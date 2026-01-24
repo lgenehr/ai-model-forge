@@ -29,8 +29,8 @@ def parse_args():
     parser.add_argument("--lora_dropout", type=float, default=0.05, help="LoRA dropout")
     
     # Training
-    parser.add_argument("--batch_size", type=int, default=2, help="Per device batch size")
-    parser.add_argument("--grad_accum_steps", type=int, default=4, help="Gradient accumulation steps")
+    parser.add_argument("--batch_size", type=int, default=1, help="Per device batch size")
+    parser.add_argument("--grad_accum_steps", type=int, default=8, help="Gradient accumulation steps")
     parser.add_argument("--epochs", type=int, default=3, help="Number of epochs")
     parser.add_argument("--learning_rate", type=float, default=2e-4, help="Learning rate")
     parser.add_argument("--output_dir", type=str, default="outputs", help="Output directory")
@@ -107,9 +107,10 @@ def train(args):
         lr_scheduler_type = "cosine",
         seed = 3407,
         output_dir = args.output_dir,
+        gradient_checkpointing = True, # Explicitly enable GC in Trainer
         
         # Validation & Early Stopping
-        evaluation_strategy = "steps",
+        eval_strategy = "steps",
         eval_steps = args.save_steps, # Evaluate every time we save
         save_strategy = "steps",
         save_steps = args.save_steps,

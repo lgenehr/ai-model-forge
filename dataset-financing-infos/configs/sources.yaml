@@ -1,13 +1,5 @@
 sources:
   # --- Fontes Oficiais e Governamentais (Brasil) ---
-  - id: "gov_agencia_brasil_econ"
-    type: "rss"
-    url: "https://agenciabrasil.ebc.com.br/rss/economia"
-    category: "macroeconomics"
-    weight: 1.0
-    enabled: true
-    note: "Fonte oficial do governo brasileiro"
-
   - id: "gov_cvm_noticias"
     type: "rss"
     url: "https://www.gov.br/cvm/pt-br/assuntos/noticias/rss.xml"
@@ -16,19 +8,13 @@ sources:
     enabled: true
     note: "Comissão de Valores Mobiliários"
 
-  - id: "gov_senado_econ"
+  - id: "gov_senado_geral"
     type: "rss"
-    url: "https://www12.senado.leg.br/noticias/feed/assunto/economia"
+    url: "https://www12.senado.leg.br/noticias/rss"
     category: "regulation"
     weight: 0.9
     enabled: true
-
-  - id: "gov_camara_econ"
-    type: "rss"
-    url: "https://www.camara.leg.br/noticias/rss/assunto/economia"
-    category: "regulation"
-    weight: 0.9
-    enabled: true
+    note: "Senado Federal - Geral (inclui Economia)"
 
   # --- Veículos de Notícias Financeiras e Negócios (Brasil) ---
   - id: "br_infomoney"
@@ -38,9 +24,9 @@ sources:
     weight: 1.0
     enabled: true
 
-  - id: "br_valor_investe"
+  - id: "br_forbes"
     type: "rss"
-    url: "https://valorinveste.globo.com/rss/valor-investe/"
+    url: "https://forbes.com.br/feed/"
     category: "business"
     weight: 1.0
     enabled: true
@@ -101,13 +87,6 @@ sources:
     weight: 0.9
     enabled: true
 
-  - id: "br_inteligencia_financeira"
-    type: "rss"
-    url: "https://inteligenciafinanceira.com.br/feed/"
-    category: "business"
-    weight: 0.8
-    enabled: true
-
   - id: "br_monitor_mercado"
     type: "rss"
     url: "https://monitordomercado.com.br/feed/"
@@ -146,9 +125,9 @@ sources:
     weight: 1.0
     enabled: true
 
-  - id: "br_cnn_business"
+  - id: "br_cnn_geral"
     type: "rss"
-    url: "https://www.cnnbrasil.com.br/economia/feed/"
+    url: "https://www.cnnbrasil.com.br/feed/"
     category: "macroeconomics"
     weight: 1.0
     enabled: true
@@ -165,6 +144,20 @@ sources:
     url: "http://rss.uol.com.br/feed/economia.xml"
     category: "macroeconomics"
     weight: 0.9
+    enabled: true
+
+  - id: "br_cartacapital_econ"
+    type: "rss"
+    url: "https://www.cartacapital.com.br/carta-capital/economia/feed/"
+    category: "macroeconomics"
+    weight: 0.9
+    enabled: true
+
+  - id: "br_jovempan_econ"
+    type: "rss"
+    url: "https://jovempan.com.br/noticias/economia/feed"
+    category: "macroeconomics"
+    weight: 0.8
     enabled: true
 
   # --- Criptoativos e Blockchain (Brasil) ---
@@ -203,13 +196,6 @@ sources:
     weight: 0.9
     enabled: true
 
-  - id: "br_web3_news"
-    type: "rss"
-    url: "https://br.cryptonews.com/news/feed"
-    category: "crypto_assets"
-    weight: 0.8
-    enabled: true
-
   # --- Jurídico e Regulatório (Corporativo) ---
   - id: "br_conjur"
     type: "rss"
@@ -225,7 +211,7 @@ sources:
     weight: 0.9
     enabled: true
 
-  # --- Internacionais (Contexto Global - Mantidos como complementares) ---
+  # --- Internacionais (Contexto Global) ---
   - id: "global_world_bank"
     type: "rss"
     url: "https://www.worldbank.org/en/news/all?format=xml"
