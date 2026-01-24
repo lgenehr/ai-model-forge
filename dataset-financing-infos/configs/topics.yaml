@@ -1,0 +1,39 @@
+categories:
+  - business
+  - macroeconomics
+  - technology
+  - energy
+  - geopolitics
+  - health
+  - science
+  - culture
+  - sports
+  - regulation
+  - crypto_assets
+
+keywords:
+  business: ["merger", "acquisition", "earnings", "IPO", "revenue", "ceo"]
+  macroeconomics: ["inflation", "GDP", "interest rate", "central bank", "unemployment"]
+  crypto_assets: ["blockchain", "consensus", "defi", "protocol", "smart contract", "regulation"]
+  technology: ["AI", "artificial intelligence", "quantum", "semiconductor", "cybersecurity"]
+
+blacklisted_terms:
+  financial_advice:
+    - "strong buy"
+    - "strong sell"
+    - "price target"
+    - "to the moon"
+    - "pump"
+    - "100x"
+    - "hidden gem"
+    - "next bitcoin"
+    - "investment advice"
+  harmful:
+    - "kill"
+    - "suicide"
+    - "hate"
+  boilerplate:
+    - "subscribe"
+    - "click here"
+    - "all rights reserved"
+    - "privacy policy"

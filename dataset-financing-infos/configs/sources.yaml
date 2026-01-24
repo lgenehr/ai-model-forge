@@ -1,0 +1,260 @@
+sources:
+  # --- Fontes Oficiais e Governamentais (Brasil) ---
+  - id: "gov_agencia_brasil_econ"
+    type: "rss"
+    url: "https://agenciabrasil.ebc.com.br/rss/economia"
+    category: "macroeconomics"
+    weight: 1.0
+    enabled: true
+    note: "Fonte oficial do governo brasileiro"
+
+  - id: "gov_cvm_noticias"
+    type: "rss"
+    url: "https://www.gov.br/cvm/pt-br/assuntos/noticias/rss.xml"
+    category: "regulation"
+    weight: 1.0
+    enabled: true
+    note: "Comissão de Valores Mobiliários"
+
+  - id: "gov_senado_econ"
+    type: "rss"
+    url: "https://www12.senado.leg.br/noticias/feed/assunto/economia"
+    category: "regulation"
+    weight: 0.9
+    enabled: true
+
+  - id: "gov_camara_econ"
+    type: "rss"
+    url: "https://www.camara.leg.br/noticias/rss/assunto/economia"
+    category: "regulation"
+    weight: 0.9
+    enabled: true
+
+  # --- Veículos de Notícias Financeiras e Negócios (Brasil) ---
+  - id: "br_infomoney"
+    type: "rss"
+    url: "https://www.infomoney.com.br/feed/"
+    category: "business"
+    weight: 1.0
+    enabled: true
+
+  - id: "br_valor_investe"
+    type: "rss"
+    url: "https://valorinveste.globo.com/rss/valor-investe/"
+    category: "business"
+    weight: 1.0
+    enabled: true
+
+  - id: "br_exame"
+    type: "rss"
+    url: "https://exame.com/feed/"
+    category: "business"
+    weight: 1.0
+    enabled: true
+
+  - id: "br_brazil_journal"
+    type: "rss"
+    url: "https://braziljournal.com/feed/"
+    category: "business"
+    weight: 1.0
+    enabled: true
+
+  - id: "br_neofeed"
+    type: "rss"
+    url: "https://neofeed.com.br/feed/"
+    category: "business"
+    weight: 0.9
+    enabled: true
+
+  - id: "br_money_times"
+    type: "rss"
+    url: "https://www.moneytimes.com.br/feed/"
+    category: "business"
+    weight: 0.9
+    enabled: true
+
+  - id: "br_suno_noticias"
+    type: "rss"
+    url: "https://www.suno.com.br/noticias/feed/"
+    category: "business"
+    weight: 0.9
+    enabled: true
+
+  - id: "br_seu_dinheiro"
+    type: "rss"
+    url: "https://www.seudinheiro.com/feed/"
+    category: "business"
+    weight: 0.9
+    enabled: true
+
+  - id: "br_investnews"
+    type: "rss"
+    url: "https://investnews.com.br/feed/"
+    category: "business"
+    weight: 0.9
+    enabled: true
+
+  - id: "br_e_investidor"
+    type: "rss"
+    url: "https://einvestidor.estadao.com.br/feed/"
+    category: "business"
+    weight: 0.9
+    enabled: true
+
+  - id: "br_inteligencia_financeira"
+    type: "rss"
+    url: "https://inteligenciafinanceira.com.br/feed/"
+    category: "business"
+    weight: 0.8
+    enabled: true
+
+  - id: "br_monitor_mercado"
+    type: "rss"
+    url: "https://monitordomercado.com.br/feed/"
+    category: "business"
+    weight: 0.8
+    enabled: true
+
+  - id: "br_bmc_news"
+    type: "rss"
+    url: "https://bmcnews.com.br/feed/"
+    category: "business"
+    weight: 0.8
+    enabled: true
+
+  - id: "br_finsiders"
+    type: "rss"
+    url: "https://finsidersbrasil.com.br/feed/"
+    category: "business"
+    weight: 0.8
+    enabled: true
+    note: "Foco em Fintechs"
+
+  - id: "br_startups"
+    type: "rss"
+    url: "https://startups.com.br/feed/"
+    category: "technology"
+    weight: 0.8
+    enabled: true
+    note: "Ecossistema de Startups"
+
+  # --- Grandes Portais (Economia) ---
+  - id: "br_g1_economia"
+    type: "rss"
+    url: "https://g1.globo.com/rss/g1/economia/"
+    category: "macroeconomics"
+    weight: 1.0
+    enabled: true
+
+  - id: "br_cnn_business"
+    type: "rss"
+    url: "https://www.cnnbrasil.com.br/economia/feed/"
+    category: "macroeconomics"
+    weight: 1.0
+    enabled: true
+
+  - id: "br_poder360_econ"
+    type: "rss"
+    url: "https://www.poder360.com.br/economia/feed/"
+    category: "macroeconomics"
+    weight: 0.9
+    enabled: true
+
+  - id: "br_uol_economia"
+    type: "rss"
+    url: "http://rss.uol.com.br/feed/economia.xml"
+    category: "macroeconomics"
+    weight: 0.9
+    enabled: true
+
+  # --- Criptoativos e Blockchain (Brasil) ---
+  - id: "br_portal_bitcoin"
+    type: "rss"
+    url: "https://portaldobitcoin.uol.com.br/feed/"
+    category: "crypto_assets"
+    weight: 1.0
+    enabled: true
+
+  - id: "br_cointelegraph"
+    type: "rss"
+    url: "https://br.cointelegraph.com/rss"
+    category: "crypto_assets"
+    weight: 1.0
+    enabled: true
+
+  - id: "br_livecoins"
+    type: "rss"
+    url: "https://livecoins.com.br/feed/"
+    category: "crypto_assets"
+    weight: 0.9
+    enabled: true
+
+  - id: "br_criptofacil"
+    type: "rss"
+    url: "https://www.criptofacil.com/feed/"
+    category: "crypto_assets"
+    weight: 0.9
+    enabled: true
+
+  - id: "br_blocktrends"
+    type: "rss"
+    url: "https://blocktrends.com.br/feed/"
+    category: "crypto_assets"
+    weight: 0.9
+    enabled: true
+
+  - id: "br_web3_news"
+    type: "rss"
+    url: "https://br.cryptonews.com/news/feed"
+    category: "crypto_assets"
+    weight: 0.8
+    enabled: true
+
+  # --- Jurídico e Regulatório (Corporativo) ---
+  - id: "br_conjur"
+    type: "rss"
+    url: "https://www.conjur.com.br/rss.xml"
+    category: "regulation"
+    weight: 0.8
+    enabled: true
+
+  - id: "br_jota"
+    type: "rss"
+    url: "https://www.jota.info/feed"
+    category: "regulation"
+    weight: 0.9
+    enabled: true
+
+  # --- Internacionais (Contexto Global - Mantidos como complementares) ---
+  - id: "global_world_bank"
+    type: "rss"
+    url: "https://www.worldbank.org/en/news/all?format=xml"
+    category: "macroeconomics"
+    weight: 0.5
+    enabled: true
+
+  # --- Structural/Technical ---
+  - id: "wiki_events"
+    type: "api_custom"
+    url: "https://en.wikipedia.org/w/api.php"
+    category: "general"
+    weight: 0.5
+    enabled: true
+    note: "Dados factuais históricos e eventos consolidados"
+
+  - id: "wiki_pt_events"
+    type: "wikipedia"
+    language: "pt"
+    url: "https://pt.wikipedia.org/w/api.php"
+    category: "general"
+    weight: 0.5
+    enabled: true
+    note: "Wikipedia em Português"
+
+  - id: "mock_future_data"
+    type: "mock"
+    url: "internal://mock"
+    category: "mixed"
+    weight: 1.0
+    enabled: true
+    note: "Gerador de dados futuros simulados (2025-2026) para testes"
