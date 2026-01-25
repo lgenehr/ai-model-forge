@@ -37,6 +37,9 @@ def parse_args():
     parser.add_argument("--logging_steps", type=int, default=10, help="Logging steps")
     parser.add_argument("--save_steps", type=int, default=100, help="Checkpoint save steps")
     
+    # Resume Logic (NOVO)
+    parser.add_argument("--resume_from_checkpoint", type=bool, default=False, help="Resume from latest checkpoint")
+    
     return parser.parse_args()
 
 def train(args):
@@ -130,25 +133,38 @@ def train(args):
         eval_dataset = eval_dataset,
         dataset_text_field = "text",
         max_seq_length = args.max_seq_length,
-        dataset_num_proc = 2,
-        packing = False, # Can set to True for speedup if short sequences
+        dataset_num_proc = 1, # ALTERADO: Reduzido para 1 para salvar RAM
+        packing = False, 
         args = training_args,
         callbacks = [EarlyStoppingCallback(early_stopping_patience=3)]
     )
 
-    # 6. Train
-    logger.info("Starting training...")
-    trainer_stats = trainer.train()
+    # 6. Train (Com lógica de Resume)
+    logger.info(f"Starting training (Resume: {args.resume_from_checkpoint})...")
+    
+    # Se resume for True, o trainer busca automaticamente o último checkpoint na output_dir
+    trainer_stats = trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
+    
     logger.info(f"Training complete. Stats: {trainer_stats}")
 
-    # 7. Save Model
-    logger.info("Saving model...")
-    model.save_pretrained_merged(f"{args.output_dir}/model_merged", tokenizer, save_method = "merged_16bit")
-    model.save_pretrained_merged(f"{args.output_dir}/model_gguf", tokenizer, save_method = "gguf_q4_k_m") # Export GGUF
+    # 7. Save Model (Safe Save)
+    logger.info("Saving LoRA adapters only (Safety first)...")
+    # Salva primeiro o mais leve e importante
+    model.save_pretrained(f"{args.output_dir}/lora_adapters") 
+    tokenizer.save_pretrained(f"{args.output_dir}/lora_adapters")
+
+    logger.info("Attempting to save merged model (High RAM usage)...")
+    try:
+        # Tenta salvar o modelo completo. Se der erro de memória, não perde o que já fez.
+        model.save_pretrained_merged(f"{args.output_dir}/model_merged", tokenizer, save_method = "merged_16bit")
+        model.save_pretrained_merged(f"{args.output_dir}/model_gguf", tokenizer, save_method = "gguf_q4_k_m")
+    except Exception as e:
+        logger.warning(f"Could not merge model due to memory constraints: {e}")
+        logger.info("Don't worry, LoRA adapters were saved above! You can merge later.")
 
     # 8. Inference Test
     logger.info("Running inference test...")
-    FastLanguageModel.for_inference(model) # Enable native 2x faster inference
+    FastLanguageModel.for_inference(model) 
     
     messages = [
         {"role": "system", "content": "Você é um analista financeiro."},
