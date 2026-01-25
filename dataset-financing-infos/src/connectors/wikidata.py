@@ -1,4 +1,5 @@
 import requests
+import random
 from typing import Generator, Dict, Any, List
 from .base import BaseConnector, logger
 import datetime
@@ -63,8 +64,8 @@ class WikipediaConnector(BaseConnector):
                             "format": "json",
                             "prop": "extracts",
                             "titles": title,
-                            "exintro": True,
                             "explaintext": True
+                            # Removed exintro=True to get full content
                         }
                         try:
                             c_resp = self.client.get(base_url, params=content_params)
@@ -87,11 +88,18 @@ class WikipediaConnector(BaseConnector):
                                         found_year = y
                                         break
 
+                                # Generate a random date within that year to avoid all items being Jan 1st
+                                start_date = datetime.datetime(found_year, 1, 1)
+                                end_date = datetime.datetime(found_year, 12, 31)
+                                delta_days = (end_date - start_date).days
+                                random_days = random.randint(0, delta_days)
+                                final_date = start_date + datetime.timedelta(days=random_days)
+
                                 yield {
                                     "content": extract,
                                     "title": title,
                                     "url": f"https://{lang}.wikipedia.org/wiki/{title.replace(' ', '_')}",
-                                    "date": datetime.datetime(found_year, 1, 1),
+                                    "date": final_date,
                                     "source_id": self.source_id,
                                     "raw": page_info
                                 }
