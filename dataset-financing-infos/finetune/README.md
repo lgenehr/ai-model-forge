@@ -32,6 +32,18 @@ python train.py \
     --epochs 3 \
     --output_dir "financial_finetune_v1"
 ```
+ou
+
+```bash
+python train.py \
+    --model_name "unsloth/Qwen2.5-14B-Instruct" \
+    --dataset_pattern "../dataset/dataset_*.jsonl" \
+    --batch_size 1 \
+    --grad_accum_steps 8 \
+    --epochs 3 \
+    --output_dir "financial_finetune_v1" \
+    --resume_from_checkpoint True
+```
 
 ### Key Arguments
 
