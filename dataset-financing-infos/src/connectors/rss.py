@@ -1,4 +1,5 @@
 import feedparser
+import trafilatura
 from typing import Generator, Dict, Any
 from dateutil import parser as date_parser
 from datetime import datetime
@@ -76,10 +77,29 @@ class RSSConnector(BaseConnector):
                 if not (year_start <= dt.year <= year_end):
                     continue
 
+                # Fetch full text content
+                article_url = entry.get("link")
+                full_text = None
+
+                if article_url:
+                    try:
+                        logger.info(f"Fetching full text from: {article_url}")
+                        # Use self.client to fetch the page content (uses robust headers/retries)
+                        article_response = self.client.get(article_url)
+                        # Extract text using trafilatura
+                        full_text = trafilatura.extract(article_response.content)
+                    except Exception as e:
+                        logger.error(f"Failed to fetch/extract content from {article_url}: {e}")
+                        continue
+
+                if not full_text:
+                    logger.warning(f"Could not extract text from {article_url}, skipping.")
+                    continue
+
                 yield {
-                    "content": entry.get("summary", "") or entry.get("description", ""),
+                    "content": full_text,
                     "title": entry.get("title", ""),
-                    "url": entry.get("link", ""),
+                    "url": article_url,
                     "date": dt,
                     "source_id": self.source_id,
                     "topics": [self.config.get("category", "general")], # Pass source category
