@@ -1,6 +1,11 @@
 import argparse
 import os
 import torch
+import gc
+import subprocess
+import shutil
+import multiprocessing
+import sys
 from unsloth import FastLanguageModel
 from trl import SFTTrainer
 from transformers import TrainingArguments, EarlyStoppingCallback
@@ -8,81 +13,151 @@ from unsloth import is_bfloat16_supported
 from data_utils import prepare_hf_dataset
 import logging
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
+# Tenta importar wandb, se não tiver, avisa
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
+# Configuração de Logs
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Fine-tune Qwen 2.5 14B on financial data using Unsloth")
+    parser = argparse.ArgumentParser(description="Fine-tune Qwen 2.5 14B with Auto-Llama.cpp Setup")
     
-    # Model
-    parser.add_argument("--model_name", type=str, default="unsloth/Qwen2.5-14B-Instruct", help="Base model path")
-    parser.add_argument("--max_seq_length", type=int, default=2048, help="Max sequence length")
-    parser.add_argument("--load_in_4bit", type=bool, default=True, help="Use 4-bit quantization")
+    # Model & Data
+    parser.add_argument("--model_name", type=str, default="unsloth/Qwen2.5-14B-Instruct")
+    parser.add_argument("--max_seq_length", type=int, default=4096)
+    parser.add_argument("--dataset_pattern", type=str, default="../dataset/*.jsonl")
+    parser.add_argument("--dataset_num_proc", type=int, default=16, help="Cores para processar dataset")
+
+    # LoRA Params (Configuração Agressiva V3)
+    parser.add_argument("--lora_r", type=int, default=64)
+    parser.add_argument("--lora_alpha", type=int, default=128)
+    parser.add_argument("--lora_dropout", type=float, default=0.05)
     
-    # Dataset
-    parser.add_argument("--dataset_pattern", type=str, default="../dataset/*.jsonl", help="Glob pattern for datasets")
+    # Training Params
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--grad_accum_steps", type=int, default=16)
+    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--learning_rate", type=float, default=2e-4)
+    parser.add_argument("--output_dir", type=str, default="financial_finetune_v3_agressivo")
+    parser.add_argument("--resume_from_checkpoint", action="store_true")
     
-    # LoRA
-    parser.add_argument("--lora_r", type=int, default=64, help="LoRA rank")
-    parser.add_argument("--lora_alpha", type=int, default=128, help="LoRA alpha")
-    parser.add_argument("--lora_dropout", type=float, default=0.05, help="LoRA dropout")
-    
-    # Training
-    parser.add_argument("--batch_size", type=int, default=1, help="Per device batch size")
-    parser.add_argument("--grad_accum_steps", type=int, default=8, help="Gradient accumulation steps")
-    parser.add_argument("--epochs", type=int, default=3, help="Number of epochs")
-    parser.add_argument("--learning_rate", type=float, default=2e-4, help="Learning rate")
-    parser.add_argument("--output_dir", type=str, default="outputs", help="Output directory")
-    parser.add_argument("--logging_steps", type=int, default=10, help="Logging steps")
-    parser.add_argument("--save_steps", type=int, default=100, help="Checkpoint save steps")
-    
-    # Resume Logic (NOVO)
-    parser.add_argument("--resume_from_checkpoint", type=bool, default=False, help="Resume from latest checkpoint")
-    
+    # WandB
+    parser.add_argument("--wandb_project", type=str, default="finetune-financeiro-qwen", help="Nome do projeto no WandB")
+    parser.add_argument("--wandb_run_name", type=str, default="run-v3-agressivo", help="Nome da run")
+
+    # Llama.cpp Automation
+    parser.add_argument("--llama_cpp_path", type=str, default="~/llama.cpp", help="Caminho para instalar/usar o llama.cpp")
+
     return parser.parse_args()
 
+def run_command(command, description):
+    """Executa comandos shell e loga o output em tempo real"""
+    logger.info(f"🚀 [Executando]: {description}")
+    try:
+        # Check=True lança erro se o comando falhar
+        subprocess.run(command, shell=True, check=True, executable='/bin/bash')
+        logger.info(f"✅ [Sucesso]: {description}")
+    except subprocess.CalledProcessError as e:
+        logger.error(f"❌ [Erro] Falha em: {description}")
+        sys.exit(1)
+
+def setup_llama_cpp(base_path):
+    """
+    Verifica se llama.cpp existe.
+    - Se não existir: Clona.
+    - Se existir mas sem binário: Compila.
+    - Instala dependências Python necessárias.
+    """
+    path = os.path.expanduser(base_path)
+    cores = multiprocessing.cpu_count()
+    
+    logger.info(f"🛠️ Verificando configuração do llama.cpp em: {path}")
+
+    # 1. Clone
+    if not os.path.isdir(path):
+        logger.warning(f"Pasta {path} não encontrada. Clonando repositório...")
+        run_command(f"git clone https://github.com/ggerganov/llama.cpp {path}", "Clonando llama.cpp")
+    
+    # 2. Dependências Python (necessárias para o script de conversão)
+    logger.info("📦 Verificando dependências Python do conversor...")
+    run_command("pip install gguf protobuf sentencepiece torch --upgrade --quiet", "Instalando libs Python para GGUF")
+
+    # 3. Compilação (Make)
+    # Verifica se o binário existe (pode estar na raiz ou em build/bin dependendo da versão/make)
+    possible_bins = [
+        os.path.join(path, "llama-quantize"),
+        os.path.join(path, "build", "bin", "llama-quantize")
+    ]
+    
+    binary_found = any(os.path.isfile(b) for b in possible_bins)
+
+    if not binary_found:
+        logger.warning("🔨 Binários não encontrados. Compilando llama.cpp...")
+        # Usa todos os cores disponíveis para compilar rápido
+        run_command(f"cd {path} && make -j{cores}", f"Compilando llama.cpp com {cores} threads")
+    else:
+        logger.info("✅ Binários do llama.cpp já compilados.")
+
+    # Retorna o caminho do script de conversão e do binário de quantização
+    convert_script = os.path.join(path, "convert_hf_to_gguf.py")
+    
+    # Localiza qual binário foi gerado
+    if os.path.isfile(possible_bins[1]):
+        quantize_bin = possible_bins[1]
+    else:
+        quantize_bin = possible_bins[0]
+        
+    return convert_script, quantize_bin
+
 def train(args):
-    # 1. Load Model & Tokenizer using Unsloth
-    logger.info(f"Loading model {args.model_name}...")
+    # 0. Setup Inicial (WandB e Llama.cpp)
+    if wandb:
+        # Se não estiver logado, isso vai pedir o token no terminal
+        wandb.init(project=args.wandb_project, name=args.wandb_run_name)
+    else:
+        logger.warning("⚠️ WandB não está instalado. Instale com `pip install wandb` para logs gráficos.")
+
+    # Prepara o ambiente do llama.cpp ANTES de começar o treino para garantir que tudo funciona
+    convert_script, quantize_bin = setup_llama_cpp(args.llama_cpp_path)
+
+    # 1. Carregar Modelo
+    logger.info(f"Carregando modelo {args.model_name}...")
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name = args.model_name,
         max_seq_length = args.max_seq_length,
-        dtype = None, # Auto-detect (Float16 or Bfloat16)
-        load_in_4bit = args.load_in_4bit,
+        dtype = None, 
+        load_in_4bit = True, 
     )
 
-    # 2. Add LoRA adapters
-    logger.info("Adding LoRA adapters...")
+    # 2. Configurar LoRA (Agressivo V3)
+    logger.info("Adicionando adaptadores LoRA...")
     model = FastLanguageModel.get_peft_model(
         model,
         r = args.lora_r,
-        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
-                          "gate_proj", "up_proj", "down_proj"],
+        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
         lora_alpha = args.lora_alpha,
         lora_dropout = args.lora_dropout,
         bias = "none",
-        use_gradient_checkpointing = "unsloth", # Optimized GC
+        use_gradient_checkpointing = "unsloth", 
         random_state = 3407,
-        use_rslora = False,
-        loftq_config = None,
     )
 
-    # 3. Load & Prepare Dataset
-    logger.info(f"Preparing dataset from {args.dataset_pattern}...")
+    # 3. Dataset
+    logger.info(f"Processando dataset: {args.dataset_pattern}")
     dataset = prepare_hf_dataset([args.dataset_pattern])
-    
-    # Split dataset (90% train, 10% validation)
     dataset_split = dataset.train_test_split(test_size=0.1, seed=3407)
     train_dataset = dataset_split["train"]
     eval_dataset = dataset_split["test"]
-    logger.info(f"Training samples: {len(train_dataset)}, Validation samples: {len(eval_dataset)}")
     
-    # Unsloth/Qwen chat template formatting
+    # Template Chat
     from unsloth.chat_templates import get_chat_template
     tokenizer = get_chat_template(
         tokenizer,
-        chat_template = "qwen-2.5", # Supports qwen-2.5
+        chat_template = "qwen-2.5",
         mapping = {"role": "role", "content": "content", "user": "user", "assistant": "assistant"}
     )
     
@@ -91,11 +166,12 @@ def train(args):
         texts = [tokenizer.apply_chat_template(convo, tokenize=False, add_generation_prompt=False) for convo in convos]
         return {"text": texts}
     
-    train_dataset = train_dataset.map(formatting_prompts_func, batched=True)
-    eval_dataset = eval_dataset.map(formatting_prompts_func, batched=True)
+    # Paralelismo na Tokenização (Usa o Ryzen)
+    logger.info(f"Tokenizando com {args.dataset_num_proc} threads...")
+    train_dataset = train_dataset.map(formatting_prompts_func, batched=True, num_proc=args.dataset_num_proc)
+    eval_dataset = eval_dataset.map(formatting_prompts_func, batched=True, num_proc=args.dataset_num_proc)
 
-    # 4. Training Arguments
-    logger.info("Setting up Trainer...")
+    # 4. Trainer Config
     training_args = TrainingArguments(
         per_device_train_batch_size = args.batch_size,
         gradient_accumulation_steps = args.grad_accum_steps,
@@ -105,27 +181,23 @@ def train(args):
         fp16 = not is_bfloat16_supported(),
         bf16 = is_bfloat16_supported(),
         logging_steps = args.logging_steps,
-        optim = "adamw_8bit", # Bitsandbytes 8-bit optimizer
+        optim = "adamw_8bit",
         weight_decay = 0.01,
         lr_scheduler_type = "cosine",
         seed = 3407,
         output_dir = args.output_dir,
-        gradient_checkpointing = True, # Explicitly enable GC in Trainer
+        gradient_checkpointing = True,
+        # WandB Integration
+        report_to = "wandb" if wandb else "none",
+        run_name = args.wandb_run_name,
         
-        # Validation & Early Stopping
         eval_strategy = "steps",
-        eval_steps = args.save_steps, # Evaluate every time we save
+        eval_steps = args.save_steps, 
         save_strategy = "steps",
         save_steps = args.save_steps,
         load_best_model_at_end = True,
-        metric_for_best_model = "eval_loss",
-        greater_is_better = False,
-        
-        logging_dir = f"{args.output_dir}/logs",
-        report_to = "wandb", # or "tensorboard"
     )
 
-    # 5. Trainer
     trainer = SFTTrainer(
         model = model,
         tokenizer = tokenizer,
@@ -133,48 +205,49 @@ def train(args):
         eval_dataset = eval_dataset,
         dataset_text_field = "text",
         max_seq_length = args.max_seq_length,
-        dataset_num_proc = 1, # ALTERADO: Reduzido para 1 para salvar RAM
+        dataset_num_proc = args.dataset_num_proc,
         packing = False, 
         args = training_args,
         callbacks = [EarlyStoppingCallback(early_stopping_patience=3)]
     )
 
-    # 6. Train (Com lógica de Resume)
-    logger.info(f"Starting training (Resume: {args.resume_from_checkpoint})...")
-    
-    # Se resume for True, o trainer busca automaticamente o último checkpoint na output_dir
-    trainer_stats = trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
-    
-    logger.info(f"Training complete. Stats: {trainer_stats}")
+    # 5. Treino
+    logger.info("🔥 Iniciando Treinamento...")
+    trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
+    logger.info("🏁 Treinamento concluído.")
 
-    # 7. Save Model (Safe Save)
-    logger.info("Saving LoRA adapters only (Safety first)...")
-    # Salva primeiro o mais leve e importante
-    model.save_pretrained(f"{args.output_dir}/lora_adapters") 
-    tokenizer.save_pretrained(f"{args.output_dir}/lora_adapters")
-
-    logger.info("Attempting to save merged model (High RAM usage)...")
-    try:
-        # Tenta salvar o modelo completo. Se der erro de memória, não perde o que já fez.
-        model.save_pretrained_merged(f"{args.output_dir}/model_merged", tokenizer, save_method = "merged_16bit")
-        model.save_pretrained_merged(f"{args.output_dir}/model_gguf", tokenizer, save_method = "gguf_q4_k_m")
-    except Exception as e:
-        logger.warning(f"Could not merge model due to memory constraints: {e}")
-        logger.info("Don't worry, LoRA adapters were saved above! You can merge later.")
-
-    # 8. Inference Test
-    logger.info("Running inference test...")
-    FastLanguageModel.for_inference(model) 
+    # 6. Salvar e Merge
+    logger.info("💾 Salvando modelo mergeado (Safetensors 16-bit)...")
+    merged_dir = os.path.join(args.output_dir, "merged_model_hf")
     
-    messages = [
-        {"role": "system", "content": "Você é um analista financeiro."},
-        {"role": "user", "content": "Quais foram os principais eventos econômicos de 2025?"}
-    ]
-    inputs = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, return_tensors="pt").to("cuda")
+    # Limpeza de VRAM antes do merge pesado
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    model.save_pretrained_merged(merged_dir, tokenizer, save_method = "merged_16bit")
     
-    outputs = model.generate(input_ids=inputs, max_new_tokens=128, use_cache=True)
-    response = tokenizer.batch_decode(outputs)
-    logger.info(f"Inference Output: {response[0]}")
+    if wandb:
+        wandb.finish()
+
+    # 7. Conversão e Quantização (Llama.cpp)
+    logger.info("⚙️ Iniciando conversão via llama.cpp...")
+    
+    fp16_gguf = os.path.join(args.output_dir, "model_fp16.gguf")
+    final_q4_gguf = os.path.join(args.output_dir, "modelo_final_q4_k_m.gguf")
+    
+    # A) HF -> GGUF FP16
+    run_command(f"python3 {convert_script} {merged_dir} --outfile {fp16_gguf} --outtype f16", "Conversão FP16")
+    
+    # B) FP16 -> Q4_K_M (Usando TODOS os núcleos do Ryzen)
+    cpu_threads = multiprocessing.cpu_count()
+    run_command(f"{quantize_bin} {fp16_gguf} {final_q4_gguf} q4_k_m {cpu_threads}", f"Quantização Q4 com {cpu_threads} threads")
+
+    # C) Limpeza
+    if os.path.exists(fp16_gguf):
+        os.remove(fp16_gguf)
+        logger.info("🗑️ Arquivo temporário FP16 removido.")
+
+    logger.info(f"✨ SUCESSO! Modelo pronto em: {final_q4_gguf}")
 
 if __name__ == "__main__":
     args = parse_args()

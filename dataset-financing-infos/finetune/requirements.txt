@@ -1,6 +1,6 @@
 # Unsloth
-unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git@2026.1.4
-unsloth-zoo==2026.1.4
+unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git
+unsloth-zoo
 
 # PyTorch
 torch==2.10.0
@@ -8,12 +8,12 @@ torchvision==0.25.0
 torchaudio==2.10.0
 
 # xFormers compatível
-xformers==0.0.34
+xformers
 
 # HF / treino
-transformers==4.46.3
-trl==0.11.4
-accelerate==0.31.0
+transformers
+trl
+accelerate
 
 datasets
 sentencepiece

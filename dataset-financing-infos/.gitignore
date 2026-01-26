@@ -17,7 +17,7 @@ data_processed/
 unsloth_compiled_cache/
 wandb/
 venv-financing-infos/
-finetune/financial_finetune_v1/
+finetune/financial_finetune_v*/
 finetune/unsloth_compiled_cache
 finetune/wandb
 finetune/__pycache__
