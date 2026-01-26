@@ -12,6 +12,7 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     cmake \
     libcurl4-openssl-dev \
+    curl \
     && add-apt-repository ppa:deadsnakes/ppa \
     && apt-get update \
     && apt-get install -y \
@@ -32,13 +33,13 @@ RUN curl -sS https://bootstrap.pypa.io/get-pip.py | python3.11
 # ===============================
 RUN python -m pip install --upgrade pip setuptools wheel
 
-# Corrige compatibilidade (pyparsing + Py 3.11)
-RUN pip install --no-cache-dir "pyparsing>=3.1.0"
+# Corrige compatibilidade Python 3.11
+RUN python -m pip install --no-cache-dir "pyparsing>=3.1.0"
 
 # ===============================
 # PyTorch 2.10 + Unsloth
 # ===============================
-RUN pip install --no-cache-dir \
+RUN python -m pip install --no-cache-dir \
     torch==2.10.0 \
     torchvision==0.25.0 \
     torchaudio==2.10.0 \
@@ -47,7 +48,7 @@ RUN pip install --no-cache-dir \
 # ===============================
 # Dependências GGUF
 # ===============================
-RUN pip install --no-cache-dir \
+RUN python -m pip install --no-cache-dir \
     gguf \
     sentencepiece \
     protobuf
@@ -67,7 +68,7 @@ ENV PATH="${LLAMA_CPP_PATH}/build/bin:${PATH}"
 # Dependências do projeto
 # ===============================
 COPY dataset-financing-infos/requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir -r /tmp/requirements.txt
+RUN python -m pip install --no-cache-dir -r /tmp/requirements.txt
 
 # ===============================
 # Validação
@@ -79,3 +80,4 @@ print("Torch:", torch.__version__)
 print("CUDA:", torch.version.cuda)
 print("GPU:", torch.cuda.is_available())
 EOF
+# ===============================
