@@ -1,18 +1,29 @@
-FROM unslothai/unsloth:latest
+FROM nvidia/cuda:12.4.1-cudnn9-runtime-ubuntu22.04
 
-# Install system dependencies required for llama.cpp conversion and other tools
+ENV DEBIAN_FRONTEND=noninteractive
+WORKDIR /workspace
+
+# Sistema
 RUN apt-get update && apt-get install -y \
+    python3 \
+    python3-pip \
+    python3-dev \
+    git \
     build-essential \
     cmake \
-    git \
     libcurl4-openssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Set working directory
-WORKDIR /workspace
+# Python padrão
+RUN ln -s /usr/bin/python3 /usr/bin/python
 
-# Copy requirements and install dependencies
-# We copy to a temporary location to ensure installation succeeds during build
-# regardless of how volumes are mounted later.
-COPY dataset-financing-infos/requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir -r /tmp/requirements.txt
+# Atualiza pip
+RUN pip install --upgrade pip
+
+# Copia requirements do projeto
+COPY dataset-financing-infos/requirements.txt /tmp/requirements-dataset.txt
+COPY dataset-financing-infos/finetune/requirements.txt /tmp/requirements-finetune.txt
+
+RUN pip install --no-cache-dir \
+    -r /tmp/requirements-dataset.txt \
+    -r /tmp/requirements-finetune.txt
