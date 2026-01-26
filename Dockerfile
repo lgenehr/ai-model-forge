@@ -30,10 +30,7 @@ RUN curl -sS https://bootstrap.pypa.io/get-pip.py | python3.11
 # ===============================
 # Ferramentas de build Python
 # ===============================
-RUN pip install --upgrade \
-    pip \
-    setuptools \
-    wheel
+RUN python -m pip install --upgrade pip setuptools wheel
 
 # Corrige compatibilidade (pyparsing + Py 3.11)
 RUN pip install --no-cache-dir "pyparsing>=3.1.0"
