@@ -29,17 +29,20 @@ RUN ln -sf /usr/bin/python3.11 /usr/bin/python \
 RUN curl -sS https://bootstrap.pypa.io/get-pip.py | python3.11
 
 # ===============================
-# Ferramentas de build Python
+# Ferramentas Python
 # ===============================
 RUN python -m pip install --upgrade pip setuptools wheel
 
-# Corrige compatibilidade Python 3.11
-RUN python -m pip install --no-cache-dir "pyparsing>=3.1.0"
+# ===============================
+# Constraints (Python 3.11 fix)
+# ===============================
+COPY constraints.txt /tmp/constraints.txt
 
 # ===============================
 # PyTorch 2.10 + Unsloth
 # ===============================
 RUN python -m pip install --no-cache-dir \
+    -c /tmp/constraints.txt \
     torch==2.10.0 \
     torchvision==0.25.0 \
     torchaudio==2.10.0 \
@@ -49,6 +52,7 @@ RUN python -m pip install --no-cache-dir \
 # Dependências GGUF
 # ===============================
 RUN python -m pip install --no-cache-dir \
+    -c /tmp/constraints.txt \
     gguf \
     sentencepiece \
     protobuf
@@ -65,19 +69,27 @@ RUN git clone https://github.com/ggerganov/llama.cpp ${LLAMA_CPP_PATH} \
 ENV PATH="${LLAMA_CPP_PATH}/build/bin:${PATH}"
 
 # ===============================
+# Copia os requirements (como você pediu)
+# ===============================
+COPY dataset-financing-infos/requirements.txt /tmp/requirements-dataset.txt
+COPY dataset-financing-infos/finetune/requirements.txt /tmp/requirements-finetune.txt
+
+# ===============================
 # Dependências do projeto
 # ===============================
-COPY dataset-financing-infos/requirements.txt /tmp/requirements.txt
-RUN python -m pip install --no-cache-dir -r /tmp/requirements.txt
+RUN python -m pip install --no-cache-dir \
+    -c /tmp/constraints.txt \
+    -r /tmp/requirements-dataset.txt \
+    -r /tmp/requirements-finetune.txt
 
 # ===============================
 # Validação
 # ===============================
 RUN python - <<EOF
-import sys, torch
+import sys, torch, pyparsing
 print("Python:", sys.version)
 print("Torch:", torch.__version__)
 print("CUDA:", torch.version.cuda)
+print("pyparsing:", pyparsing.__version__)
 print("GPU:", torch.cuda.is_available())
 EOF
-# ===============================
