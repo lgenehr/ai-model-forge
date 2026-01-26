@@ -50,8 +50,8 @@ def parse_args():
     parser.add_argument("--wandb_run_name", type=str, default="run-v3-agressivo", help="Nome da run")
 
     # Llama.cpp Automation
-    parser.add_argument("--llama_cpp_path", type=str, default="~/llama.cpp", help="Caminho para instalar/usar o llama.cpp")
-
+    parser.add_argument("--llama_cpp_path", type=str, default="/opt/llama.cpp", help="Caminho para instalar/usar o llama.cpp")
+    
     return parser.parse_args()
 
 def run_command(command, description):
@@ -66,51 +66,18 @@ def run_command(command, description):
         sys.exit(1)
 
 def setup_llama_cpp(base_path):
-    """
-    Verifica se llama.cpp existe.
-    - Se não existir: Clona.
-    - Se existir mas sem binário: Compila.
-    - Instala dependências Python necessárias.
-    """
     path = os.path.expanduser(base_path)
-    cores = multiprocessing.cpu_count()
-    
-    logger.info(f"🛠️ Verificando configuração do llama.cpp em: {path}")
 
-    # 1. Clone
-    if not os.path.isdir(path):
-        logger.warning(f"Pasta {path} não encontrada. Clonando repositório...")
-        run_command(f"git clone https://github.com/ggerganov/llama.cpp {path}", "Clonando llama.cpp")
-    
-    # 2. Dependências Python (necessárias para o script de conversão)
-    logger.info("📦 Verificando dependências Python do conversor...")
-    run_command("pip install gguf protobuf sentencepiece torch --upgrade --quiet", "Instalando libs Python para GGUF")
-
-    # 3. Compilação (Make)
-    # Verifica se o binário existe (pode estar na raiz ou em build/bin dependendo da versão/make)
-    possible_bins = [
-        os.path.join(path, "llama-quantize"),
-        os.path.join(path, "build", "bin", "llama-quantize")
-    ]
-    
-    binary_found = any(os.path.isfile(b) for b in possible_bins)
-
-    if not binary_found:
-        logger.warning("🔨 Binários não encontrados. Compilando llama.cpp...")
-        # Usa todos os cores disponíveis para compilar rápido
-        run_command(f"cd {path} && make -j{cores}", f"Compilando llama.cpp com {cores} threads")
-    else:
-        logger.info("✅ Binários do llama.cpp já compilados.")
-
-    # Retorna o caminho do script de conversão e do binário de quantização
     convert_script = os.path.join(path, "convert_hf_to_gguf.py")
-    
-    # Localiza qual binário foi gerado
-    if os.path.isfile(possible_bins[1]):
-        quantize_bin = possible_bins[1]
-    else:
-        quantize_bin = possible_bins[0]
-        
+    quantize_bin = os.path.join(path, "build", "bin", "llama-quantize")
+
+    if not os.path.isfile(convert_script):
+        raise FileNotFoundError("convert_hf_to_gguf.py não encontrado no llama.cpp")
+
+    if not os.path.isfile(quantize_bin):
+        raise FileNotFoundError("llama-quantize não encontrado. Imagem está incorreta.")
+
+    logger.info("✅ llama.cpp já disponível e compilado na imagem.")
     return convert_script, quantize_bin
 
 def train(args):

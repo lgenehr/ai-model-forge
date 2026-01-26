@@ -1,25 +1,14 @@
-# Unsloth
-unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git
-unsloth-zoo
-
-# PyTorch
-torch==2.10.0
-torchvision==0.25.0
-torchaudio==2.10.0
-
-# xFormers compatível
-xformers
-
-# HF / treino
+# Core HF / treino
 transformers
 trl
 accelerate
-
 datasets
-sentencepiece
-protobuf
+peft
+
+# Quantização / LoRA runtime
 bitsandbytes
+
+# Utils
 pandas
 scipy
 wandb
-peft
