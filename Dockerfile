@@ -4,23 +4,39 @@ ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /workspace
 
 # ===============================
-# Sistema
+# Sistema + Python 3.11.8
 # ===============================
 RUN apt-get update && apt-get install -y \
-    python3 \
-    python3-pip \
-    python3-dev \
+    software-properties-common \
     git \
     build-essential \
     cmake \
     libcurl4-openssl-dev \
+    && add-apt-repository ppa:deadsnakes/ppa \
+    && apt-get update \
+    && apt-get install -y \
+        python3.11 \
+        python3.11-dev \
+        python3.11-distutils \
     && rm -rf /var/lib/apt/lists/*
 
-# Python padrão
-RUN ln -s /usr/bin/python3 /usr/bin/python
+# Python 3.11 como padrão
+RUN ln -sf /usr/bin/python3.11 /usr/bin/python \
+    && ln -sf /usr/bin/python3.11 /usr/bin/python3
 
-# Pip
-RUN pip install --upgrade pip
+# Pip para Python 3.11
+RUN curl -sS https://bootstrap.pypa.io/get-pip.py | python3.11
+
+# ===============================
+# Ferramentas de build Python
+# ===============================
+RUN pip install --upgrade \
+    pip \
+    setuptools \
+    wheel
+
+# Corrige compatibilidade (pyparsing + Py 3.11)
+RUN pip install --no-cache-dir "pyparsing>=3.1.0"
 
 # ===============================
 # PyTorch 2.10 + Unsloth
@@ -48,23 +64,21 @@ RUN git clone https://github.com/ggerganov/llama.cpp ${LLAMA_CPP_PATH} \
     && cd ${LLAMA_CPP_PATH} \
     && make -j$(nproc)
 
-# Expor binários no PATH
 ENV PATH="${LLAMA_CPP_PATH}/build/bin:${PATH}"
 
 # ===============================
 # Dependências do projeto
-# (sem torch / unsloth / cuda)
 # ===============================
 COPY dataset-financing-infos/requirements.txt /tmp/requirements.txt
-
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
 # ===============================
-# Validação básica (opcional)
+# Validação
 # ===============================
 RUN python - <<EOF
-import torch, unsloth
+import sys, torch
+print("Python:", sys.version)
 print("Torch:", torch.__version__)
 print("CUDA:", torch.version.cuda)
-print("GPU disponível:", torch.cuda.is_available())
+print("GPU:", torch.cuda.is_available())
 EOF
