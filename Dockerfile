@@ -41,11 +41,16 @@ COPY constraints.txt /tmp/constraints.txt
 # ===============================
 # PyTorch 2.10 + Unsloth
 # ===============================
+# Torch sem dependências (evita resolution-too-deep)
 RUN python -m pip install --no-cache-dir \
-    -c /tmp/constraints.txt \
     torch==2.10.0 \
     torchvision==0.25.0 \
     torchaudio==2.10.0 \
+    --no-deps
+
+# Agora o ecossistema, com constraints
+RUN python -m pip install --no-cache-dir \
+    -c /tmp/constraints.txt \
     "unsloth[colab] @ git+https://github.com/unslothai/unsloth.git"
 
 # ===============================

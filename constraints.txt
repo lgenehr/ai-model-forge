@@ -1,2 +1,11 @@
+# Python 3.11 compatibility
 pyparsing>=3.1.0
 numpy>=1.26.4
+
+# Evita backtracking infinito
+jinja2>=3.1.3
+markupsafe>=2.1.3
+
+# Infra comum
+packaging>=23.2
+typing-extensions>=4.8.0
