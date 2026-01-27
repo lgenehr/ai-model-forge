@@ -73,7 +73,10 @@ ENV LLAMA_CPP_PATH=/opt/llama.cpp
 
 RUN git clone https://github.com/ggerganov/llama.cpp ${LLAMA_CPP_PATH} \
     && cd ${LLAMA_CPP_PATH} \
-    && make -j$(nproc)
+    && mkdir build \
+    && cd build \
+    && cmake .. \
+    && cmake --build . --config Release -j$(nproc)
 
 ENV PATH="${LLAMA_CPP_PATH}/build/bin:${PATH}"
 
