@@ -32,6 +32,7 @@ def parse_args():
     parser.add_argument("--max_seq_length", type=int, default=4096)
     parser.add_argument("--dataset_pattern", type=str, default="/workspace/ai-model-forge/dataset-financing-infos/dataset/*.jsonl")
     parser.add_argument("--dataset_num_proc", type=int, default=16, help="Cores para processar dataset")
+    parser.add_argument("--model_cache_dir", type=str, default="/workspace/models", help="Diretório persistente para cache de modelos HF")
 
     # LoRA Params (Configuração Agressiva V3)
     parser.add_argument("--lora_r", type=int, default=64)
@@ -100,13 +101,30 @@ def train(args):
     # Prepara o ambiente do llama.cpp ANTES de começar o treino para garantir que tudo funciona
     convert_script, quantize_bin = setup_llama_cpp(args.llama_cpp_path)
 
+    os.makedirs(args.model_cache_dir, exist_ok=True)
+    os.environ["HF_HOME"] = args.model_cache_dir
+    os.environ["TRANSFORMERS_CACHE"] = args.model_cache_dir
+    os.environ["HF_DATASETS_CACHE"] = args.model_cache_dir
+    os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+
     # 1. Carregar Modelo
     logger.info(f"Carregando modelo {args.model_name}...")
+    
+    # Resolve caminho local se já existir
+    local_model_path = os.path.join(
+        args.model_cache_dir,
+        args.model_name.replace("/", "__")
+    )
+
+    model_source = local_model_path if os.path.isdir(local_model_path) else args.model_name
+
+    logger.info(f"📦 Fonte do modelo: {model_source}")
+
     model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name = args.model_name,
+        model_name = model_source,
         max_seq_length = args.max_seq_length,
-        dtype = None, 
-        load_in_4bit = True, 
+        dtype = None,
+        load_in_4bit = True,
     )
 
     # 2. Configurar LoRA (Agressivo V3)
