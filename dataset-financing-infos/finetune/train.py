@@ -30,7 +30,7 @@ def parse_args():
     # Model & Data
     parser.add_argument("--model_name", type=str, default="unsloth/Qwen2.5-14B-Instruct")
     parser.add_argument("--max_seq_length", type=int, default=4096)
-    parser.add_argument("--dataset_pattern", type=str, default="/workspace/ai-model-forge/dataset-financing-infos/dataset/*.jsonl")
+    parser.add_argument("--dataset_pattern", type=str, default="../dataset/dataset_*.jsonl")
     parser.add_argument("--dataset_num_proc", type=int, default=16, help="Cores para processar dataset")
     parser.add_argument("--model_cache_dir", type=str, default="/workspace/models", help="Diretório persistente para cache de modelos HF")
 
