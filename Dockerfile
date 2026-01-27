@@ -98,7 +98,7 @@ RUN python -m pip install --no-cache-dir \
 # Validação
 # ===============================
 RUN python - <<EOF
-import sys, torch, pyparsing,
+import sys, torch, pyparsing
 print("Python:", sys.version)
 print("Torch:", torch.__version__)
 print("CUDA:", torch.version.cuda)
