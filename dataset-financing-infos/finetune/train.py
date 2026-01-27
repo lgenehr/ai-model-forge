@@ -12,7 +12,7 @@ from transformers import TrainingArguments, EarlyStoppingCallback
 from unsloth import is_bfloat16_supported
 from data_utils import prepare_hf_dataset
 import logging
-import os, wandb; os.environ["WANDB_API_KEY"] = args.wandb_api_key if args.wandb_api_key else os.environ.get("WANDB_API_KEY", ""); wandb.login(key=os.environ["WANDB_API_KEY"]) if os.environ["WANDB_API_KEY"] else None
+import os
 
 # Tenta importar wandb, se não tiver, avisa
 try:
@@ -57,6 +57,7 @@ def parse_args():
 
     return parser.parse_args()
 
+
 def run_command(command, description):
     """Executa comandos shell e loga o output em tempo real"""
     logger.info(f"🚀 [Executando]: {description}")
@@ -85,9 +86,13 @@ def setup_llama_cpp(base_path):
 
 def train(args):
     # 0. Setup Inicial (WandB e Llama.cpp)
-    if wandb:
-        # Se não estiver logado, isso vai pedir o token no terminal
+    if wandb and args.wandb_api_key:
+        os.environ["WANDB_API_KEY"] = args.wandb_api_key
+        wandb.login(key=args.wandb_api_key)
         wandb.init(project=args.wandb_project, name=args.wandb_run_name)
+    elif wandb:
+        logger.warning("⚠️ wandb instalado, mas sem --wandb_api_key. Não vou inicializar o wandb para evitar prompt interativo.")
+        os.environ["WANDB_MODE"] = "disabled"
     else:
         logger.warning("⚠️ WandB não está instalado. Instale com `pip install wandb` para logs gráficos.")
 
