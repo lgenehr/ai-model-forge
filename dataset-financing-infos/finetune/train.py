@@ -48,10 +48,11 @@ def parse_args():
     # WandB
     parser.add_argument("--wandb_project", type=str, default="finetune-financeiro-qwen", help="Nome do projeto no WandB")
     parser.add_argument("--wandb_run_name", type=str, default="run-v3-agressivo", help="Nome da run")
+    parser.add_argument("--logging_steps",type=int,default=10,help="Número de steps entre logs")
 
     # Llama.cpp Automation
     parser.add_argument("--llama_cpp_path", type=str, default="/opt/llama.cpp", help="Caminho para instalar/usar o llama.cpp")
-    
+
     return parser.parse_args()
 
 def run_command(command, description):
