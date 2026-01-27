@@ -77,8 +77,26 @@ docker run --gpus all \
     --lora_dropout 0.05 \
     --dataset_num_proc 16 \
     --wandb_project "finetune-financeiro-qwen" \
-    --wandb_run_name "run-v3-docker" --wandb_api_key "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"
+    --wandb_run_name "run-v4-docker" --wandb_api_key "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"
 ```
+
+### Fine-tuning Local
+
+```bash
+  python train.py \
+    --model_name "unsloth/Qwen2.5-14B-Instruct" \
+    --output_dir "financial_finetune_v4" \
+    --llama_cpp_path "/opt/llama.cpp" \
+    --batch_size 1 \
+    --grad_accum_steps 16 \
+    --epochs 3 \
+    --lora_r 64 \
+    --lora_alpha 128 \
+    --lora_dropout 0.05 \
+    --dataset_num_proc 16 \
+    --wandb_project "finetune-financeiro-qwen-v4" \
+    --wandb_run_name "run-v4-docker" --wandb_api_key "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"
+  ```
 
 ## Project Structure
 

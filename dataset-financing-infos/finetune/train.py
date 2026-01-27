@@ -9,10 +9,9 @@ import multiprocessing
 from unsloth import FastLanguageModel, is_bfloat16_supported
 from trl import SFTTrainer
 from transformers import TrainingArguments, EarlyStoppingCallback
-from data_utils import prepare_hf_dataset  # Certifique-se de que este arquivo existe
-from huggingface_hub import snapshot_download # Necessário: pip install huggingface_hub
+from data_utils import prepare_hf_dataset
+from huggingface_hub import snapshot_download
 
-# Tenta importar wandb
 try:
     import wandb
 except ImportError:
@@ -32,7 +31,9 @@ def parse_args():
     parser.add_argument("--dataset_pattern", type=str, default="../dataset/*.jsonl")
     parser.add_argument("--dataset_num_proc", type=int, default=16, help="Cores para processar dataset")
     # Pasta onde o modelo será salvo fisicamente para evitar download repetido
-    parser.add_argument("--model_cache_dir", type=str, default="/models_cache", help="Diretório persistente para cache de modelos HF")
+    # Em Docker: use volumes montados como /models_cache
+    # Localmente: fallback para ~/models_cache
+    parser.add_argument("--model_cache_dir", type=str, default="/models_cache", help="Diretório persistente para cache de modelos HF. Em Docker, configure volume mount para este caminho.")
 
     # LoRA Params (Configuração Agressiva)
     parser.add_argument("--lora_r", type=int, default=64)
@@ -55,7 +56,7 @@ def parse_args():
     parser.add_argument("--wandb_api_key", type=str, default=None)
 
     # Llama.cpp Automation
-    parser.add_argument("--llama_cpp_path", type=str, default="/opt/llama.cpp")
+    parser.add_argument("--llama_cpp_path", type=str, default="/opt/llama.cpp", help="Caminho para llama.cpp. Em Docker, pode usar volume mount ou deixar compilar localmente.")
 
     return parser.parse_args()
 
@@ -69,21 +70,172 @@ def run_command(command, description):
         logger.error(f"❌ [Erro] Falha em: {description}")
         sys.exit(1)
 
-def setup_llama_cpp(base_path):
-    """Verifica se as ferramentas do llama.cpp estão disponíveis"""
+def check_command_exists(command):
+    """Verifica se um comando está disponível no sistema"""
+    result = subprocess.run(f"which {command}", shell=True, capture_output=True)
+    return result.returncode == 0
+
+def get_writable_path(requested_path, default_fallback=""):
+    """
+    Verifica se um caminho é gravável. Tenta criar se necessário.
+    Respeita volumes montados em containers Docker.
+    Só faz fallback se absolutamente necessário.
+    """
+    expanded_path = os.path.expanduser(requested_path)
+    parent_dir = os.path.dirname(expanded_path) or expanded_path
+    
+    # Se o caminho já existe e é gravável, usa
+    if os.path.exists(expanded_path) and os.access(expanded_path, os.W_OK):
+        logger.info(f"✅ Usando caminho existente: {expanded_path}")
+        return expanded_path
+    
+    # Tenta criar o diretório (importante para volumes Docker montados)
+    try:
+        os.makedirs(expanded_path, exist_ok=True)
+        logger.info(f"✅ Diretório criado/verificado: {expanded_path}")
+        return expanded_path
+    except PermissionError as e:
+        logger.error(f"❌ Sem permissão para criar/acessar: {expanded_path}")
+        logger.error(f"   Erro: {e}")
+        
+        # Só usa fallback se especificado
+        if default_fallback:
+            fallback = os.path.expanduser(f"~/{default_fallback}")
+            logger.warning(f"⚠️ Usando fallback no home directory: {fallback}")
+            try:
+                os.makedirs(fallback, exist_ok=True)
+                return fallback
+            except Exception as fallback_error:
+                logger.error(f"❌ Falha no fallback também: {fallback_error}")
+                sys.exit(1)
+        else:
+            sys.exit(1)
+
+def setup_llama_cpp_auto(base_path):
+    """
+    Verifica se llama.cpp existe. Se não, faz download e compila.
+    Retorna os caminhos para convert_script e quantize_bin.
+    """
     path = os.path.expanduser(base_path)
+    
+    # Verifica se o diretório pai é gravável
+    parent_dir = os.path.dirname(path)
+    if not os.access(parent_dir, os.W_OK):
+        # Fall back to home directory
+        fallback_path = os.path.expanduser("~/llama.cpp")
+        logger.warning(f"⚠️ Sem permissão para escrever em {parent_dir}")
+        logger.info(f"📁 Usando diretório alternativo: {fallback_path}")
+        path = fallback_path
+    
     convert_script = os.path.join(path, "convert_hf_to_gguf.py")
     quantize_bin = os.path.join(path, "build", "bin", "llama-quantize")
 
+    # Se ambos os arquivos existem, retorna
+    if os.path.isfile(convert_script) and os.path.isfile(quantize_bin):
+        logger.info(f"✅ llama.cpp já configurado em: {path}")
+        return convert_script, quantize_bin
+
+    # Caso contrário, inicia setup automático
+    logger.info(f"⬇️ llama.cpp não encontrado em {path}. Iniciando download e compilação...")
+
+    # Verifica dependências de build
+    required_tools = ["git", "cmake", "make", "gcc", "g++"]
+    for tool in required_tools:
+        if not check_command_exists(tool):
+            logger.error(f"❌ {tool} não está instalado. Instale com: sudo apt-get install {tool}")
+            sys.exit(1)
+
+    logger.info("✅ Todas as dependências de build estão disponíveis.")
+
+    # Cria diretório pai se não existir
+    parent_dir = os.path.dirname(path)
+    os.makedirs(parent_dir, exist_ok=True)
+
+    # Clone do repositório
+    if not os.path.exists(path):
+        logger.info(f"🔗 Clonando llama.cpp de GitHub para {path}...")
+        try:
+            run_command(f"git clone https://github.com/ggerganov/llama.cpp {path}", "Clone do llama.cpp")
+        except SystemExit:
+            logger.error(f"❌ Falha ao clonar para {path}. Verifique permissões.")
+            sys.exit(1)
+    else:
+        logger.info(f"📁 Diretório {path} existe, atualizando repositório...")
+        try:
+            run_command(f"cd {path} && git pull origin master", "Atualização do repositório llama.cpp")
+        except SystemExit:
+            logger.warning(f"⚠️ Não foi possível atualizar repositório em {path}")
+
+    # Compilação
+    logger.info("🔨 Compilando llama.cpp (isso pode levar alguns minutos)...")
+    try:
+        run_command(f"cd {path} && mkdir -p build && cd build && cmake .. && make -j{multiprocessing.cpu_count()}", 
+                    "Compilação do llama.cpp")
+    except SystemExit:
+        logger.error(f"❌ Erro durante compilação de llama.cpp em {path}")
+        sys.exit(1)
+
+    # Verifica se a compilação foi bem-sucedida
     if not os.path.isfile(convert_script):
-        logger.error(f"❌ Script não encontrado: {convert_script}")
+        logger.error(f"❌ Script não encontrado após compilação: {convert_script}")
         sys.exit(1)
 
     if not os.path.isfile(quantize_bin):
-        logger.error(f"❌ Binário não encontrado: {quantize_bin}")
+        logger.error(f"❌ Binário não encontrado após compilação: {quantize_bin}")
         sys.exit(1)
 
+    logger.info(f"✨ llama.cpp compilado com sucesso em: {path}")
     return convert_script, quantize_bin
+
+def get_latest_checkpoint(output_dir):
+    """
+    Encontra o checkpoint mais recente em output_dir.
+    Funciona tanto em Docker quanto em WSL/Linux local.
+    Retorna o caminho completo do checkpoint ou None.
+    """
+    if not os.path.isdir(output_dir):
+        logger.warning(f"⚠️ Diretório de output não existe: {output_dir}")
+        return None
+    
+    checkpoint_dirs = []
+    try:
+        for item in os.listdir(output_dir):
+            if item.startswith("checkpoint-"):
+                checkpoint_path = os.path.join(output_dir, item)
+                if os.path.isdir(checkpoint_path):
+                    # Extrai número do checkpoint
+                    try:
+                        step_num = int(item.split("-")[1])
+                        checkpoint_dirs.append((step_num, checkpoint_path))
+                    except (ValueError, IndexError):
+                        continue
+    except PermissionError as e:
+        logger.warning(f"⚠️ Sem permissão para ler {output_dir}: {e}")
+        return None
+    
+    if not checkpoint_dirs:
+        logger.info(f"ℹ️ Nenhum checkpoint encontrado em {output_dir}")
+        return None
+    
+    # Retorna o checkpoint com maior step_num
+    latest_step, latest_checkpoint = max(checkpoint_dirs, key=lambda x: x[0])
+    logger.info(f"✅ Checkpoint mais recente encontrado: {latest_checkpoint} (step {latest_step})")
+    return latest_checkpoint
+
+def validate_checkpoint(checkpoint_path):
+    """
+    Valida se um checkpoint é acessível e contém arquivos essenciais.
+    """
+    required_files = ["adapter_config.json", "adapter_model.bin"]
+    
+    for file in required_files:
+        file_path = os.path.join(checkpoint_path, file)
+        if not os.path.isfile(file_path):
+            logger.warning(f"⚠️ Arquivo faltando no checkpoint: {file}")
+            return False
+    
+    logger.info(f"✅ Checkpoint validado: {checkpoint_path}")
+    return True
 
 def train(args):
     # --- 0. Setup Inicial ---
@@ -95,14 +247,26 @@ def train(args):
         os.environ["WANDB_MODE"] = "disabled"
         logger.warning("⚠️ WandB instalado, mas sem API Key. Desativando.")
 
-    convert_script, quantize_bin = setup_llama_cpp(args.llama_cpp_path)
+    convert_script, quantize_bin = setup_llama_cpp_auto(args.llama_cpp_path)
 
+    # Obtém caminhos com fallback para permissões
+    model_cache_dir = get_writable_path(args.model_cache_dir, "models_cache")
+    output_dir = get_writable_path(args.output_dir, "finetuned_models")
+    
     # Cria diretórios necessários
-    os.makedirs(args.model_cache_dir, exist_ok=True)
-    os.makedirs(args.output_dir, exist_ok=True)
+    os.makedirs(model_cache_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
+    
+    logger.info(f"")
+    logger.info(f"📁 ========== DIRETÓRIOS CONFIGURADOS ==========")
+    logger.info(f"📁 model_cache_dir: {model_cache_dir}")
+    logger.info(f"📁 output_dir: {output_dir}")
+    logger.info(f"📁 llama.cpp path: {args.llama_cpp_path}")
+    logger.info(f"📁 =============================================")
+    logger.info(f"")
     
     # Configura variáveis de ambiente do HF para usar nossa pasta de cache
-    os.environ["HF_HOME"] = args.model_cache_dir
+    os.environ["HF_HOME"] = model_cache_dir
     os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 
     # --- 1. Carregar Modelo (Lógica de Cache Inteligente) ---
@@ -110,7 +274,7 @@ def train(args):
     
     # Define nome de pasta seguro (ex: unsloth/Qwen -> unsloth__Qwen)
     local_model_name = args.model_name.replace("/", "__")
-    local_model_path = os.path.join(args.model_cache_dir, local_model_name)
+    local_model_path = os.path.join(model_cache_dir, local_model_name)
 
     # Verifica se o modelo existe fisicamente na pasta mapeada
     if os.path.exists(local_model_path) and os.listdir(local_model_path):
@@ -134,7 +298,7 @@ def train(args):
     logger.info(f"📦 Carregando modelo na memória a partir de: {model_source}")
 
     model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name = model_source, # Usa sempre o caminho local agora
+        model_name = model_source,
         max_seq_length = args.max_seq_length,
         dtype = None,
         load_in_4bit = True,
@@ -194,8 +358,8 @@ def train(args):
         weight_decay = 0.01,
         lr_scheduler_type = "cosine",
         seed = 3407,
-        output_dir = args.output_dir,
-        gradient_checkpointing = True, # Obrigatório para 16GB VRAM
+        output_dir = output_dir,
+        gradient_checkpointing = True,
         report_to = "wandb" if wandb and args.wandb_api_key else "none",
         run_name = args.wandb_run_name,
         eval_strategy = "steps",
@@ -218,42 +382,87 @@ def train(args):
         callbacks = [EarlyStoppingCallback(early_stopping_patience=3)]
     )
 
-    # --- 5. Treino ---
+    # --- 5. Treino com Checkpoint Automático ---
     logger.info("🔥 Iniciando Treinamento...")
-    trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
+    
+    # Detecta e valida checkpoint se --resume_from_checkpoint foi passado
+    resume_checkpoint = None
+    if args.resume_from_checkpoint:
+        latest_checkpoint = get_latest_checkpoint(output_dir)
+        if latest_checkpoint and validate_checkpoint(latest_checkpoint):
+            resume_checkpoint = latest_checkpoint
+            logger.info(f"📂 Retomando do checkpoint: {resume_checkpoint}")
+        else:
+            logger.warning("⚠️ Flag --resume_from_checkpoint ativada, mas checkpoint não encontrado ou inválido. Iniciando do zero.")
+    
+    trainer.train(resume_from_checkpoint=resume_checkpoint)
     logger.info("🏁 Treinamento concluído.")
 
     # --- 6. Salvar e Merge ---
     logger.info("💾 Salvando modelo mergeado (Safetensors 16-bit)...")
-    merged_dir = os.path.join(args.output_dir, "merged_model_hf")
+    merged_dir = os.path.join(output_dir, "merged_model_hf")
     
-    # Limpeza de VRAM
+    # Limpeza de VRAM ANTES do merge (crítico!)
     torch.cuda.empty_cache()
     gc.collect()
 
-    # Salva o modelo mergeado (LoRA + Base)
-    model.save_pretrained_merged(merged_dir, tokenizer, save_method = "merged_16bit")
-    
+    try:
+        model.save_pretrained_merged(merged_dir, tokenizer, save_method = "merged_16bit")
+        logger.info(f"✅ Modelo mergeado salvo em: {merged_dir}")
+    except Exception as e:
+        logger.error(f"❌ Erro ao salvar modelo mergeado: {e}")
+        sys.exit(1)
+
     if wandb:
         wandb.finish()
 
     # --- 7. Conversão e Quantização (Llama.cpp) ---
     logger.info("⚙️ Iniciando conversão via llama.cpp...")
     
-    fp16_gguf = os.path.join(args.output_dir, "model_fp16.gguf")
-    final_q4_gguf = os.path.join(args.output_dir, "modelo_final_q4_k_m.gguf")
+    # Validação crítica
+    if not os.path.isdir(merged_dir) or not os.listdir(merged_dir):
+        logger.error(f"❌ Diretório do modelo mergeado vazio ou inexistente: {merged_dir}")
+        sys.exit(1)
+    
+    logger.info(f"✅ Validado modelo mergeado em: {merged_dir}")
+    
+    fp16_gguf = os.path.join(output_dir, "model_fp16.gguf")
+    final_q4_gguf = os.path.join(output_dir, "modelo_final_q4_k_m.gguf")
+    
+    # Limpeza antes da conversão
+    torch.cuda.empty_cache()
+    gc.collect()
     
     # A) HF -> GGUF FP16
-    run_command(f"python3 {convert_script} {merged_dir} --outfile {fp16_gguf} --outtype f16", "Conversão FP16")
+    try:
+        run_command(f"python3 {convert_script} {merged_dir} --outfile {fp16_gguf} --outtype f16", "Conversão FP16")
+        if not os.path.isfile(fp16_gguf):
+            logger.error(f"❌ Conversão falhou: arquivo não gerado {fp16_gguf}")
+            sys.exit(1)
+        logger.info(f"✅ Conversão FP16 concluída: {fp16_gguf}")
+    except SystemExit:
+        logger.error("❌ Falha na conversão FP16")
+        sys.exit(1)
     
-    # B) FP16 -> Q4_K_M (Usando TODOS os núcleos do Ryzen)
-    cpu_threads = multiprocessing.cpu_count()
-    run_command(f"{quantize_bin} {fp16_gguf} {final_q4_gguf} q4_k_m {cpu_threads}", f"Quantização Q4 com {cpu_threads} threads")
+    # B) FP16 -> Q4_K_M
+    try:
+        cpu_threads = multiprocessing.cpu_count()
+        run_command(f"{quantize_bin} {fp16_gguf} {final_q4_gguf} q4_k_m {cpu_threads}", f"Quantização Q4 com {cpu_threads} threads")
+        if not os.path.isfile(final_q4_gguf):
+            logger.error(f"❌ Quantização falhou: arquivo não gerado {final_q4_gguf}")
+            sys.exit(1)
+        logger.info(f"✅ Quantização Q4 concluída: {final_q4_gguf}")
+    except SystemExit:
+        logger.error("❌ Falha na quantização Q4")
+        sys.exit(1)
 
     # C) Limpeza
     if os.path.exists(fp16_gguf):
-        os.remove(fp16_gguf)
-        logger.info("🗑️ Arquivo temporário FP16 removido.")
+        try:
+            os.remove(fp16_gguf)
+            logger.info("🗑️ Arquivo temporário FP16 removido.")
+        except Exception as e:
+            logger.warning(f"⚠️ Não foi possível remover {fp16_gguf}: {e}")
 
     logger.info(f"✨ SUCESSO! Modelo final pronto em: {final_q4_gguf}")
 

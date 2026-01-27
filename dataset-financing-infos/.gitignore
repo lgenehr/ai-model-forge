@@ -11,6 +11,7 @@ build/
 .env
 venv/
 dataset/*.jsonl
+dataset/*.json
 !dataset/sample.jsonl
 data_raw/
 data_processed/
