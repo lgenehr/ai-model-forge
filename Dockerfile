@@ -52,6 +52,7 @@ RUN python -m pip install --no-cache-dir \
 RUN python -m pip install --no-cache-dir \
     -c /tmp/constraints.txt \
     unsloth@git+https://github.com/unslothai/unsloth.git \
+    unsloth_zoo \
     bitsandbytes \
     accelerate \
     trl \
