@@ -190,7 +190,7 @@ def train(args):
         fp16 = not is_bfloat16_supported(),
         bf16 = is_bfloat16_supported(),
         logging_steps = args.logging_steps,
-        optim = "adamw_8bit",
+        optim = "paged_adamw_8bit",
         weight_decay = 0.01,
         lr_scheduler_type = "cosine",
         seed = 3407,
