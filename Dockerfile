@@ -48,10 +48,14 @@ RUN python -m pip install --no-cache-dir \
     torchaudio==2.10.0 \
     --no-deps
 
-# Agora o ecossistema, com constraints
+# Ecossistema controlado
 RUN python -m pip install --no-cache-dir \
     -c /tmp/constraints.txt \
-    "unsloth[colab] @ git+https://github.com/unslothai/unsloth.git"
+    unsloth @ git+https://github.com/unslothai/unsloth.git \
+    bitsandbytes \
+    accelerate \
+    trl \
+    peft
 
 # ===============================
 # Dependências GGUF
@@ -91,7 +95,7 @@ RUN python -m pip install --no-cache-dir \
 # Validação
 # ===============================
 RUN python - <<EOF
-import sys, torch, pyparsing
+import sys, torch, pyparsing,
 print("Python:", sys.version)
 print("Torch:", torch.__version__)
 print("CUDA:", torch.version.cuda)

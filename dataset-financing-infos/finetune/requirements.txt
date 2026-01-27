@@ -1,14 +1,14 @@
 # Core HF / treino
-transformers
-trl
-accelerate
-datasets
-peft
+transformers>=4.39
+trl>=0.8
+accelerate>=0.27
+datasets>=2.18
+peft>=0.10
 
 # Quantização / LoRA runtime
-bitsandbytes
+bitsandbytes>=0.45.5
 
 # Utils
-pandas
-scipy
-wandb
+pandas>=2.1
+scipy>=1.11
+wandb>=0.16
