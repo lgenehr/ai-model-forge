@@ -12,6 +12,7 @@ from transformers import TrainingArguments, EarlyStoppingCallback
 from unsloth import is_bfloat16_supported
 from data_utils import prepare_hf_dataset
 import logging
+import os, wandb; os.environ["WANDB_API_KEY"] = args.wandb_api_key if args.wandb_api_key else os.environ.get("WANDB_API_KEY", ""); wandb.login(key=os.environ["WANDB_API_KEY"]) if os.environ["WANDB_API_KEY"] else None
 
 # Tenta importar wandb, se não tiver, avisa
 try:
@@ -44,11 +45,12 @@ def parse_args():
     parser.add_argument("--learning_rate", type=float, default=2e-4)
     parser.add_argument("--output_dir", type=str, default="financial_finetune_v3_agressivo")
     parser.add_argument("--resume_from_checkpoint", action="store_true")
+    parser.add_argument("--logging_steps",type=int,default=10,help="Número de steps entre logs")
     
     # WandB
     parser.add_argument("--wandb_project", type=str, default="finetune-financeiro-qwen", help="Nome do projeto no WandB")
     parser.add_argument("--wandb_run_name", type=str, default="run-v3-agressivo", help="Nome da run")
-    parser.add_argument("--logging_steps",type=int,default=10,help="Número de steps entre logs")
+    parser.add_argument("--wandb_api_key", type=str, default=None, help="API key do Weights & Biases")
 
     # Llama.cpp Automation
     parser.add_argument("--llama_cpp_path", type=str, default="/opt/llama.cpp", help="Caminho para instalar/usar o llama.cpp")
