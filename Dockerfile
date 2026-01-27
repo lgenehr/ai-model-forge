@@ -51,7 +51,7 @@ RUN python -m pip install --no-cache-dir \
 # Ecossistema controlado
 RUN python -m pip install --no-cache-dir \
     -c /tmp/constraints.txt \
-    unsloth @ git+https://github.com/unslothai/unsloth.git \
+    unsloth@git+https://github.com/unslothai/unsloth.git \
     bitsandbytes \
     accelerate \
     trl \
