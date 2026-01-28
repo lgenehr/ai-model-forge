@@ -40,9 +40,54 @@ def parse_args():
     # Resume Logic (NOVO)
     parser.add_argument("--resume_from_checkpoint", type=bool, default=False, help="Resume from latest checkpoint")
     
+    # Merge & Convert Logic
+    parser.add_argument("--merge_and_quantize", action="store_true", help="Merge model and quantize to GGUF after training")
+    parser.add_argument("--convert_only", action="store_true", help="Skip training and only perform merge/quantization of existing adapters")
+
     return parser.parse_args()
 
+def run_merge_and_quantize(model, tokenizer, output_dir):
+    """
+    Merges the LoRA adapters with the base model and saves to GGUF (Q4_K_M).
+    """
+    logger.info("Starting Merge and Quantization process...")
+    try:
+        # Save merged 16bit model first (optional but good for safety/reference)
+        # logger.info(f"Saving merged 16-bit model to {output_dir}/model_merged...")
+        # model.save_pretrained_merged(f"{output_dir}/model_merged", tokenizer, save_method="merged_16bit")
+
+        # Save GGUF Q4_K_M
+        logger.info(f"Saving GGUF (Q4_K_M) to {output_dir}/model_gguf...")
+        model.save_pretrained_merged(f"{output_dir}/model_gguf", tokenizer, save_method="gguf_q4_k_m")
+        logger.info("Merge and Quantization complete!")
+
+    except Exception as e:
+        logger.error(f"Failed to merge/quantize: {e}")
+        logger.warning("Ensure you have enough RAM (usually >16GB for 7B/14B models) and llama.cpp dependencies installed.")
+
 def train(args):
+    # Special flow for Convert Only
+    if args.convert_only:
+        logger.info("Running in CONVERT ONLY mode.")
+        adapter_path = f"{args.output_dir}/lora_adapters"
+
+        if not os.path.exists(adapter_path):
+            raise FileNotFoundError(f"Could not find adapters at {adapter_path}. Cannot convert.")
+
+        logger.info(f"Loading adapters from {adapter_path}...")
+        # Unsloth handles loading base model from the adapter config if available,
+        # or we might need to specify model_name if it's not relative.
+        # Assuming standard usage where adapter points to base.
+        model, tokenizer = FastLanguageModel.from_pretrained(
+            model_name = adapter_path, # Load the adapter (which loads base)
+            max_seq_length = args.max_seq_length,
+            dtype = None,
+            load_in_4bit = args.load_in_4bit,
+        )
+
+        run_merge_and_quantize(model, tokenizer, args.output_dir)
+        return
+
     # 1. Load Model & Tokenizer using Unsloth
     logger.info(f"Loading model {args.model_name}...")
     model, tokenizer = FastLanguageModel.from_pretrained(
@@ -153,14 +198,9 @@ def train(args):
     model.save_pretrained(f"{args.output_dir}/lora_adapters") 
     tokenizer.save_pretrained(f"{args.output_dir}/lora_adapters")
 
-    logger.info("Attempting to save merged model (High RAM usage)...")
-    try:
-        # Tenta salvar o modelo completo. Se der erro de memória, não perde o que já fez.
-        model.save_pretrained_merged(f"{args.output_dir}/model_merged", tokenizer, save_method = "merged_16bit")
-        model.save_pretrained_merged(f"{args.output_dir}/model_gguf", tokenizer, save_method = "gguf_q4_k_m")
-    except Exception as e:
-        logger.warning(f"Could not merge model due to memory constraints: {e}")
-        logger.info("Don't worry, LoRA adapters were saved above! You can merge later.")
+    # Merge if requested
+    if args.merge_and_quantize:
+        run_merge_and_quantize(model, tokenizer, args.output_dir)
 
     # 8. Inference Test
     logger.info("Running inference test...")
