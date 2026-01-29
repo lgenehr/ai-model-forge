@@ -23,11 +23,11 @@ logger = logging.getLogger(__name__)
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Fine-tune Qwen 2.5 14B with Smart Caching & Auto-Llama.cpp")
-    
+
     # Model & Data
     parser.add_argument("--model_name", type=str, default="unsloth/Qwen2.5-14B-Instruct")
     # 4096 é o limite seguro para 16GB de VRAM. Tentar 8192 pode causar OOM.
-    parser.add_argument("--max_seq_length", type=int, default=4096) 
+    parser.add_argument("--max_seq_length", type=int, default=4096)
     parser.add_argument("--dataset_pattern", type=str, default="../dataset/*.jsonl")
     parser.add_argument("--dataset_num_proc", type=int, default=16, help="Cores para processar dataset")
     # Pasta onde o modelo será salvo fisicamente para evitar download repetido
@@ -57,6 +57,10 @@ def parse_args():
 
     # Llama.cpp Automation
     parser.add_argument("--llama_cpp_path", type=str, default="/opt/llama.cpp", help="Caminho para llama.cpp. Em Docker, pode usar volume mount ou deixar compilar localmente.")
+
+    # Merge & Convert Logic (Jules Features)
+    parser.add_argument("--merge_and_quantize", action="store_true", help="Merge model and quantize to GGUF after training")
+    parser.add_argument("--convert_only", action="store_true", help="Skip training and only perform merge/quantization of existing adapters")
 
     return parser.parse_args()
 
@@ -97,7 +101,7 @@ def get_writable_path(requested_path, default_fallback=""):
     except PermissionError as e:
         logger.error(f"❌ Sem permissão para criar/acessar: {expanded_path}")
         logger.error(f"   Erro: {e}")
-        
+
         # Só usa fallback se especificado
         if default_fallback:
             fallback = os.path.expanduser(f"~/{default_fallback}")
@@ -169,7 +173,7 @@ def setup_llama_cpp_auto(base_path):
     # Compilação
     logger.info("🔨 Compilando llama.cpp (isso pode levar alguns minutos)...")
     try:
-        run_command(f"cd {path} && mkdir -p build && cd build && cmake .. && make -j{multiprocessing.cpu_count()}", 
+        run_command(f"cd {path} && mkdir -p build && cd build && cmake .. && make -j{multiprocessing.cpu_count()}",
                     "Compilação do llama.cpp")
     except SystemExit:
         logger.error(f"❌ Erro durante compilação de llama.cpp em {path}")
@@ -196,7 +200,7 @@ def get_latest_checkpoint(output_dir):
     if not os.path.isdir(output_dir):
         logger.warning(f"⚠️ Diretório de output não existe: {output_dir}")
         return None
-    
+
     checkpoint_dirs = []
     try:
         for item in os.listdir(output_dir):
@@ -212,11 +216,11 @@ def get_latest_checkpoint(output_dir):
     except PermissionError as e:
         logger.warning(f"⚠️ Sem permissão para ler {output_dir}: {e}")
         return None
-    
+
     if not checkpoint_dirs:
         logger.info(f"ℹ️ Nenhum checkpoint encontrado em {output_dir}")
         return None
-    
+
     # Retorna o checkpoint com maior step_num
     latest_step, latest_checkpoint = max(checkpoint_dirs, key=lambda x: x[0])
     logger.info(f"✅ Checkpoint mais recente encontrado: {latest_checkpoint} (step {latest_step})")
@@ -227,18 +231,84 @@ def validate_checkpoint(checkpoint_path):
     Valida se um checkpoint é acessível e contém arquivos essenciais.
     """
     required_files = ["adapter_config.json", "adapter_model.bin"]
-    
+
     for file in required_files:
         file_path = os.path.join(checkpoint_path, file)
         if not os.path.isfile(file_path):
             logger.warning(f"⚠️ Arquivo faltando no checkpoint: {file}")
             return False
-    
+
     logger.info(f"✅ Checkpoint validado: {checkpoint_path}")
     return True
 
+def run_merge_and_quantize_manual(model, tokenizer, output_dir, llama_cpp_path):
+    """
+    Executa o merge manual e quantização usando os scripts do llama.cpp
+    configurados no ambiente.
+    """
+    logger.info("⚙️ Iniciando processo de merge e quantização manual...")
+
+    convert_script, quantize_bin = setup_llama_cpp_auto(llama_cpp_path)
+    merged_dir = os.path.join(output_dir, "merged_model_hf")
+
+    # 1. Salvar merged HF
+    logger.info("💾 Salvando modelo mergeado (Safetensors 16-bit)...")
+    # Limpeza de VRAM
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    try:
+        model.save_pretrained_merged(merged_dir, tokenizer, save_method = "merged_16bit")
+        logger.info(f"✅ Modelo mergeado salvo em: {merged_dir}")
+    except Exception as e:
+        logger.error(f"❌ Erro ao salvar modelo mergeado: {e}")
+        return
+
+    # 2. Validar diretório
+    if not os.path.isdir(merged_dir) or not os.listdir(merged_dir):
+        logger.error(f"❌ Diretório do modelo mergeado vazio ou inexistente: {merged_dir}")
+        return
+
+    fp16_gguf = os.path.join(output_dir, "model_fp16.gguf")
+    final_q4_gguf = os.path.join(output_dir, "modelo_final_q4_k_m.gguf")
+
+    # 3. Conversão HF -> GGUF FP16
+    logger.info("⚙️ Convertendo para GGUF FP16...")
+    try:
+        run_command(f"python3 {convert_script} {merged_dir} --outfile {fp16_gguf} --outtype f16", "Conversão FP16")
+        if not os.path.isfile(fp16_gguf):
+            logger.error(f"❌ Conversão falhou: arquivo não gerado {fp16_gguf}")
+            return
+    except SystemExit:
+        logger.error("❌ Falha na conversão FP16")
+        return
+
+    # 4. Quantização FP16 -> Q4
+    logger.info("⚙️ Quantizando para Q4_K_M...")
+    try:
+        cpu_threads = multiprocessing.cpu_count()
+        run_command(f"{quantize_bin} {fp16_gguf} {final_q4_gguf} q4_k_m {cpu_threads}", f"Quantização Q4 com {cpu_threads} threads")
+        if not os.path.isfile(final_q4_gguf):
+            logger.error(f"❌ Quantização falhou: arquivo não gerado {final_q4_gguf}")
+            return
+        logger.info(f"✅ Quantização Q4 concluída: {final_q4_gguf}")
+    except SystemExit:
+        logger.error("❌ Falha na quantização Q4")
+        return
+
+    # 5. Limpeza
+    if os.path.exists(fp16_gguf):
+        try:
+            os.remove(fp16_gguf)
+            logger.info("🗑️ Arquivo temporário FP16 removido.")
+        except Exception as e:
+            logger.warning(f"⚠️ Não foi possível remover {fp16_gguf}: {e}")
+
+    logger.info(f"✨ SUCESSO! Modelo final pronto em: {final_q4_gguf}")
+
+
 def train(args):
-    # --- 0. Setup Inicial ---
+    # --- 0. Setup Inicial (WandB, Diretórios) ---
     if wandb and args.wandb_api_key:
         os.environ["WANDB_API_KEY"] = args.wandb_api_key
         wandb.login(key=args.wandb_api_key)
@@ -247,32 +317,67 @@ def train(args):
         os.environ["WANDB_MODE"] = "disabled"
         logger.warning("⚠️ WandB instalado, mas sem API Key. Desativando.")
 
-    convert_script, quantize_bin = setup_llama_cpp_auto(args.llama_cpp_path)
-
     # Obtém caminhos com fallback para permissões
     model_cache_dir = get_writable_path(args.model_cache_dir, "models_cache")
     output_dir = get_writable_path(args.output_dir, "finetuned_models")
-    
+
     # Cria diretórios necessários
     os.makedirs(model_cache_dir, exist_ok=True)
     os.makedirs(output_dir, exist_ok=True)
-    
+
     logger.info(f"")
     logger.info(f"📁 ========== DIRETÓRIOS CONFIGURADOS ==========")
     logger.info(f"📁 model_cache_dir: {model_cache_dir}")
     logger.info(f"📁 output_dir: {output_dir}")
     logger.info(f"📁 llama.cpp path: {args.llama_cpp_path}")
     logger.info(f"📁 =============================================")
-    logger.info(f"")
-    
+
     # Configura variáveis de ambiente do HF para usar nossa pasta de cache
     os.environ["HF_HOME"] = model_cache_dir
     os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 
+    # --- 0.5 Special Flow: Convert Only ---
+    if args.convert_only:
+        logger.info("🔄 Running in CONVERT ONLY mode.")
+        adapter_path = os.path.join(output_dir, "checkpoint-final", "lora_adapters")
+        if not os.path.exists(adapter_path):
+             # Try simpler path if checkpoint structure differs
+             adapter_path = os.path.join(output_dir, "lora_adapters")
+
+        if not os.path.exists(adapter_path):
+            # Try finding latest checkpoint
+            latest = get_latest_checkpoint(output_dir)
+            if latest:
+                adapter_path = latest
+            else:
+                logger.error(f"❌ Could not find adapters in {output_dir}. Cannot convert.")
+                sys.exit(1)
+
+        logger.info(f"Loading adapters from {adapter_path}...")
+
+        # We need to know base model. Assume it's the one in args.
+        # Check cache logic again for base model path
+        local_model_name = args.model_name.replace("/", "__")
+        local_model_path = os.path.join(model_cache_dir, local_model_name)
+
+        if os.path.exists(local_model_path) and os.listdir(local_model_path):
+            model_source = local_model_path
+        else:
+            model_source = args.model_name # Fallback to download/HF
+
+        model, tokenizer = FastLanguageModel.from_pretrained(
+            model_name = adapter_path, # Load the adapter (which should link to base)
+            max_seq_length = args.max_seq_length,
+            dtype = None,
+            load_in_4bit = True,
+        )
+
+        run_merge_and_quantize_manual(model, tokenizer, output_dir, args.llama_cpp_path)
+        return
+
     # --- 1. Carregar Modelo (Lógica de Cache Inteligente) ---
     logger.info(f"🔍 Verificando modelo base: {args.model_name}")
-    
-    # Define nome de pasta seguro (ex: unsloth/Qwen -> unsloth__Qwen)
+
     local_model_name = args.model_name.replace("/", "__")
     local_model_path = os.path.join(model_cache_dir, local_model_name)
 
@@ -313,7 +418,7 @@ def train(args):
         lora_alpha = args.lora_alpha,
         lora_dropout = args.lora_dropout,
         bias = "none",
-        use_gradient_checkpointing = "unsloth", 
+        use_gradient_checkpointing = "unsloth",
         random_state = 3407,
     )
 
@@ -363,7 +468,7 @@ def train(args):
         report_to = "wandb" if wandb and args.wandb_api_key else "none",
         run_name = args.wandb_run_name,
         eval_strategy = "steps",
-        eval_steps = args.save_steps, 
+        eval_steps = args.save_steps,
         save_strategy = "steps",
         save_steps = args.save_steps,
         load_best_model_at_end = True,
@@ -399,72 +504,18 @@ def train(args):
     logger.info("🏁 Treinamento concluído.")
 
     # --- 6. Salvar e Merge ---
-    logger.info("💾 Salvando modelo mergeado (Safetensors 16-bit)...")
-    merged_dir = os.path.join(output_dir, "merged_model_hf")
-    
-    # Limpeza de VRAM ANTES do merge (crítico!)
-    torch.cuda.empty_cache()
-    gc.collect()
-
-    try:
-        model.save_pretrained_merged(merged_dir, tokenizer, save_method = "merged_16bit")
-        logger.info(f"✅ Modelo mergeado salvo em: {merged_dir}")
-    except Exception as e:
-        logger.error(f"❌ Erro ao salvar modelo mergeado: {e}")
-        sys.exit(1)
+    # Salva LoRA apenas
+    final_lora_dir = os.path.join(output_dir, "lora_adapters")
+    model.save_pretrained(final_lora_dir)
+    tokenizer.save_pretrained(final_lora_dir)
+    logger.info(f"💾 Adaptadores LoRA salvos em: {final_lora_dir}")
 
     if wandb:
         wandb.finish()
 
-    # --- 7. Conversão e Quantização (Llama.cpp) ---
-    logger.info("⚙️ Iniciando conversão via llama.cpp...")
-    
-    # Validação crítica
-    if not os.path.isdir(merged_dir) or not os.listdir(merged_dir):
-        logger.error(f"❌ Diretório do modelo mergeado vazio ou inexistente: {merged_dir}")
-        sys.exit(1)
-    
-    logger.info(f"✅ Validado modelo mergeado em: {merged_dir}")
-    
-    fp16_gguf = os.path.join(output_dir, "model_fp16.gguf")
-    final_q4_gguf = os.path.join(output_dir, "modelo_final_q4_k_m.gguf")
-    
-    # Limpeza antes da conversão
-    torch.cuda.empty_cache()
-    gc.collect()
-    
-    # A) HF -> GGUF FP16
-    try:
-        run_command(f"python3 {convert_script} {merged_dir} --outfile {fp16_gguf} --outtype f16", "Conversão FP16")
-        if not os.path.isfile(fp16_gguf):
-            logger.error(f"❌ Conversão falhou: arquivo não gerado {fp16_gguf}")
-            sys.exit(1)
-        logger.info(f"✅ Conversão FP16 concluída: {fp16_gguf}")
-    except SystemExit:
-        logger.error("❌ Falha na conversão FP16")
-        sys.exit(1)
-    
-    # B) FP16 -> Q4_K_M
-    try:
-        cpu_threads = multiprocessing.cpu_count()
-        run_command(f"{quantize_bin} {fp16_gguf} {final_q4_gguf} q4_k_m {cpu_threads}", f"Quantização Q4 com {cpu_threads} threads")
-        if not os.path.isfile(final_q4_gguf):
-            logger.error(f"❌ Quantização falhou: arquivo não gerado {final_q4_gguf}")
-            sys.exit(1)
-        logger.info(f"✅ Quantização Q4 concluída: {final_q4_gguf}")
-    except SystemExit:
-        logger.error("❌ Falha na quantização Q4")
-        sys.exit(1)
-
-    # C) Limpeza
-    if os.path.exists(fp16_gguf):
-        try:
-            os.remove(fp16_gguf)
-            logger.info("🗑️ Arquivo temporário FP16 removido.")
-        except Exception as e:
-            logger.warning(f"⚠️ Não foi possível remover {fp16_gguf}: {e}")
-
-    logger.info(f"✨ SUCESSO! Modelo final pronto em: {final_q4_gguf}")
+    # Merge/Quantize se solicitado
+    if args.merge_and_quantize:
+        run_merge_and_quantize_manual(model, tokenizer, output_dir, args.llama_cpp_path)
 
 if __name__ == "__main__":
     args = parse_args()
