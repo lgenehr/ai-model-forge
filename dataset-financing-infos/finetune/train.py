@@ -58,6 +58,13 @@ def parse_args():
     # Llama.cpp Automation
     parser.add_argument("--llama_cpp_path", type=str, default="/opt/llama.cpp", help="Caminho para llama.cpp. Em Docker, pode usar volume mount ou deixar compilar localmente.")
 
+    # Merge & GGUF Conversion
+    parser.add_argument("--merge_only", action="store_true", help="Apenas mergea checkpoint existente com modelo base e converte para GGUF (sem treinar)")
+    parser.add_argument("--checkpoint_path", type=str, default=None, help="Caminho específico para o checkpoint a ser mergeado. Se não informado, usa o checkpoint mais recente do output_dir")
+    parser.add_argument("--convert_to_gguf", action="store_true", help="Converte modelo mergeado para GGUF Q4_K_M após treinamento ou merge")
+    parser.add_argument("--skip_gguf_conversion", action="store_true", help="Pula conversão GGUF mesmo se --convert_to_gguf estiver ativo (útil para debug)")
+    parser.add_argument("--gguf_quantization", type=str, default="q4_k_m", choices=["q4_k_m", "q4_k_s", "q5_k_m", "q5_k_s", "q8_0", "f16"], help="Método de quantização GGUF")
+
     return parser.parse_args()
 
 def run_command(command, description):
@@ -225,17 +232,184 @@ def get_latest_checkpoint(output_dir):
 def validate_checkpoint(checkpoint_path):
     """
     Valida se um checkpoint é acessível e contém arquivos essenciais.
+    Suporta tanto formato .bin quanto .safetensors.
     """
-    required_files = ["adapter_config.json", "adapter_model.bin"]
-    
-    for file in required_files:
-        file_path = os.path.join(checkpoint_path, file)
-        if not os.path.isfile(file_path):
-            logger.warning(f"⚠️ Arquivo faltando no checkpoint: {file}")
-            return False
-    
+    # adapter_config.json é obrigatório
+    config_path = os.path.join(checkpoint_path, "adapter_config.json")
+    if not os.path.isfile(config_path):
+        logger.warning(f"⚠️ Arquivo faltando no checkpoint: adapter_config.json")
+        return False
+
+    # Verifica se existe adapter_model.bin OU adapter_model.safetensors
+    bin_path = os.path.join(checkpoint_path, "adapter_model.bin")
+    safetensors_path = os.path.join(checkpoint_path, "adapter_model.safetensors")
+
+    if not os.path.isfile(bin_path) and not os.path.isfile(safetensors_path):
+        logger.warning(f"⚠️ Arquivo de modelo faltando no checkpoint (nem .bin nem .safetensors)")
+        return False
+
     logger.info(f"✅ Checkpoint validado: {checkpoint_path}")
     return True
+
+def merge_and_convert_gguf(args, model=None, tokenizer=None, checkpoint_path=None):
+    """
+    Mergea um modelo LoRA com o modelo base e converte para GGUF.
+
+    Pode ser usado:
+    1. Standalone: carrega checkpoint e modelo base do zero (--merge_only)
+    2. Pós-treino: usa modelo já carregado em memória
+
+    Args:
+        args: argumentos do CLI
+        model: modelo já carregado (opcional, para pós-treino)
+        tokenizer: tokenizer já carregado (opcional, para pós-treino)
+        checkpoint_path: caminho do checkpoint (opcional, detecta automaticamente se não informado)
+
+    Returns:
+        str: caminho do arquivo GGUF final
+    """
+    # Setup llama.cpp
+    convert_script, quantize_bin = setup_llama_cpp_auto(args.llama_cpp_path)
+
+    # Obtém caminhos com fallback para permissões
+    model_cache_dir = get_writable_path(args.model_cache_dir, "models_cache")
+    output_dir = get_writable_path(args.output_dir, "finetuned_models")
+
+    os.makedirs(model_cache_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Configura variáveis de ambiente do HF
+    os.environ["HF_HOME"] = model_cache_dir
+    os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+
+    # Determina o checkpoint a usar
+    if checkpoint_path is None:
+        checkpoint_path = args.checkpoint_path
+
+    if checkpoint_path is None:
+        # Detecta checkpoint mais recente
+        checkpoint_path = get_latest_checkpoint(output_dir)
+        if checkpoint_path is None:
+            logger.error("❌ Nenhum checkpoint encontrado. Use --checkpoint_path para especificar.")
+            sys.exit(1)
+
+    if not validate_checkpoint(checkpoint_path):
+        logger.error(f"❌ Checkpoint inválido: {checkpoint_path}")
+        sys.exit(1)
+
+    logger.info(f"📂 Usando checkpoint: {checkpoint_path}")
+
+    # Se modelo não foi passado, carrega do zero
+    if model is None or tokenizer is None:
+        logger.info(f"🔍 Carregando modelo base: {args.model_name}")
+
+        # Define nome de pasta seguro
+        local_model_name = args.model_name.replace("/", "__")
+        local_model_path = os.path.join(model_cache_dir, local_model_name)
+
+        # Verifica cache local
+        if os.path.exists(local_model_path) and os.listdir(local_model_path):
+            logger.info(f"✅ Modelo encontrado no cache local: {local_model_path}")
+            model_source = local_model_path
+        else:
+            logger.info(f"⬇️ Baixando modelo para: {local_model_path}...")
+            try:
+                snapshot_download(
+                    repo_id=args.model_name,
+                    local_dir=local_model_path,
+                    local_dir_use_symlinks=False,
+                    token=os.getenv("HF_TOKEN")
+                )
+                model_source = local_model_path
+            except Exception as e:
+                logger.error(f"❌ Erro ao baixar modelo: {e}")
+                sys.exit(1)
+
+        # Carrega modelo base
+        model, tokenizer = FastLanguageModel.from_pretrained(
+            model_name=model_source,
+            max_seq_length=args.max_seq_length,
+            dtype=None,
+            load_in_4bit=True,
+        )
+
+        # Carrega adaptadores LoRA do checkpoint
+        logger.info(f"🔧 Carregando adaptadores LoRA do checkpoint...")
+        from peft import PeftModel
+        model = PeftModel.from_pretrained(model, checkpoint_path)
+        logger.info("✅ Adaptadores LoRA carregados com sucesso.")
+
+    # Merge do modelo
+    logger.info("💾 Mergeando modelo (Safetensors 16-bit)...")
+    merged_dir = os.path.join(output_dir, "merged_model_hf")
+
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    try:
+        model.save_pretrained_merged(merged_dir, tokenizer, save_method="merged_16bit")
+        logger.info(f"✅ Modelo mergeado salvo em: {merged_dir}")
+    except Exception as e:
+        logger.error(f"❌ Erro ao salvar modelo mergeado: {e}")
+        sys.exit(1)
+
+    # Skip GGUF se solicitado
+    if args.skip_gguf_conversion:
+        logger.info("⏭️ Conversão GGUF ignorada (--skip_gguf_conversion)")
+        return merged_dir
+
+    # Conversão GGUF
+    logger.info("⚙️ Iniciando conversão via llama.cpp...")
+
+    if not os.path.isdir(merged_dir) or not os.listdir(merged_dir):
+        logger.error(f"❌ Diretório do modelo mergeado vazio: {merged_dir}")
+        sys.exit(1)
+
+    fp16_gguf = os.path.join(output_dir, "model_fp16.gguf")
+    quantization = args.gguf_quantization
+    final_gguf = os.path.join(output_dir, f"modelo_final_{quantization}.gguf")
+
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    # A) HF -> GGUF FP16
+    try:
+        run_command(f"python3 {convert_script} {merged_dir} --outfile {fp16_gguf} --outtype f16", "Conversão FP16")
+        if not os.path.isfile(fp16_gguf):
+            logger.error(f"❌ Conversão falhou: {fp16_gguf} não foi gerado")
+            sys.exit(1)
+        logger.info(f"✅ Conversão FP16 concluída: {fp16_gguf}")
+    except SystemExit:
+        logger.error("❌ Falha na conversão FP16")
+        sys.exit(1)
+
+    # B) FP16 -> Quantização escolhida
+    if quantization != "f16":
+        try:
+            cpu_threads = multiprocessing.cpu_count()
+            run_command(f"{quantize_bin} {fp16_gguf} {final_gguf} {quantization} {cpu_threads}",
+                       f"Quantização {quantization.upper()} com {cpu_threads} threads")
+            if not os.path.isfile(final_gguf):
+                logger.error(f"❌ Quantização falhou: {final_gguf} não foi gerado")
+                sys.exit(1)
+            logger.info(f"✅ Quantização {quantization.upper()} concluída: {final_gguf}")
+        except SystemExit:
+            logger.error(f"❌ Falha na quantização {quantization.upper()}")
+            sys.exit(1)
+
+        # Remove FP16 temporário
+        if os.path.exists(fp16_gguf):
+            try:
+                os.remove(fp16_gguf)
+                logger.info("🗑️ Arquivo temporário FP16 removido.")
+            except Exception as e:
+                logger.warning(f"⚠️ Não foi possível remover {fp16_gguf}: {e}")
+    else:
+        final_gguf = fp16_gguf
+
+    logger.info(f"✨ SUCESSO! Modelo GGUF pronto em: {final_gguf}")
+    return final_gguf
+
 
 def train(args):
     # --- 0. Setup Inicial ---
@@ -247,21 +421,25 @@ def train(args):
         os.environ["WANDB_MODE"] = "disabled"
         logger.warning("⚠️ WandB instalado, mas sem API Key. Desativando.")
 
-    convert_script, quantize_bin = setup_llama_cpp_auto(args.llama_cpp_path)
+    # Verifica llama.cpp antecipadamente se conversão GGUF foi solicitada
+    if args.convert_to_gguf and not args.skip_gguf_conversion:
+        logger.info("🔍 Verificando llama.cpp (conversão GGUF ativada)...")
+        setup_llama_cpp_auto(args.llama_cpp_path)
 
     # Obtém caminhos com fallback para permissões
     model_cache_dir = get_writable_path(args.model_cache_dir, "models_cache")
     output_dir = get_writable_path(args.output_dir, "finetuned_models")
-    
+
     # Cria diretórios necessários
     os.makedirs(model_cache_dir, exist_ok=True)
     os.makedirs(output_dir, exist_ok=True)
-    
+
     logger.info(f"")
     logger.info(f"📁 ========== DIRETÓRIOS CONFIGURADOS ==========")
     logger.info(f"📁 model_cache_dir: {model_cache_dir}")
     logger.info(f"📁 output_dir: {output_dir}")
-    logger.info(f"📁 llama.cpp path: {args.llama_cpp_path}")
+    if args.convert_to_gguf:
+        logger.info(f"📁 llama.cpp path: {args.llama_cpp_path}")
     logger.info(f"📁 =============================================")
     logger.info(f"")
     
@@ -398,74 +576,49 @@ def train(args):
     trainer.train(resume_from_checkpoint=resume_checkpoint)
     logger.info("🏁 Treinamento concluído.")
 
-    # --- 6. Salvar e Merge ---
-    logger.info("💾 Salvando modelo mergeado (Safetensors 16-bit)...")
-    merged_dir = os.path.join(output_dir, "merged_model_hf")
-    
-    # Limpeza de VRAM ANTES do merge (crítico!)
-    torch.cuda.empty_cache()
-    gc.collect()
-
-    try:
-        model.save_pretrained_merged(merged_dir, tokenizer, save_method = "merged_16bit")
-        logger.info(f"✅ Modelo mergeado salvo em: {merged_dir}")
-    except Exception as e:
-        logger.error(f"❌ Erro ao salvar modelo mergeado: {e}")
-        sys.exit(1)
-
     if wandb:
         wandb.finish()
 
-    # --- 7. Conversão e Quantização (Llama.cpp) ---
-    logger.info("⚙️ Iniciando conversão via llama.cpp...")
-    
-    # Validação crítica
-    if not os.path.isdir(merged_dir) or not os.listdir(merged_dir):
-        logger.error(f"❌ Diretório do modelo mergeado vazio ou inexistente: {merged_dir}")
-        sys.exit(1)
-    
-    logger.info(f"✅ Validado modelo mergeado em: {merged_dir}")
-    
-    fp16_gguf = os.path.join(output_dir, "model_fp16.gguf")
-    final_q4_gguf = os.path.join(output_dir, "modelo_final_q4_k_m.gguf")
-    
-    # Limpeza antes da conversão
-    torch.cuda.empty_cache()
-    gc.collect()
-    
-    # A) HF -> GGUF FP16
-    try:
-        run_command(f"python3 {convert_script} {merged_dir} --outfile {fp16_gguf} --outtype f16", "Conversão FP16")
-        if not os.path.isfile(fp16_gguf):
-            logger.error(f"❌ Conversão falhou: arquivo não gerado {fp16_gguf}")
-            sys.exit(1)
-        logger.info(f"✅ Conversão FP16 concluída: {fp16_gguf}")
-    except SystemExit:
-        logger.error("❌ Falha na conversão FP16")
-        sys.exit(1)
-    
-    # B) FP16 -> Q4_K_M
-    try:
-        cpu_threads = multiprocessing.cpu_count()
-        run_command(f"{quantize_bin} {fp16_gguf} {final_q4_gguf} q4_k_m {cpu_threads}", f"Quantização Q4 com {cpu_threads} threads")
-        if not os.path.isfile(final_q4_gguf):
-            logger.error(f"❌ Quantização falhou: arquivo não gerado {final_q4_gguf}")
-            sys.exit(1)
-        logger.info(f"✅ Quantização Q4 concluída: {final_q4_gguf}")
-    except SystemExit:
-        logger.error("❌ Falha na quantização Q4")
-        sys.exit(1)
+    # --- 6. Merge e Conversão GGUF (se solicitado) ---
+    if args.convert_to_gguf:
+        logger.info("🔄 Iniciando merge e conversão para GGUF...")
+        final_gguf = merge_and_convert_gguf(args, model=model, tokenizer=tokenizer)
+        logger.info(f"✨ SUCESSO! Modelo GGUF pronto em: {final_gguf}")
+    else:
+        # Apenas salva o modelo mergeado sem GGUF
+        logger.info("💾 Salvando modelo mergeado (Safetensors 16-bit)...")
+        merged_dir = os.path.join(output_dir, "merged_model_hf")
 
-    # C) Limpeza
-    if os.path.exists(fp16_gguf):
+        torch.cuda.empty_cache()
+        gc.collect()
+
         try:
-            os.remove(fp16_gguf)
-            logger.info("🗑️ Arquivo temporário FP16 removido.")
+            model.save_pretrained_merged(merged_dir, tokenizer, save_method="merged_16bit")
+            logger.info(f"✅ Modelo mergeado salvo em: {merged_dir}")
         except Exception as e:
-            logger.warning(f"⚠️ Não foi possível remover {fp16_gguf}: {e}")
+            logger.error(f"❌ Erro ao salvar modelo mergeado: {e}")
+            sys.exit(1)
 
-    logger.info(f"✨ SUCESSO! Modelo final pronto em: {final_q4_gguf}")
+        logger.info(f"✨ SUCESSO! Modelo final pronto em: {merged_dir}")
+        logger.info("💡 Dica: Use --convert_to_gguf para converter para GGUF automaticamente")
 
 if __name__ == "__main__":
     args = parse_args()
-    train(args)
+
+    if args.merge_only:
+        # Modo merge-only: apenas mergea checkpoint existente e converte para GGUF
+        logger.info("=" * 60)
+        logger.info("🔀 MODO MERGE-ONLY ATIVADO")
+        logger.info("=" * 60)
+        logger.info("Este modo mergeia um checkpoint LoRA existente com o modelo base")
+        logger.info("e opcionalmente converte para GGUF.")
+        logger.info("")
+
+        # Força conversão GGUF no merge_only (a menos que skip_gguf esteja ativo)
+        if not args.skip_gguf_conversion:
+            args.convert_to_gguf = True
+
+        merge_and_convert_gguf(args)
+    else:
+        # Modo treinamento normal
+        train(args)
