@@ -301,43 +301,16 @@ def merge_and_convert_gguf(args, model=None, tokenizer=None, checkpoint_path=Non
 
     # Se modelo não foi passado, carrega do zero
     if model is None or tokenizer is None:
-        logger.info(f"🔍 Carregando modelo base: {args.model_name}")
+        logger.info(f"🔍 Carregando modelo e adaptadores de: {checkpoint_path}")
 
-        # Define nome de pasta seguro
-        local_model_name = args.model_name.replace("/", "__")
-        local_model_path = os.path.join(model_cache_dir, local_model_name)
-
-        # Verifica cache local
-        if os.path.exists(local_model_path) and os.listdir(local_model_path):
-            logger.info(f"✅ Modelo encontrado no cache local: {local_model_path}")
-            model_source = local_model_path
-        else:
-            logger.info(f"⬇️ Baixando modelo para: {local_model_path}...")
-            try:
-                snapshot_download(
-                    repo_id=args.model_name,
-                    local_dir=local_model_path,
-                    local_dir_use_symlinks=False,
-                    token=os.getenv("HF_TOKEN")
-                )
-                model_source = local_model_path
-            except Exception as e:
-                logger.error(f"❌ Erro ao baixar modelo: {e}")
-                sys.exit(1)
-
-        # Carrega modelo base
+        # Carrega modelo e adaptadores via Unsloth (mais robusto para merge)
         model, tokenizer = FastLanguageModel.from_pretrained(
-            model_name=model_source,
+            model_name=checkpoint_path,
             max_seq_length=args.max_seq_length,
             dtype=None,
             load_in_4bit=True,
         )
-
-        # Carrega adaptadores LoRA do checkpoint
-        logger.info(f"🔧 Carregando adaptadores LoRA do checkpoint...")
-        from peft import PeftModel
-        model = PeftModel.from_pretrained(model, checkpoint_path)
-        logger.info("✅ Adaptadores LoRA carregados com sucesso.")
+        logger.info("✅ Modelo e adaptadores carregados com sucesso.")
 
     # Merge do modelo
     logger.info("💾 Mergeando modelo (Safetensors 16-bit)...")
@@ -374,7 +347,7 @@ def merge_and_convert_gguf(args, model=None, tokenizer=None, checkpoint_path=Non
 
     # A) HF -> GGUF FP16
     try:
-        run_command(f"python3 {convert_script} {merged_dir} --outfile {fp16_gguf} --outtype f16", "Conversão FP16")
+        run_command(f"{sys.executable} {convert_script} {merged_dir} --outfile {fp16_gguf} --outtype f16", "Conversão FP16")
         if not os.path.isfile(fp16_gguf):
             logger.error(f"❌ Conversão falhou: {fp16_gguf} não foi gerado")
             sys.exit(1)
