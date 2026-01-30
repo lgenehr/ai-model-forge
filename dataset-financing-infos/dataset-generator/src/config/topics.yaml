@@ -1,0 +1,238 @@
+# Topics and Subtopics Configuration
+
+topics:
+  financeiro:
+    name: "Financeiro"
+    description: "Economia, finanças e mercado"
+    keywords:
+      - economia
+      - finanças
+      - investimento
+      - mercado
+      - bolsa
+      - ações
+      - renda fixa
+      - dinheiro
+    subtopics:
+      economia:
+        keywords: ["PIB", "inflação", "taxa de juros", "Selic", "macroeconomia", "microeconomia"]
+      mercado_financeiro:
+        keywords: ["bolsa de valores", "B3", "ações", "fundos", "ETF", "derivativos"]
+      investimentos:
+        keywords: ["investir", "carteira", "rentabilidade", "risco", "diversificação"]
+      criptomoedas:
+        keywords: ["Bitcoin", "Ethereum", "blockchain", "crypto", "DeFi", "NFT"]
+      banking:
+        keywords: ["banco", "conta", "crédito", "empréstimo", "financiamento", "fintech"]
+
+  tecnologia:
+    name: "Tecnologia"
+    description: "Computação, software e inovação"
+    keywords:
+      - tecnologia
+      - software
+      - programação
+      - código
+      - computador
+      - internet
+      - digital
+    subtopics:
+      programacao:
+        keywords: ["Python", "JavaScript", "Java", "código", "desenvolvimento", "framework"]
+      inteligencia_artificial:
+        keywords: ["IA", "machine learning", "deep learning", "neural", "GPT", "LLM"]
+      ciencia_dados:
+        keywords: ["data science", "análise de dados", "big data", "pandas", "SQL"]
+      cybersecurity:
+        keywords: ["segurança", "hacker", "vulnerabilidade", "criptografia", "firewall"]
+      cloud_computing:
+        keywords: ["cloud", "AWS", "Azure", "GCP", "Kubernetes", "Docker"]
+
+  ciencias:
+    name: "Ciências"
+    description: "Ciências naturais e exatas"
+    keywords:
+      - ciência
+      - científico
+      - pesquisa
+      - experimento
+      - teoria
+      - descoberta
+    subtopics:
+      fisica:
+        keywords: ["física", "quântica", "relatividade", "energia", "partícula", "onda"]
+      quimica:
+        keywords: ["química", "molécula", "átomo", "reação", "elemento", "composto"]
+      biologia:
+        keywords: ["biologia", "célula", "gene", "DNA", "evolução", "ecossistema"]
+      matematica:
+        keywords: ["matemática", "equação", "teorema", "cálculo", "álgebra", "geometria"]
+      astronomia:
+        keywords: ["astronomia", "planeta", "estrela", "galáxia", "universo", "espaço"]
+
+  saude:
+    name: "Saúde"
+    description: "Medicina e bem-estar"
+    keywords:
+      - saúde
+      - medicina
+      - médico
+      - tratamento
+      - doença
+      - bem-estar
+    subtopics:
+      medicina:
+        keywords: ["diagnóstico", "tratamento", "medicamento", "cirurgia", "hospital"]
+      nutricao:
+        keywords: ["nutrição", "dieta", "alimento", "vitamina", "caloria", "metabolismo"]
+      psicologia:
+        keywords: ["psicologia", "mente", "comportamento", "terapia", "ansiedade", "depressão"]
+      fitness:
+        keywords: ["exercício", "treino", "academia", "musculação", "aeróbico", "corrida"]
+      saude_publica:
+        keywords: ["SUS", "vacina", "epidemia", "prevenção", "sanitário", "pandemia"]
+
+  juridico:
+    name: "Jurídico"
+    description: "Direito e legislação"
+    keywords:
+      - direito
+      - lei
+      - jurídico
+      - tribunal
+      - justiça
+      - processo
+    subtopics:
+      direito_civil:
+        keywords: ["contrato", "propriedade", "família", "sucessão", "responsabilidade civil"]
+      direito_penal:
+        keywords: ["crime", "pena", "prisão", "júri", "réu", "sentença"]
+      direito_trabalhista:
+        keywords: ["CLT", "trabalhista", "emprego", "demissão", "férias", "FGTS"]
+      direito_tributario:
+        keywords: ["imposto", "tributo", "ICMS", "IR", "contribuição", "fisco"]
+      direito_constitucional:
+        keywords: ["constituição", "fundamental", "cidadão", "federativo", "democracia"]
+
+  humanidades:
+    name: "Humanidades"
+    description: "Ciências humanas e sociais"
+    keywords:
+      - história
+      - filosofia
+      - sociedade
+      - cultura
+      - humano
+    subtopics:
+      historia:
+        keywords: ["histórico", "período", "civilização", "guerra", "revolução", "império"]
+      filosofia:
+        keywords: ["filosofia", "ética", "moral", "existência", "razão", "pensamento"]
+      sociologia:
+        keywords: ["sociedade", "social", "classe", "estrutura", "desigualdade", "movimento"]
+      antropologia:
+        keywords: ["cultura", "costume", "ritual", "etnia", "tradição", "identidade"]
+      politica:
+        keywords: ["política", "governo", "eleição", "partido", "democracia", "poder"]
+
+  cultura:
+    name: "Cultura"
+    description: "Arte, literatura e entretenimento"
+    keywords:
+      - cultura
+      - arte
+      - literatura
+      - música
+      - cinema
+    subtopics:
+      literatura:
+        keywords: ["livro", "romance", "poesia", "autor", "narrativa", "conto"]
+      arte:
+        keywords: ["pintura", "escultura", "museu", "artista", "exposição", "obra"]
+      musica:
+        keywords: ["música", "canção", "instrumento", "banda", "concerto", "compositor"]
+      cinema:
+        keywords: ["filme", "diretor", "ator", "roteiro", "produção", "cinema"]
+      gastronomia:
+        keywords: ["culinária", "receita", "chef", "restaurante", "ingrediente", "cozinha"]
+
+  negocios:
+    name: "Negócios"
+    description: "Empreendedorismo e gestão"
+    keywords:
+      - negócio
+      - empresa
+      - empreendedor
+      - gestão
+      - corporativo
+    subtopics:
+      empreendedorismo:
+        keywords: ["startup", "empreender", "inovação", "MVP", "pitch", "valuation"]
+      marketing:
+        keywords: ["marketing", "marca", "propaganda", "digital", "SEO", "conversão"]
+      gestao:
+        keywords: ["gestão", "administração", "liderança", "estratégia", "processo"]
+      recursos_humanos:
+        keywords: ["RH", "recrutamento", "seleção", "treinamento", "carreira", "talento"]
+      vendas:
+        keywords: ["venda", "cliente", "negociação", "funil", "CRM", "comercial"]
+
+  educacao:
+    name: "Educação"
+    description: "Ensino e aprendizagem"
+    keywords:
+      - educação
+      - ensino
+      - aprendizagem
+      - escola
+      - professor
+      - aluno
+    subtopics:
+      pedagogia:
+        keywords: ["pedagogia", "didática", "currículo", "avaliação", "metodologia"]
+      ensino_superior:
+        keywords: ["universidade", "graduação", "mestrado", "doutorado", "pesquisa"]
+      educacao_infantil:
+        keywords: ["creche", "pré-escola", "infantil", "criança", "desenvolvimento"]
+      educacao_especial:
+        keywords: ["inclusão", "acessibilidade", "deficiência", "adaptação", "LIBRAS"]
+      metodologias:
+        keywords: ["ativa", "híbrido", "EAD", "gamificação", "projeto", "competência"]
+
+  meio_ambiente:
+    name: "Meio Ambiente"
+    description: "Sustentabilidade e natureza"
+    keywords:
+      - meio ambiente
+      - sustentabilidade
+      - ecologia
+      - natureza
+      - verde
+    subtopics:
+      sustentabilidade:
+        keywords: ["sustentável", "ESG", "reciclagem", "carbono", "renovável"]
+      mudancas_climaticas:
+        keywords: ["clima", "aquecimento", "efeito estufa", "emissão", "temperatura"]
+      energia_renovavel:
+        keywords: ["solar", "eólica", "hidrelétrica", "biomassa", "limpa"]
+      conservacao:
+        keywords: ["preservação", "biodiversidade", "espécie", "floresta", "Amazônia"]
+      agricultura:
+        keywords: ["agro", "plantio", "colheita", "orgânico", "agropecuária", "safra"]
+
+# Language distribution targets
+language_distribution:
+  pt_br: 0.80
+  en: 0.15
+  other: 0.05
+
+# Source distribution targets
+source_distribution:
+  news: 0.25
+  books: 0.20
+  academic: 0.15
+  legal: 0.10
+  social_media: 0.10
+  videos: 0.10
+  encyclopedia: 0.05
+  forums: 0.05

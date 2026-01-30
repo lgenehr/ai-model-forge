@@ -1,0 +1,215 @@
+# Data Sources Configuration
+
+sources:
+  news:
+    name: "News & Articles"
+    enabled: true
+    priority: 1
+    distribution: 0.25
+    collectors:
+      - type: rss
+        feeds:
+          - name: "G1 Economia"
+            url: "https://g1.globo.com/rss/g1/economia/"
+            topics: ["financeiro", "negocios"]
+          - name: "G1 Tecnologia"
+            url: "https://g1.globo.com/rss/g1/tecnologia/"
+            topics: ["tecnologia"]
+          - name: "G1 Ciência e Saúde"
+            url: "https://g1.globo.com/rss/g1/ciencia-e-saude/"
+            topics: ["ciencias", "saude"]
+          - name: "G1 Educação"
+            url: "https://g1.globo.com/rss/g1/educacao/"
+            topics: ["educacao"]
+          - name: "Folha de São Paulo"
+            url: "https://feeds.folha.uol.com.br/folha/rss091.xml"
+            topics: ["geral"]
+          - name: "UOL Economia"
+            url: "https://economia.uol.com.br/rss.xml"
+            topics: ["financeiro"]
+          - name: "InfoMoney"
+            url: "https://www.infomoney.com.br/feed/"
+            topics: ["financeiro"]
+          - name: "Tecnoblog"
+            url: "https://tecnoblog.net/feed/"
+            topics: ["tecnologia"]
+      - type: newsapi
+        requires_key: true
+        countries: ["br"]
+        categories:
+          - business
+          - technology
+          - science
+          - health
+      - type: gnews
+        requires_key: true
+        countries: ["br"]
+        languages: ["pt"]
+
+  books:
+    name: "Books & Long Texts"
+    enabled: true
+    priority: 2
+    distribution: 0.20
+    collectors:
+      - type: gutenberg
+        languages: ["pt"]
+        categories:
+          - Literature
+          - History
+          - Philosophy
+          - Science
+      - type: open_library
+        languages: ["por"]
+        subjects:
+          - Brazilian literature
+          - Portuguese literature
+          - Philosophy
+          - History
+      - type: wikisource
+        languages: ["pt"]
+        categories:
+          - Textos em domínio público
+
+  academic:
+    name: "Academic Papers"
+    enabled: true
+    priority: 3
+    distribution: 0.15
+    collectors:
+      - type: arxiv
+        categories:
+          - cs.AI
+          - cs.CL
+          - cs.LG
+          - econ
+          - q-fin
+          - stat
+        max_results: 1000
+      - type: semantic_scholar
+        requires_key: true
+        fields_of_study:
+          - Computer Science
+          - Economics
+          - Medicine
+          - Physics
+          - Biology
+      - type: scielo
+        languages: ["pt"]
+        collections:
+          - scl  # Brazil
+          - sss  # Social Sciences
+
+  legal:
+    name: "Legal Documents"
+    enabled: true
+    priority: 4
+    distribution: 0.10
+    collectors:
+      - type: planalto
+        document_types:
+          - lei
+          - decreto
+          - medida_provisoria
+          - constituicao
+      - type: stf
+        decision_types:
+          - acordao
+          - sumula
+          - repercussao_geral
+      - type: stj
+        decision_types:
+          - acordao
+          - sumula
+
+  social_media:
+    name: "Social Media"
+    enabled: true
+    priority: 5
+    distribution: 0.10
+    collectors:
+      - type: reddit
+        requires_key: true
+        subreddits:
+          # Finance
+          - investimentos
+          - brasil
+          - economia
+          - farialimabets
+          # Technology
+          - brdev
+          - programacao
+          - tecnologia
+          # General
+          - desabafos
+          - perguntereddit
+        min_score: 10
+        min_comments: 5
+      - type: mastodon
+        instances:
+          - mastodon.social
+          - masto.ai
+        languages: ["pt"]
+
+  videos:
+    name: "Video Transcriptions"
+    enabled: true
+    priority: 6
+    distribution: 0.10
+    collectors:
+      - type: youtube
+        requires_key: true
+        channels:
+          # Finance
+          - channel_id: "UC_mSfchV-fgpPy-vuwML8_A"  # Me Poupe!
+            topics: ["financeiro"]
+          - channel_id: "UCT4nDeU5pv1XIGySbSK-GgA"  # Primo Rico
+            topics: ["financeiro"]
+          # Technology
+          - channel_id: "UCVHFbqXqoYvEWM1Ddxl0QDg"  # Código Fonte TV
+            topics: ["tecnologia"]
+          - channel_id: "UCSSLqiuGHK-RQYvU1jUZzaw"  # Fabio Akita
+            topics: ["tecnologia"]
+        use_whisper: true
+
+  encyclopedia:
+    name: "Encyclopedia"
+    enabled: true
+    priority: 7
+    distribution: 0.05
+    collectors:
+      - type: wikipedia
+        languages: ["pt"]
+        categories:
+          - Economia
+          - Tecnologia
+          - Ciência
+          - Direito
+          - Saúde
+          - História
+          - Filosofia
+          - Educação
+        random_articles: 5000
+      - type: wikibooks
+        languages: ["pt"]
+
+  forums:
+    name: "Forums & Q&A"
+    enabled: true
+    priority: 8
+    distribution: 0.05
+    collectors:
+      - type: stackoverflow
+        site: "pt.stackoverflow.com"
+        tags:
+          - python
+          - javascript
+          - java
+          - sql
+          - machine-learning
+        min_score: 5
+      - type: reddit_qa
+        requires_key: true
+        subreddits:
+          - perguntereddit
+          - conselhoslegais
