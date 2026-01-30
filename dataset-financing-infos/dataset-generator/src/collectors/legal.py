@@ -7,6 +7,7 @@ import re
 from collections.abc import AsyncIterator
 from typing import Any
 
+import aiohttp
 from bs4 import BeautifulSoup
 
 from ..schemas.dataset import RawCollectedData
@@ -84,7 +85,9 @@ class LegalCollector(AsyncCollector):
     @async_retry(max_attempts=3, min_wait=2.0)
     async def _fetch_legislation(self, url: str) -> str:
         """Fetch legislation page with retry."""
-        return await self.fetch_url(url)
+        headers = {"User-Agent": self.settings.web_user_agent}
+        timeout = aiohttp.ClientTimeout(total=self.settings.request_timeout * 2)
+        return await self.fetch_url(url, headers=headers, timeout=timeout)
 
     def _parse_legislation(self, html: str) -> dict[str, Any]:
         """Parse legislation HTML."""
