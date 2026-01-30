@@ -7,6 +7,8 @@ from collections.abc import Awaitable, Callable
 from functools import wraps
 from typing import Any, ParamSpec, TypeVar
 
+import aiohttp
+
 from tenacity import (
     AsyncRetrying,
     RetryError,
@@ -30,7 +32,18 @@ RETRYABLE_EXCEPTIONS = (
     ConnectionError,
     TimeoutError,
     OSError,
+    aiohttp.ClientError,
 )
+
+
+def _format_error(error: Exception) -> str:
+    """Return a consistent error message for retry logging."""
+    message = str(error)
+    if not message:
+        message = repr(error)
+    if not message:
+        return error.__class__.__name__
+    return f"{error.__class__.__name__}: {message}"
 
 
 def sync_retry(
@@ -72,7 +85,7 @@ def sync_retry(
                             function=func.__name__,
                             attempt=attempt.retry_state.attempt_number,
                             max_attempts=max_attempts,
-                            error=str(e),
+                            error=_format_error(e),
                         )
                         raise
 
@@ -123,7 +136,7 @@ def async_retry(
                             function=func.__name__,
                             attempt=attempt.retry_state.attempt_number,
                             max_attempts=max_attempts,
-                            error=str(e),
+                            error=_format_error(e),
                         )
                         raise
 
@@ -165,7 +178,7 @@ async def retry_with_fallback(
                 "Fallback triggered",
                 attempt=i + 1,
                 total=len(all_coros),
-                error=str(e),
+                error=_format_error(e),
             )
             continue
 

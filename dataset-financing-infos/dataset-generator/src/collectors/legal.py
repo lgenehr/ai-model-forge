@@ -25,12 +25,12 @@ class LegalCollector(AsyncCollector):
 
     # Planalto URLs for legislation
     PLANALTO_URLS = {
-        "constituicao": "http://www.planalto.gov.br/ccivil_03/constituicao/constituicao.htm",
-        "codigo_civil": "http://www.planalto.gov.br/ccivil_03/leis/2002/l10406compilada.htm",
-        "codigo_penal": "http://www.planalto.gov.br/ccivil_03/decreto-lei/del2848compilado.htm",
-        "clt": "http://www.planalto.gov.br/ccivil_03/decreto-lei/del5452.htm",
-        "cdc": "http://www.planalto.gov.br/ccivil_03/leis/l8078compilado.htm",
-        "cpc": "http://www.planalto.gov.br/ccivil_03/_ato2015-2018/2015/lei/l13105.htm",
+        "constituicao": "https://www.planalto.gov.br/ccivil_03/constituicao/constituicao.htm",
+        "codigo_civil": "https://www.planalto.gov.br/ccivil_03/leis/2002/l10406compilada.htm",
+        "codigo_penal": "https://www.planalto.gov.br/ccivil_03/decreto-lei/del2848compilado.htm",
+        "clt": "https://www.planalto.gov.br/ccivil_03/decreto-lei/del5452.htm",
+        "cdc": "https://www.planalto.gov.br/ccivil_03/leis/l8078compilado.htm",
+        "cpc": "https://www.planalto.gov.br/ccivil_03/_ato2015-2018/2015/lei/l13105.htm",
     }
 
     # Keywords by legal subtopic
