@@ -55,8 +55,13 @@ class Settings(BaseSettings):
     youtube_api_key: str | None = Field(default=None, alias="YOUTUBE_API_KEY")
     reddit_client_id: str | None = Field(default=None, alias="REDDIT_CLIENT_ID")
     reddit_client_secret: str | None = Field(default=None, alias="REDDIT_CLIENT_SECRET")
+    reddit_access_token: str | None = Field(default=None, alias="REDDIT_ACCESS_TOKEN")
     reddit_user_agent: str = Field(
         default="DatasetGenerator/1.0", alias="REDDIT_USER_AGENT"
+    )
+    wikipedia_user_agent: str = Field(
+        default="DatasetGenerator/1.0 (+https://github.com/ai-model-forge/dataset-generator)",
+        alias="WIKIPEDIA_USER_AGENT",
     )
     semantic_scholar_key: str | None = Field(
         default=None, alias="SEMANTIC_SCHOLAR_KEY"

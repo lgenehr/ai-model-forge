@@ -3,6 +3,7 @@ Social media collector for Reddit and other platforms.
 """
 
 import hashlib
+import os
 from collections.abc import AsyncIterator
 from datetime import datetime
 from typing import Any
@@ -90,6 +91,14 @@ class SocialMediaCollector(AsyncCollector):
 
     async def _authenticate(self) -> None:
         """Authenticate with Reddit API."""
+        devvit_token = self.settings.reddit_access_token or os.getenv(
+            "DEVVIT_REDDIT_TOKEN"
+        )
+        if devvit_token:
+            self._access_token = devvit_token
+            self.logger.info("Using Reddit access token from Devvit environment")
+            return
+
         if not self.settings.reddit_client_id or not self.settings.reddit_client_secret:
             self.logger.warning("Reddit credentials not configured")
             return

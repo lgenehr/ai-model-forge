@@ -106,7 +106,8 @@ class WikipediaCollector(AsyncCollector):
     async def _api_request(self, params: dict[str, Any]) -> dict[str, Any]:
         """Make Wikipedia API request with retry."""
         params["format"] = "json"
-        return await self.fetch_json(self.WIKIPEDIA_API, params=params)
+        headers = {"User-Agent": self.settings.wikipedia_user_agent}
+        return await self.fetch_json(self.WIKIPEDIA_API, headers=headers, params=params)
 
     async def _get_category_members(
         self,

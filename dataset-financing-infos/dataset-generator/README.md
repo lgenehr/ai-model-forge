@@ -45,6 +45,8 @@ cp .env.example .env
 - **NewsAPI** (free tier: 100 requests/day): https://newsapi.org/
 - **YouTube Data API** (free tier: 10,000 units/day): https://console.cloud.google.com/
 - **Reddit API** (60 requests/minute): https://www.reddit.com/prefs/apps
+  - Use `REDDIT_ACCESS_TOKEN` or the Devvit-provided `DEVVIT_REDDIT_TOKEN` when running inside Devvit.
+- **Wikipedia API**: Set a descriptive `WIKIPEDIA_USER_AGENT` to avoid 403 responses from the API.
 
 ### Optional API Keys
 
