@@ -63,6 +63,10 @@ class Settings(BaseSettings):
         default="DatasetGenerator/1.0 (+https://github.com/ai-model-forge/dataset-generator)",
         alias="WIKIPEDIA_USER_AGENT",
     )
+    web_user_agent: str = Field(
+        default="DatasetGenerator/1.0 (+https://github.com/ai-model-forge/dataset-generator)",
+        alias="WEB_USER_AGENT",
+    )
     semantic_scholar_key: str | None = Field(
         default=None, alias="SEMANTIC_SCHOLAR_KEY"
     )

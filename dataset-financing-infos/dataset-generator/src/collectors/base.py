@@ -158,6 +158,7 @@ class AsyncCollector(ABC):
         url: str,
         headers: dict[str, str] | None = None,
         params: dict[str, Any] | None = None,
+        timeout: aiohttp.ClientTimeout | None = None,
     ) -> str:
         """
         Fetch URL content with rate limiting.
@@ -166,12 +167,15 @@ class AsyncCollector(ABC):
             url: URL to fetch
             headers: Optional headers
             params: Optional query parameters
+            timeout: Optional request timeout override
 
         Returns:
             Response text
         """
         await self.rate_limit()
-        async with self.session.get(url, headers=headers, params=params) as response:
+        async with self.session.get(
+            url, headers=headers, params=params, timeout=timeout
+        ) as response:
             response.raise_for_status()
             return await response.text()
 
@@ -180,6 +184,7 @@ class AsyncCollector(ABC):
         url: str,
         headers: dict[str, str] | None = None,
         params: dict[str, Any] | None = None,
+        timeout: aiohttp.ClientTimeout | None = None,
     ) -> dict[str, Any]:
         """
         Fetch URL and parse as JSON.
@@ -188,12 +193,15 @@ class AsyncCollector(ABC):
             url: URL to fetch
             headers: Optional headers
             params: Optional query parameters
+            timeout: Optional request timeout override
 
         Returns:
             Parsed JSON response
         """
         await self.rate_limit()
-        async with self.session.get(url, headers=headers, params=params) as response:
+        async with self.session.get(
+            url, headers=headers, params=params, timeout=timeout
+        ) as response:
             response.raise_for_status()
             return await response.json()
 
