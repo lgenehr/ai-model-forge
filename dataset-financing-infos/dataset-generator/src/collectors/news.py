@@ -48,7 +48,6 @@ class NewsCollector(AsyncCollector):
         ],
         "negocios": [
             {"name": "Exame", "url": "https://exame.com/feed/"},
-            {"name": "Pequenas Empresas", "url": "https://revistapegn.globo.com/rss/"},
         ],
         "educacao": [
             {"name": "G1 Educação", "url": "https://g1.globo.com/rss/g1/educacao/"},
