@@ -27,8 +27,16 @@ def parse_args():
     # Model & Data
     parser.add_argument("--model_name", type=str, default="unsloth/Qwen2.5-14B-Instruct")
     # 4096 é o limite seguro para 16GB de VRAM. Tentar 8192 pode causar OOM.
-    parser.add_argument("--max_seq_length", type=int, default=4096) 
-    parser.add_argument("--dataset_pattern", type=str, default="../dataset/*.jsonl")
+    parser.add_argument("--max_seq_length", type=int, default=4096)
+    # Caminho padrão para dados gerados pelo dataset-generator
+    # Formatos suportados: Alpaca, ShareGPT, ChatML (todos são automaticamente normalizados para ChatML)
+    # Você pode usar um dos seguintes caminhos:
+    #   - "../dataset-generator/outputs/final/chatml/train.jsonl" (ChatML format)
+    #   - "../dataset-generator/outputs/final/alpaca/train.jsonl" (Alpaca format)
+    #   - "../dataset-generator/outputs/final/sharegpt/train.jsonl" (ShareGPT format)
+    #   - "../dataset-generator/outputs/final/**/train.jsonl" (todos os formatos)
+    #   - "../dataset/*.jsonl" (legado - qualquer dataset antigo)
+    parser.add_argument("--dataset_pattern", type=str, default="../dataset-generator/outputs/final/chatml/train.jsonl")
     parser.add_argument("--dataset_num_proc", type=int, default=16, help="Cores para processar dataset")
     # Pasta onde o modelo será salvo fisicamente para evitar download repetido
     # Em Docker: use volumes montados como /models_cache
@@ -470,13 +478,29 @@ def train(args):
 
     # --- 3. Dataset ---
     logger.info(f"📚 Processando dataset: {args.dataset_pattern}")
-    # Assume que prepare_hf_dataset retorna um Dataset do HF
+    logger.info(f"   Formatos suportados: Alpaca, ShareGPT, ChatML (auto-detectados e normalizados)")
+
+    # prepare_hf_dataset detecta automaticamente o formato e normaliza para ChatML
     dataset = prepare_hf_dataset([args.dataset_pattern])
-    
+
+    if len(dataset) == 0:
+        logger.error("❌ Nenhum dado encontrado! Verifique o caminho do dataset.")
+        logger.error(f"   Caminho configurado: {args.dataset_pattern}")
+        logger.error(f"   Dica: Use o dataset-generator para gerar dados primeiro:")
+        logger.error(f"      cd ../dataset-generator")
+        logger.error(f"      python -m src.main collect --sources all --topics financeiro")
+        logger.error(f"      python -m src.main process")
+        logger.error(f"      python -m src.main format --formats chatml")
+        sys.exit(1)
+
+    logger.info(f"✅ {len(dataset)} exemplos carregados com sucesso")
+
     # Split simples 90/10
     dataset_split = dataset.train_test_split(test_size=0.1, seed=3407)
     train_dataset = dataset_split["train"]
     eval_dataset = dataset_split["test"]
+
+    logger.info(f"📊 Split do dataset: {len(train_dataset)} treino / {len(eval_dataset)} validação")
     
     # Formatação de Chat
     from unsloth.chat_templates import get_chat_template
