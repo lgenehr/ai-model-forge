@@ -6,3 +6,4 @@ datasets>=2.18
 pandas>=2.1
 scipy>=1.11
 wandb>=0.16
+rich>=13.7  # TUI rica para terminal
