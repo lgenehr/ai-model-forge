@@ -17,3 +17,6 @@ einops>=0.7.0
 # Training utilities
 tqdm>=4.65.0
 numpy>=1.24.0
+
+# Experiment tracking
+wandb>=0.15.0

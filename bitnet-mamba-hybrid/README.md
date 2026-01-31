@@ -9,6 +9,7 @@ Uma implementação modular e profissional que combina a eficiência do **Mamba*
 - [Requisitos](#requisitos)
 - [Instalação](#instalação)
 - [Treinamento](#treinamento)
+- [Weights & Biases](#weights--biases)
 - [Inferência](#inferência)
 - [Configuração](#configuração)
 - [Estrutura do Projeto](#estrutura-do-projeto)
@@ -326,6 +327,110 @@ python train_hybrid-mamba-bitnet.py
 python train_hybrid-mamba-bitnet.py
 # Output: "Resuming from checkpoint: checkpoints/checkpoint_00005000.pt"
 ```
+
+---
+
+## Weights & Biases
+
+Integração completa com [Weights & Biases](https://wandb.ai) para rastreamento de experimentos, visualização de métricas e gerenciamento de artefatos.
+
+### Configuração Inicial
+
+1. Crie uma conta em [wandb.ai](https://wandb.ai)
+2. Obtenha sua API key em [wandb.ai/authorize](https://wandb.ai/authorize)
+
+### Habilitando W&B no Treinamento
+
+#### Opção 1: Via argumento de linha de comando
+
+```bash
+python train_hybrid-mamba-bitnet.py \
+    --wandb \
+    --wandb_api_key "sua-api-key-aqui" \
+    --wandb_project "meu-projeto" \
+    --wandb_run_name "experimento-1"
+```
+
+#### Opção 2: Via variável de ambiente
+
+```bash
+export WANDB_API_KEY="sua-api-key-aqui"
+
+python train_hybrid-mamba-bitnet.py \
+    --wandb \
+    --wandb_project "bitnet-mamba-hybrid"
+```
+
+#### Opção 3: Login persistente
+
+```bash
+# Login uma vez (salva credenciais localmente)
+wandb login
+
+# Depois, basta usar --wandb
+python train_hybrid-mamba-bitnet.py --wandb
+```
+
+### Argumentos W&B
+
+| Argumento | Default | Descrição |
+|-----------|---------|-----------|
+| `--wandb` | False | Habilita Weights & Biases |
+| `--wandb_api_key` | None | API key (ou use WANDB_API_KEY env var) |
+| `--wandb_project` | bitnet-mamba-hybrid | Nome do projeto no W&B |
+| `--wandb_run_name` | None | Nome da run (auto-gerado se não fornecido) |
+| `--wandb_entity` | None | Entidade (username ou nome do time) |
+
+### Métricas Rastreadas
+
+O treinamento automaticamente registra:
+
+| Métrica | Descrição |
+|---------|-----------|
+| `train/loss` | Loss de treinamento |
+| `train/learning_rate` | Learning rate atual |
+| `train/tokens` | Total de tokens processados |
+| `train/tokens_per_sec` | Throughput em tokens/segundo |
+| `train/epoch` | Progresso em relação ao total de tokens |
+| `train/best_loss` | Melhor loss alcançado |
+| `final/*` | Métricas finais do treinamento |
+
+### Visualização no Dashboard
+
+Após iniciar o treinamento com W&B habilitado, você verá uma URL no terminal:
+
+```
+Weights & Biases initialized: https://wandb.ai/seu-usuario/bitnet-mamba-hybrid/runs/abc123
+```
+
+No dashboard você pode:
+- Visualizar gráficos de loss em tempo real
+- Comparar múltiplas runs
+- Analisar gradientes do modelo
+- Baixar checkpoints salvos como artefatos
+
+### Exemplo Completo com W&B
+
+```bash
+python train_hybrid-mamba-bitnet.py \
+    --d_model 768 \
+    --n_layers 12 \
+    --batch_size 8 \
+    --grad_accum 4 \
+    --max_tokens 1000000000 \
+    --wandb \
+    --wandb_api_key "sua-chave" \
+    --wandb_project "bitnet-mamba-experiments" \
+    --wandb_run_name "768d-12l-1B-tokens" \
+    --wandb_entity "meu-time"
+```
+
+### Artefatos
+
+Ao final do treinamento, o melhor modelo é automaticamente salvo como artefato no W&B, permitindo:
+- Versionamento de modelos
+- Download posterior
+- Compartilhamento com o time
 
 ---
 

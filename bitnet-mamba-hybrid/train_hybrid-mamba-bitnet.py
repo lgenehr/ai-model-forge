@@ -39,6 +39,15 @@ except ImportError:
     tiktoken = None
     print("Warning: tiktoken not available, will use fallback tokenizer")
 
+# Weights & Biases for experiment tracking
+WANDB_AVAILABLE = False
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    wandb = None
+    print("Warning: wandb not available, experiment tracking disabled")
+
 try:
     from einops import rearrange, repeat
 except ImportError:
@@ -119,6 +128,12 @@ class TrainingConfig:
     checkpoint_dir: str = "./ai-model-forge/bitnet-mamba-hybrid/checkpoints"
     log_file: str = "./ai-model-forge/bitnet-mamba-hybrid/training.log"
     csv_file: str = "./ai-model-forge/bitnet-mamba-hybrid/loss_history.csv"
+
+    # Weights & Biases
+    use_wandb: bool = False
+    wandb_project: str = "bitnet-mamba-hybrid"
+    wandb_run_name: Optional[str] = None
+    wandb_entity: Optional[str] = None
 
     def __post_init__(self):
         # Compute max steps from token budget
@@ -754,13 +769,15 @@ class Trainer:
     - Gradient accumulation
     - Resumable checkpoints
     - Logging and metrics tracking
+    - Weights & Biases integration
     """
 
     def __init__(
         self,
         model: BitNetMambaLM,
         train_config: TrainingConfig,
-        model_config: ModelConfig
+        model_config: ModelConfig,
+        wandb_api_key: Optional[str] = None
     ):
         self.model = model
         self.train_config = train_config
@@ -796,6 +813,9 @@ class Trainer:
 
         # Setup logging
         self._setup_logging()
+
+        # Setup Weights & Biases
+        self._setup_wandb(wandb_api_key)
 
         # Try to resume from checkpoint
         self._try_resume()
@@ -851,6 +871,79 @@ class Trainer:
                 'step', 'loss', 'lr', 'tokens', 'tokens_per_sec', 'timestamp'
             ])
             self.csv_file.flush()
+
+    def _setup_wandb(self, api_key: Optional[str] = None):
+        """Setup Weights & Biases for experiment tracking"""
+        self.wandb_enabled = False
+
+        if not self.train_config.use_wandb:
+            self.logger.info("Weights & Biases disabled")
+            return
+
+        if not WANDB_AVAILABLE:
+            self.logger.warning("wandb not installed. Install with: pip install wandb")
+            return
+
+        try:
+            # Login with API key if provided
+            if api_key:
+                wandb.login(key=api_key)
+                self.logger.info("Logged in to Weights & Biases with API key")
+
+            # Prepare config for wandb
+            config_dict = {
+                **asdict(self.model_config),
+                **asdict(self.train_config),
+                'num_params': self.model.get_num_params(),
+                'device': str(self.device),
+                'dtype': str(self.dtype),
+            }
+
+            # Initialize wandb run
+            wandb.init(
+                project=self.train_config.wandb_project,
+                name=self.train_config.wandb_run_name,
+                entity=self.train_config.wandb_entity,
+                config=config_dict,
+                resume="allow",
+                dir=self.train_config.output_dir
+            )
+
+            # Watch model for gradient tracking
+            wandb.watch(self.model, log="gradients", log_freq=100)
+
+            self.wandb_enabled = True
+            self.logger.info(f"Weights & Biases initialized: {wandb.run.url}")
+
+        except Exception as e:
+            self.logger.warning(f"Failed to initialize wandb: {e}")
+            self.wandb_enabled = False
+
+    def _log_to_wandb(self, metrics: Dict[str, Any], step: int):
+        """Log metrics to Weights & Biases"""
+        if self.wandb_enabled and WANDB_AVAILABLE:
+            wandb.log(metrics, step=step)
+
+    def _finish_wandb(self):
+        """Finish wandb run and upload final artifacts"""
+        if self.wandb_enabled and WANDB_AVAILABLE:
+            # Log final model as artifact
+            try:
+                best_model_path = Path(self.train_config.output_dir) / "best_model.pt"
+                if best_model_path.exists():
+                    artifact = wandb.Artifact(
+                        name=f"model-{wandb.run.id}",
+                        type="model",
+                        description="Best BitNet-Mamba model checkpoint"
+                    )
+                    artifact.add_file(str(best_model_path))
+                    wandb.log_artifact(artifact)
+                    self.logger.info("Uploaded best model to Weights & Biases")
+            except Exception as e:
+                self.logger.warning(f"Failed to upload model artifact: {e}")
+
+            wandb.finish()
+            self.logger.info("Weights & Biases run finished")
 
     def _get_lr(self) -> float:
         """Get current learning rate with warmup"""
@@ -1020,9 +1113,19 @@ class Trainer:
                     ])
                     self.csv_file.flush()
 
+                    # Log to Weights & Biases
+                    self._log_to_wandb({
+                        'train/loss': avg_loss,
+                        'train/learning_rate': current_lr,
+                        'train/tokens': self.total_tokens,
+                        'train/tokens_per_sec': tokens_per_sec,
+                        'train/epoch': self.total_tokens / self.train_config.max_tokens,
+                    }, step=self.global_step)
+
                     # Track best loss
                     if avg_loss < self.best_loss:
                         self.best_loss = avg_loss
+                        self._log_to_wandb({'train/best_loss': self.best_loss}, step=self.global_step)
 
                     accumulated_loss = 0.0
                     step_start_time = datetime.now()
@@ -1041,6 +1144,16 @@ class Trainer:
         # Final checkpoint and cleanup
         self._save_checkpoint(is_best=True)
         self.csv_file.close()
+
+        # Log final metrics to wandb
+        self._log_to_wandb({
+            'final/total_steps': self.global_step,
+            'final/total_tokens': self.total_tokens,
+            'final/best_loss': self.best_loss,
+        }, step=self.global_step)
+
+        # Finish wandb run
+        self._finish_wandb()
 
         self.logger.info("=" * 60)
         self.logger.info("Training Complete!")
@@ -1089,6 +1202,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--no_amp", action="store_true", help="Disable automatic mixed precision")
 
+    # Weights & Biases arguments
+    parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
+    parser.add_argument("--wandb_api_key", type=str, default=None,
+                        help="Weights & Biases API key (or set WANDB_API_KEY env var)")
+    parser.add_argument("--wandb_project", type=str, default="bitnet-mamba-hybrid",
+                        help="Weights & Biases project name")
+    parser.add_argument("--wandb_run_name", type=str, default=None,
+                        help="Weights & Biases run name (auto-generated if not provided)")
+    parser.add_argument("--wandb_entity", type=str, default=None,
+                        help="Weights & Biases entity (username or team name)")
+
     return parser.parse_args()
 
 
@@ -1124,7 +1248,12 @@ def main():
         output_dir=args.output_dir,
         checkpoint_dir=f"{args.output_dir}/checkpoints",
         log_file=f"{args.output_dir}/training.log",
-        csv_file=f"{args.output_dir}/loss_history.csv"
+        csv_file=f"{args.output_dir}/loss_history.csv",
+        # Weights & Biases
+        use_wandb=args.wandb,
+        wandb_project=args.wandb_project,
+        wandb_run_name=args.wandb_run_name,
+        wandb_entity=args.wandb_entity
     )
 
     # Print configuration
@@ -1146,8 +1275,11 @@ def main():
     # Create data pipeline
     data_pipeline = BilingualDataPipeline(tokenizer, train_config, seed=args.seed)
 
+    # Get wandb API key from argument or environment variable
+    wandb_api_key = args.wandb_api_key or os.environ.get('WANDB_API_KEY')
+
     # Create trainer and start training
-    trainer = Trainer(model, train_config, model_config)
+    trainer = Trainer(model, train_config, model_config, wandb_api_key=wandb_api_key)
     trainer.train(data_pipeline)
 
 
