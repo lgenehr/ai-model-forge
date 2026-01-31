@@ -669,11 +669,18 @@ class BilingualDataPipeline:
                     sample = next(self.en_iter)
                     is_english = True
                 else:
-                    sample = next(self.pt_iter)
+                    try:
+                        sample = next(self.pt_iter)
+                    except StopIteration:
+                        self.pt_iter = iter(self.pt_dataset)
+                        sample = next(self.pt_iter)
 
-            return self._get_text(sample, is_english)
+            text = self._get_text(sample, is_english)
+            return text if text else None
+
         except StopIteration:
             # Reset iterator
+            logging.debug("Dataset iterator exhausted, resetting...")
             if is_english:
                 self.en_iter = iter(self.en_dataset)
                 sample = next(self.en_iter)
@@ -686,6 +693,9 @@ class BilingualDataPipeline:
                     sample = next(self.en_iter)
 
             return self._get_text(sample, is_english)
+        except Exception as e:
+            logging.warning(f"Error getting sample: {e}")
+            return None
 
     def _create_batch_from_texts(
         self,
@@ -736,7 +746,10 @@ class BilingualDataPipeline:
         """
         buffer = []
         buffer_tokens = 0
-        target_buffer_tokens = batch_size * max_seq_len * 2  # Some overhead
+        target_buffer_tokens = batch_size * max_seq_len * 4  # Need enough for at least one batch
+        samples_loaded = 0
+
+        logging.info(f"Starting data generation (target buffer: {target_buffer_tokens:,} tokens)")
 
         while self.total_tokens < self.config.max_tokens:
             # Decide language based on ratio
@@ -744,13 +757,28 @@ class BilingualDataPipeline:
 
             # Get next text sample
             text = self._get_next_sample(is_english)
-            if text:
+            if text and len(text.strip()) > 10:  # Skip very short texts
                 buffer.append(text)
-                buffer_tokens += len(text.split()) * 1.3  # Rough token estimate
+                # More accurate token estimate
+                buffer_tokens += len(text) // 4  # Rough: 1 token ≈ 4 chars
+                samples_loaded += 1
+
+                # Progress logging every 100 samples
+                if samples_loaded % 100 == 0:
+                    logging.info(f"Loaded {samples_loaded} samples, buffer: ~{buffer_tokens:,} tokens")
 
             # Create batch when buffer is full enough
             if buffer_tokens >= target_buffer_tokens:
+                logging.info(f"Buffer full, creating batches from {len(buffer)} samples...")
                 input_ids, labels = self._create_batch_from_texts(buffer, max_seq_len)
+
+                if len(input_ids) == 0:
+                    logging.warning("No valid sequences created, refilling buffer...")
+                    buffer = []
+                    buffer_tokens = 0
+                    continue
+
+                logging.info(f"Created {len(input_ids)} sequences")
 
                 # Yield batches
                 for i in range(0, len(input_ids), batch_size):
@@ -1231,6 +1259,13 @@ def parse_args() -> argparse.Namespace:
 
 def main():
     args = parse_args()
+
+    # Setup basic logging early
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s | %(levelname)s | %(message)s',
+        handlers=[logging.StreamHandler(sys.stdout)]
+    )
 
     # Set random seeds
     torch.manual_seed(args.seed)
