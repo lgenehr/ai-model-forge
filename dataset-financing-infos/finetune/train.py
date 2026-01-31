@@ -44,8 +44,8 @@ def parse_args():
     parser.add_argument("--dataset_num_proc", type=int, default=16, help="Cores para processar dataset")
     # Pasta onde o modelo será salvo fisicamente para evitar download repetido
     # Em Docker: use volumes montados como /models_cache
-    # Localmente: fallback para ~/models_cache
-    parser.add_argument("--model_cache_dir", type=str, default="/models_cache", help="Diretório persistente para cache de modelos HF. Em Docker, configure volume mount para este caminho.")
+    # Localmente: usa ~/models_cache por padrão
+    parser.add_argument("--model_cache_dir", type=str, default="~/models_cache", help="Diretório persistente para cache de modelos HF. Em Docker, configure volume mount para este caminho.")
 
     # LoRA Params (Configuração Agressiva)
     parser.add_argument("--lora_r", type=int, default=64)
@@ -68,7 +68,7 @@ def parse_args():
     parser.add_argument("--wandb_api_key", type=str, default=None)
 
     # Llama.cpp Automation
-    parser.add_argument("--llama_cpp_path", type=str, default="/opt/llama.cpp", help="Caminho para llama.cpp. Em Docker, pode usar volume mount ou deixar compilar localmente.")
+    parser.add_argument("--llama_cpp_path", type=str, default="~/llama.cpp", help="Caminho para llama.cpp. Em Docker, pode usar volume mount ou deixar compilar localmente.")
 
     # Merge & GGUF Conversion
     parser.add_argument("--merge_only", action="store_true", help="Apenas mergea checkpoint existente com modelo base e converte para GGUF (sem treinar)")
@@ -100,8 +100,8 @@ def get_writable_path(requested_path, default_fallback=""):
     Respeita volumes montados em containers Docker.
     Só faz fallback se absolutamente necessário.
     """
-    expanded_path = os.path.expanduser(requested_path)
-    parent_dir = os.path.dirname(expanded_path) or expanded_path
+    # Sempre expande ~ e variáveis de ambiente
+    expanded_path = os.path.expanduser(os.path.expandvars(requested_path))
 
     # Se o caminho já existe e é gravável, usa
     if os.path.exists(expanded_path) and os.access(expanded_path, os.W_OK):
@@ -111,22 +111,30 @@ def get_writable_path(requested_path, default_fallback=""):
     # Tenta criar o diretório (importante para volumes Docker montados)
     try:
         os.makedirs(expanded_path, exist_ok=True)
-        ui.print_step(f"Diretório criado/verificado: {expanded_path}", "success")
-        return expanded_path
-    except PermissionError as e:
-        ui.print_error(f"Sem permissão para criar/acessar: {expanded_path}\nErro: {e}")
+        # Verifica se realmente foi criado e é gravável
+        if os.access(expanded_path, os.W_OK):
+            ui.print_step(f"Diretório criado/verificado: {expanded_path}", "success")
+            return expanded_path
+        else:
+            raise PermissionError(f"Diretório criado mas não é gravável: {expanded_path}")
+    except (PermissionError, OSError) as e:
+        ui.print_warning(f"Sem permissão para criar/acessar: {expanded_path}\nErro: {e}")
 
         # Só usa fallback se especificado
         if default_fallback:
             fallback = os.path.expanduser(f"~/{default_fallback}")
-            ui.print_warning(f"Usando fallback no home directory: {fallback}")
+            ui.print_step(f"Usando fallback no home directory: {fallback}", "info")
             try:
                 os.makedirs(fallback, exist_ok=True)
-                return fallback
+                if os.access(fallback, os.W_OK):
+                    return fallback
+                else:
+                    raise PermissionError(f"Fallback não é gravável: {fallback}")
             except Exception as fallback_error:
                 ui.print_error(f"Falha no fallback também: {fallback_error}")
                 sys.exit(1)
         else:
+            ui.print_error("Nenhum fallback disponível. Configure um caminho com permissões adequadas.")
             sys.exit(1)
 
 def setup_llama_cpp_auto(base_path):
