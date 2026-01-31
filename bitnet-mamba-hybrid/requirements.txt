@@ -1,0 +1,19 @@
+# BitNet-Mamba Hybrid Dependencies
+# Optimized for NVIDIA RTX 4070 Ti Super (16GB) + Ryzen 9 7950X
+
+# Core dependencies
+torch>=2.0.0
+datasets>=2.14.0
+tiktoken>=0.5.0
+
+# Tensor operations
+einops>=0.7.0
+
+# Optional: Install mamba-ssm for optimized CUDA kernels
+# Requires CUDA toolkit to be installed
+# pip install mamba-ssm
+# mamba-ssm>=1.0.0
+
+# Training utilities
+tqdm>=4.65.0
+numpy>=1.24.0
