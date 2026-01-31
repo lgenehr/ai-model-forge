@@ -29,7 +29,7 @@ from typing import Optional, Iterator, Tuple, Dict, Any, List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
@@ -590,45 +590,58 @@ class BilingualDataPipeline:
                 "HuggingFaceFW/fineweb-edu",
                 name="sample-10BT",
                 split="train",
-                streaming=True,
-                trust_remote_code=True
-            )
-            self.en_iter = iter(self.en_dataset)
-        except Exception as e:
-            logging.warning(f"Could not load fineweb-edu: {e}")
-            logging.info("Falling back to wikitext-103 for English")
-            self.en_dataset = load_dataset(
-                "wikitext",
-                "wikitext-103-raw-v1",
-                split="train",
                 streaming=True
             )
             self.en_iter = iter(self.en_dataset)
+            logging.info("Successfully loaded fineweb-edu")
+        except Exception as e:
+            logging.warning(f"Could not load fineweb-edu: {e}")
+            logging.info("Falling back to wikitext-103 for English")
+            try:
+                self.en_dataset = load_dataset(
+                    "wikitext",
+                    "wikitext-103-raw-v1",
+                    split="train",
+                    streaming=True
+                )
+                self.en_iter = iter(self.en_dataset)
+            except Exception as e2:
+                logging.warning(f"Could not load wikitext: {e2}")
+                logging.info("Falling back to roneneldan/TinyStories for English")
+                self.en_dataset = load_dataset(
+                    "roneneldan/TinyStories",
+                    split="train",
+                    streaming=True
+                )
+                self.en_iter = iter(self.en_dataset)
 
-        logging.info("Loading Portuguese dataset: Wikipedia (pt)")
+        logging.info("Loading Portuguese dataset")
         try:
+            # Try community Portuguese dataset
             self.pt_dataset = load_dataset(
-                "wikipedia",
-                "20220301.pt",
+                "eduagarcia/portuguese_benchmark",
+                "assin2-rte",
                 split="train",
-                streaming=True,
-                trust_remote_code=True
+                streaming=True
             )
             self.pt_iter = iter(self.pt_dataset)
+            logging.info("Successfully loaded Portuguese dataset")
         except Exception as e:
-            logging.warning(f"Could not load Portuguese Wikipedia: {e}")
-            logging.info("Falling back to Portuguese Oscar subset")
+            logging.warning(f"Could not load Portuguese dataset: {e}")
             try:
+                # Fallback to multilingual dataset with Portuguese
+                logging.info("Trying mc4 Portuguese subset")
                 self.pt_dataset = load_dataset(
-                    "oscar-corpus/OSCAR-2301",
-                    language="pt",
+                    "mc4",
+                    "pt",
                     split="train",
-                    streaming=True,
-                    trust_remote_code=True
+                    streaming=True
                 )
                 self.pt_iter = iter(self.pt_dataset)
+                logging.info("Successfully loaded mc4 Portuguese")
             except Exception as e2:
-                logging.warning(f"Could not load OSCAR: {e2}")
+                logging.warning(f"Could not load mc4 Portuguese: {e2}")
+                logging.info("Portuguese dataset unavailable, using English only")
                 self.pt_dataset = None
                 self.pt_iter = None
 
@@ -801,7 +814,7 @@ class Trainer:
         )
 
         # Gradient scaler for mixed precision
-        self.scaler = GradScaler(enabled=train_config.use_amp and self.dtype == torch.float16)
+        self.scaler = GradScaler('cuda', enabled=train_config.use_amp and self.dtype == torch.float16)
 
         # Training state
         self.global_step = 0
@@ -1044,7 +1057,7 @@ class Trainer:
             labels = labels.to(self.device)
 
             # Forward pass with mixed precision
-            with autocast(device_type='cuda', dtype=self.dtype, enabled=self.train_config.use_amp):
+            with autocast('cuda', dtype=self.dtype, enabled=self.train_config.use_amp):
                 outputs = self.model(input_ids, labels)
                 loss = outputs['loss'] / self.train_config.gradient_accumulation_steps
 
