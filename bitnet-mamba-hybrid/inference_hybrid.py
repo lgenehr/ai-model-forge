@@ -535,7 +535,11 @@ class TextGenerator:
                 break
 
             # Forward pass with single token
-            input_tensor = next_token.unsqueeze(0).unsqueeze(0)
+            # next_token is shape [1] after sampling, need shape [1, 1] for model
+            if next_token.dim() == 0:
+                input_tensor = next_token.unsqueeze(0).unsqueeze(0)
+            else:
+                input_tensor = next_token.unsqueeze(0)  # [1] -> [1, 1]
 
             with torch.autocast(device_type='cuda', dtype=self.dtype):
                 outputs = self.model(input_tensor, use_cache=use_cache)
