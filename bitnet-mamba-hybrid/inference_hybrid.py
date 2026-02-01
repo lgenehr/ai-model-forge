@@ -589,12 +589,16 @@ def load_model(
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print(f"Loading checkpoint from: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
     # Extract config from checkpoint
     if 'model_config' in checkpoint:
         config_dict = checkpoint['model_config']
-        config = ModelConfig(**config_dict)
+        # Remove computed fields that aren't part of the dataclass definition
+        valid_fields = {'vocab_size', 'd_model', 'n_layers', 'd_state', 'd_conv',
+                        'expand', 'dropout', 'bias', 'max_seq_len', 'bitnet_groups'}
+        filtered_config = {k: v for k, v in config_dict.items() if k in valid_fields}
+        config = ModelConfig(**filtered_config)
     else:
         # Use default config
         config = ModelConfig()
