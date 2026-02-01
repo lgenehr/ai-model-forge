@@ -721,6 +721,8 @@ def interactive_mode(generator: TextGenerator, args: argparse.Namespace):
             print("\n\nInterrupted. Type /quit to exit.")
             continue
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             print(f"Error: {e}")
             continue
 
