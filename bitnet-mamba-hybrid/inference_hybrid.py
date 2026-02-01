@@ -706,6 +706,7 @@ def interactive_mode(generator: TextGenerator, args: argparse.Namespace):
 
             if greedy:
                 output = generator.generate_greedy(prompt, max_tokens=max_tokens)
+                print(output)
             else:
                 output = generator.generate(
                     prompt,
@@ -715,9 +716,7 @@ def interactive_mode(generator: TextGenerator, args: argparse.Namespace):
                     top_k=top_k,
                     stream=True
                 )
-
-            if not args.stream:
-                print(output)
+                # Don't print again if streaming (already printed token by token)
 
             print("-" * 40)
 
