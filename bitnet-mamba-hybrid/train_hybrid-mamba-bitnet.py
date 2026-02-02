@@ -62,6 +62,7 @@ import torch.nn.functional as F
 from torch.amp import autocast, GradScaler
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.utils.checkpoint import checkpoint
 
 # ============================================================================
 # CUDA Performance Optimizations
@@ -236,6 +237,9 @@ class ModelConfig:
 
     # BitNet specific
     bitnet_groups: int = 1  # Number of groups for BitLinear
+
+    # Memory optimization
+    use_gradient_checkpointing: bool = False  # Trade compute for memory
 
     def __post_init__(self):
         self.d_inner = self.expand * self.d_model
@@ -597,9 +601,15 @@ class BitNetMambaLM(nn.Module):
         # Token embeddings
         x = self.embedding(input_ids)
 
-        # Apply Mamba blocks
-        for layer in self.layers:
-            x = layer(x)
+        # Apply Mamba blocks with optional gradient checkpointing
+        if self.config.use_gradient_checkpointing and self.training:
+            # Use gradient checkpointing to save memory
+            for layer in self.layers:
+                x = checkpoint(layer, x, use_reentrant=False)
+        else:
+            # Standard forward pass
+            for layer in self.layers:
+                x = layer(x)
 
         # Final normalization
         x = self.norm_f(x)
@@ -1195,6 +1205,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--d_conv", type=int, default=4, help="Convolution kernel size")
     parser.add_argument("--expand", type=int, default=2, help="Block expansion factor")
     parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate")
+    parser.add_argument("--gradient_checkpointing", action="store_true",
+                        help="Enable gradient checkpointing to save memory (trades compute for memory)")
 
     # Training arguments
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
@@ -1271,7 +1283,8 @@ def main():
         d_conv=args.d_conv,
         expand=args.expand,
         dropout=args.dropout,
-        max_seq_len=args.max_seq_len
+        max_seq_len=args.max_seq_len,
+        use_gradient_checkpointing=args.gradient_checkpointing
     )
 
     train_config = TrainingConfig(
