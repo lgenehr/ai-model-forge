@@ -9,6 +9,12 @@ A professional, object-oriented implementation combining:
 Optimized for: NVIDIA RTX 4070 Ti Super (16GB) + Ryzen 9 7950X
 Uses bfloat16 mixed precision throughout.
 
+Performance optimizations:
+- Pre-tokenized memory-mapped datasets (no HTTP requests during training)
+- Multi-worker data loading with prefetching
+- CUDA optimizations (cudnn.benchmark, TF32)
+- Optimized Mamba CUDA kernels
+
 Author: AI Model Forge
 License: MIT
 """
@@ -33,11 +39,22 @@ from torch.amp import autocast, GradScaler
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
-try:
-    import tiktoken
-except ImportError:
-    tiktoken = None
-    print("Warning: tiktoken not available, will use fallback tokenizer")
+# ============================================================================
+# CUDA Performance Optimizations
+# ============================================================================
+# Enable cuDNN autotuner - finds optimal convolution algorithms
+torch.backends.cudnn.benchmark = True
+
+# Enable TF32 for faster matrix multiplications on Ampere+ GPUs
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
+# Reduce verbosity of HTTP requests and dataset loading
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("requests").setLevel(logging.WARNING)
+logging.getLogger("datasets").setLevel(logging.WARNING)
+logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
+logging.getLogger("filelock").setLevel(logging.WARNING)
 
 # Weights & Biases for experiment tracking
 WANDB_AVAILABLE = False
@@ -54,10 +71,18 @@ except ImportError:
     rearrange = None
     print("Warning: einops not available, using manual reshape operations")
 
+# Import efficient data loader
 try:
-    from datasets import load_dataset, IterableDataset
+    from data_loader import (
+        create_dataloader,
+        check_preprocessed_data,
+        get_dataset_info,
+        InfiniteDataLoader
+    )
+    DATA_LOADER_AVAILABLE = True
 except ImportError:
-    raise ImportError("datasets library is required: pip install datasets")
+    DATA_LOADER_AVAILABLE = False
+    print("Warning: data_loader module not found, will use streaming fallback")
 
 # Optional: mamba-ssm for optimized CUDA kernels
 # pip install mamba-ssm (requires CUDA toolkit)
@@ -69,10 +94,103 @@ except ImportError:
     pass
 
 # Import selective_scan_fn for optimized SSM computation
+selective_scan_fn = None
+SELECTIVE_SCAN_CUDA = False
 try:
     from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
+    SELECTIVE_SCAN_CUDA = True
 except ImportError:
-    selective_scan_fn = None
+    pass
+
+
+# =============================================================================
+# Mamba Optimization Verification
+# =============================================================================
+
+def verify_mamba_optimizations() -> Dict[str, Any]:
+    """
+    Verify Mamba optimizations are properly configured.
+
+    Returns:
+        Dictionary with optimization status and details
+    """
+    status = {
+        'mamba_ssm_installed': MAMBA_SSM_AVAILABLE,
+        'selective_scan_cuda': SELECTIVE_SCAN_CUDA,
+        'cuda_available': torch.cuda.is_available(),
+        'cudnn_benchmark': torch.backends.cudnn.benchmark,
+        'tf32_matmul': torch.backends.cuda.matmul.allow_tf32,
+        'tf32_cudnn': torch.backends.cudnn.allow_tf32,
+        'gpu_name': None,
+        'gpu_memory_gb': None,
+        'warnings': [],
+        'optimizations_ok': True,
+    }
+
+    # Get GPU info
+    if torch.cuda.is_available():
+        status['gpu_name'] = torch.cuda.get_device_name(0)
+        status['gpu_memory_gb'] = torch.cuda.get_device_properties(0).total_memory / 1e9
+
+    # Check critical optimizations
+    if not MAMBA_SSM_AVAILABLE:
+        status['warnings'].append(
+            "mamba-ssm not installed. Install with: pip install mamba-ssm"
+        )
+        status['optimizations_ok'] = False
+
+    if not SELECTIVE_SCAN_CUDA:
+        status['warnings'].append(
+            "selective_scan_fn CUDA kernel not available. "
+            "Training will be significantly slower."
+        )
+        status['optimizations_ok'] = False
+
+    if not torch.cuda.is_available():
+        status['warnings'].append("CUDA not available. Training on CPU will be very slow.")
+        status['optimizations_ok'] = False
+
+    return status
+
+
+def print_optimization_status(status: Dict[str, Any], logger=None):
+    """Print optimization status to console/logger"""
+    log_fn = logger.info if logger else print
+
+    log_fn("=" * 60)
+    log_fn("Mamba Optimization Status")
+    log_fn("=" * 60)
+
+    # Hardware
+    log_fn(f"CUDA Available: {status['cuda_available']}")
+    if status['gpu_name']:
+        log_fn(f"GPU: {status['gpu_name']}")
+        log_fn(f"GPU Memory: {status['gpu_memory_gb']:.1f} GB")
+
+    # Mamba optimizations
+    log_fn(f"mamba-ssm Installed: {status['mamba_ssm_installed']}")
+    log_fn(f"selective_scan_fn CUDA: {status['selective_scan_cuda']}")
+
+    # PyTorch optimizations
+    log_fn(f"cuDNN Benchmark: {status['cudnn_benchmark']}")
+    log_fn(f"TF32 MatMul: {status['tf32_matmul']}")
+    log_fn(f"TF32 cuDNN: {status['tf32_cudnn']}")
+
+    # Warnings
+    if status['warnings']:
+        log_fn("-" * 60)
+        log_fn("WARNINGS:")
+        for warning in status['warnings']:
+            log_fn(f"  - {warning}")
+
+    # Overall status
+    log_fn("-" * 60)
+    if status['optimizations_ok']:
+        log_fn("All critical optimizations are enabled.")
+    else:
+        log_fn("Some optimizations are missing. Performance may be degraded.")
+
+    log_fn("=" * 60)
 
 
 # =============================================================================
@@ -130,10 +248,16 @@ class TrainingConfig:
     pt_ratio: float = 0.5
 
     # Paths
+    data_dir: str = "./data/tokenized"  # Pre-tokenized data directory
     output_dir: str = "./ai-model-forge/bitnet-mamba-hybrid"
     checkpoint_dir: str = "./ai-model-forge/bitnet-mamba-hybrid/checkpoints"
     log_file: str = "./ai-model-forge/bitnet-mamba-hybrid/training.log"
     csv_file: str = "./ai-model-forge/bitnet-mamba-hybrid/loss_history.csv"
+
+    # DataLoader settings
+    num_workers: int = 4
+    pin_memory: bool = True
+    prefetch_factor: int = 2
 
     # Weights & Biases
     use_wandb: bool = False
@@ -486,279 +610,63 @@ class BitNetMambaLM(nn.Module):
 
 
 # =============================================================================
-# Data Pipeline
+# Data Pipeline (Efficient Memory-Mapped Loading)
 # =============================================================================
 
-class TokenizerWrapper:
-    """Wrapper for tokenizer with fallback support"""
-
-    def __init__(self, tokenizer_name: str = "gpt2"):
-        if tiktoken is not None:
-            self.tokenizer = tiktoken.get_encoding("gpt2")
-            self.vocab_size = self.tokenizer.n_vocab
-            self.eos_token_id = self.tokenizer.eot_token
-            self.pad_token_id = self.tokenizer.eot_token
-        else:
-            # Fallback: simple character-level tokenizer
-            print("Using fallback character tokenizer")
-            self.tokenizer = None
-            self.vocab_size = 50304
-            self.eos_token_id = 0
-            self.pad_token_id = 0
-
-    def encode(self, text: str) -> List[int]:
-        if self.tokenizer is not None:
-            return self.tokenizer.encode(text, allowed_special={'<|endoftext|>'})
-        else:
-            return [ord(c) % self.vocab_size for c in text]
-
-    def decode(self, tokens: List[int]) -> str:
-        if self.tokenizer is not None:
-            return self.tokenizer.decode(tokens)
-        else:
-            return ''.join(chr(t) for t in tokens if t < 128)
-
-
-class BilingualDataPipeline:
+def create_efficient_dataloader(train_config: TrainingConfig, seed: int = 42) -> InfiniteDataLoader:
     """
-    Streaming data pipeline that mixes English and Portuguese data.
+    Create an efficient dataloader using pre-tokenized memory-mapped data.
 
-    English: HuggingFaceFW/fineweb-edu (sample-10BT)
-    Portuguese: Wikipedia (pt)
+    This eliminates all HTTP requests during training by loading pre-processed
+    data from disk.
+
+    Args:
+        train_config: Training configuration
+        seed: Random seed
+
+    Returns:
+        InfiniteDataLoader instance
+
+    Raises:
+        FileNotFoundError: If preprocessed data is not found
     """
+    if not DATA_LOADER_AVAILABLE:
+        raise ImportError(
+            "data_loader module not available. "
+            "Make sure data_loader.py is in the same directory."
+        )
 
-    def __init__(
-        self,
-        tokenizer: TokenizerWrapper,
-        config: TrainingConfig,
-        seed: int = 42
-    ):
-        self.tokenizer = tokenizer
-        self.config = config
-        self.seed = seed
-        self.rng = random.Random(seed)
+    # Check for preprocessed data
+    if not check_preprocessed_data(train_config.data_dir):
+        raise FileNotFoundError(
+            f"Preprocessed data not found at {train_config.data_dir}\n"
+            f"Please run the preprocessing script first:\n"
+            f"  python preprocess_datasets.py --output_dir {train_config.data_dir}\n"
+        )
 
-        # Track total tokens processed
-        self.total_tokens = 0
+    # Get dataset info
+    dataset_info = get_dataset_info(train_config.data_dir)
+    logging.info(f"Dataset info:")
+    logging.info(f"  English tokens: {dataset_info['en_tokens']:,}")
+    logging.info(f"  Portuguese tokens: {dataset_info['pt_tokens']:,}")
+    logging.info(f"  Total tokens: {dataset_info['total_tokens']:,}")
 
-        # Initialize datasets
-        self._init_datasets()
+    # Create dataloader
+    dataloader = create_dataloader(
+        data_dir=train_config.data_dir,
+        batch_size=train_config.batch_size,
+        max_seq_len=train_config.max_seq_len,
+        en_ratio=train_config.en_ratio,
+        pt_ratio=train_config.pt_ratio,
+        num_workers=train_config.num_workers,
+        pin_memory=train_config.pin_memory,
+        prefetch_factor=train_config.prefetch_factor,
+        seed=seed,
+        epoch_tokens=train_config.max_tokens,
+        drop_last=True,
+    )
 
-    def _init_datasets(self):
-        """Initialize streaming datasets"""
-        logging.info("Loading English dataset: HuggingFaceFW/fineweb-edu (sample-10BT)")
-        try:
-            self.en_dataset = load_dataset(
-                "HuggingFaceFW/fineweb-edu",
-                name="sample-10BT",
-                split="train",
-                streaming=True
-            )
-            self.en_iter = iter(self.en_dataset)
-            logging.info("Successfully loaded fineweb-edu")
-        except Exception as e:
-            logging.warning(f"Could not load fineweb-edu: {e}")
-            logging.info("Falling back to wikitext-103 for English")
-            try:
-                self.en_dataset = load_dataset(
-                    "wikitext",
-                    "wikitext-103-raw-v1",
-                    split="train",
-                    streaming=True
-                )
-                self.en_iter = iter(self.en_dataset)
-            except Exception as e2:
-                logging.warning(f"Could not load wikitext: {e2}")
-                logging.info("Falling back to roneneldan/TinyStories for English")
-                self.en_dataset = load_dataset(
-                    "roneneldan/TinyStories",
-                    split="train",
-                    streaming=True
-                )
-                self.en_iter = iter(self.en_dataset)
-
-        logging.info("Loading Portuguese dataset")
-        try:
-            # Try community Portuguese dataset
-            self.pt_dataset = load_dataset(
-                "eduagarcia/portuguese_benchmark",
-                "assin2-rte",
-                split="train",
-                streaming=True
-            )
-            self.pt_iter = iter(self.pt_dataset)
-            logging.info("Successfully loaded Portuguese dataset")
-        except Exception as e:
-            logging.warning(f"Could not load Portuguese dataset: {e}")
-            try:
-                # Fallback to multilingual dataset with Portuguese
-                logging.info("Trying mc4 Portuguese subset")
-                self.pt_dataset = load_dataset(
-                    "mc4",
-                    "pt",
-                    split="train",
-                    streaming=True
-                )
-                self.pt_iter = iter(self.pt_dataset)
-                logging.info("Successfully loaded mc4 Portuguese")
-            except Exception as e2:
-                logging.warning(f"Could not load mc4 Portuguese: {e2}")
-                logging.info("Portuguese dataset unavailable, using English only")
-                self.pt_dataset = None
-                self.pt_iter = None
-
-    def _get_text(self, sample: Dict, is_english: bool) -> str:
-        """Extract text from dataset sample"""
-        if 'text' in sample:
-            return sample['text']
-        elif 'content' in sample:
-            return sample['content']
-        else:
-            # Try common text field names
-            for key in ['sentence', 'document', 'article']:
-                if key in sample:
-                    return sample[key]
-        return ""
-
-    def _get_next_sample(self, is_english: bool) -> Optional[str]:
-        """Get next text sample from the appropriate dataset"""
-        try:
-            if is_english:
-                sample = next(self.en_iter)
-            else:
-                if self.pt_iter is None:
-                    # Fallback to English if PT not available
-                    sample = next(self.en_iter)
-                    is_english = True
-                else:
-                    try:
-                        sample = next(self.pt_iter)
-                    except StopIteration:
-                        self.pt_iter = iter(self.pt_dataset)
-                        sample = next(self.pt_iter)
-
-            text = self._get_text(sample, is_english)
-            return text if text else None
-
-        except StopIteration:
-            # Reset iterator
-            logging.debug("Dataset iterator exhausted, resetting...")
-            if is_english:
-                self.en_iter = iter(self.en_dataset)
-                sample = next(self.en_iter)
-            else:
-                if self.pt_iter is not None:
-                    self.pt_iter = iter(self.pt_dataset)
-                    sample = next(self.pt_iter)
-                else:
-                    self.en_iter = iter(self.en_dataset)
-                    sample = next(self.en_iter)
-
-            return self._get_text(sample, is_english)
-        except Exception as e:
-            logging.warning(f"Error getting sample: {e}")
-            return None
-
-    def _create_batch_from_texts(
-        self,
-        texts: List[str],
-        max_seq_len: int
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Tokenize and create a batch from text samples"""
-        all_tokens = []
-
-        for text in texts:
-            tokens = self.tokenizer.encode(text)
-            all_tokens.extend(tokens)
-            all_tokens.append(self.tokenizer.eos_token_id)
-
-        # Chunk into sequences of max_seq_len
-        sequences = []
-        for i in range(0, len(all_tokens) - max_seq_len, max_seq_len):
-            seq = all_tokens[i:i + max_seq_len + 1]
-            if len(seq) == max_seq_len + 1:
-                sequences.append(seq)
-
-        if not sequences:
-            # Not enough tokens, create a padded sequence
-            seq = all_tokens[:max_seq_len + 1]
-            while len(seq) < max_seq_len + 1:
-                seq.append(self.tokenizer.pad_token_id)
-            sequences.append(seq)
-
-        # Convert to tensors
-        batch = torch.tensor(sequences, dtype=torch.long)
-        input_ids = batch[:, :-1]
-        labels = batch[:, 1:]
-
-        return input_ids, labels
-
-    def generate_batches(
-        self,
-        batch_size: int,
-        max_seq_len: int
-    ) -> Iterator[Tuple[torch.Tensor, torch.Tensor, int]]:
-        """
-        Generate training batches with interleaved EN/PT data.
-
-        Yields:
-            input_ids: [batch_size, max_seq_len]
-            labels: [batch_size, max_seq_len]
-            tokens_in_batch: Number of tokens in this batch
-        """
-        buffer = []
-        buffer_tokens = 0
-        target_buffer_tokens = batch_size * max_seq_len * 4  # Need enough for at least one batch
-        samples_loaded = 0
-
-        logging.info(f"Starting data generation (target buffer: {target_buffer_tokens:,} tokens)")
-
-        while self.total_tokens < self.config.max_tokens:
-            # Decide language based on ratio
-            is_english = self.rng.random() < self.config.en_ratio
-
-            # Get next text sample
-            text = self._get_next_sample(is_english)
-            if text and len(text.strip()) > 10:  # Skip very short texts
-                buffer.append(text)
-                # More accurate token estimate
-                buffer_tokens += len(text) // 4  # Rough: 1 token ≈ 4 chars
-                samples_loaded += 1
-
-                # Progress logging every 100 samples
-                if samples_loaded % 100 == 0:
-                    logging.info(f"Loaded {samples_loaded} samples, buffer: ~{buffer_tokens:,} tokens")
-
-            # Create batch when buffer is full enough
-            if buffer_tokens >= target_buffer_tokens:
-                logging.info(f"Buffer full, creating batches from {len(buffer)} samples...")
-                input_ids, labels = self._create_batch_from_texts(buffer, max_seq_len)
-
-                if len(input_ids) == 0:
-                    logging.warning("No valid sequences created, refilling buffer...")
-                    buffer = []
-                    buffer_tokens = 0
-                    continue
-
-                logging.info(f"Created {len(input_ids)} sequences")
-
-                # Yield batches
-                for i in range(0, len(input_ids), batch_size):
-                    batch_input = input_ids[i:i + batch_size]
-                    batch_labels = labels[i:i + batch_size]
-
-                    if len(batch_input) == batch_size:
-                        tokens_in_batch = batch_input.numel()
-                        self.total_tokens += tokens_in_batch
-
-                        yield batch_input, batch_labels, tokens_in_batch
-
-                        if self.total_tokens >= self.config.max_tokens:
-                            return
-
-                # Reset buffer
-                buffer = []
-                buffer_tokens = 0
+    return dataloader
 
 
 # =============================================================================
@@ -1013,8 +921,13 @@ class Trainer:
 
         self.logger.info(f"Resumed from step {self.global_step}, tokens: {self.total_tokens:,}")
 
-    def train(self, data_pipeline: BilingualDataPipeline):
-        """Main training loop"""
+    def train(self, dataloader: InfiniteDataLoader):
+        """
+        Main training loop using efficient memory-mapped dataloader.
+
+        Args:
+            dataloader: InfiniteDataLoader instance from data_loader module
+        """
         self.model.train()
 
         self.logger.info("=" * 60)
@@ -1025,26 +938,22 @@ class Trainer:
         self.logger.info(f"Effective batch size: {self.train_config.batch_size * self.train_config.gradient_accumulation_steps}")
         self.logger.info(f"Device: {self.device}")
         self.logger.info(f"Dtype: {self.dtype}")
+        self.logger.info(f"Num workers: {self.train_config.num_workers}")
+        self.logger.info(f"Pin memory: {self.train_config.pin_memory}")
         self.logger.info("=" * 60)
 
         # Training metrics
         accumulated_loss = 0.0
         accumulated_tokens = 0
         step_start_time = datetime.now()
+        batch_idx = 0
 
-        # Data generator
-        batch_generator = data_pipeline.generate_batches(
-            batch_size=self.train_config.batch_size,
-            max_seq_len=self.train_config.max_seq_len
-        )
-
-        # Update data pipeline's total tokens to match checkpoint
-        data_pipeline.total_tokens = self.total_tokens
-
-        for batch_idx, (input_ids, labels, tokens_in_batch) in enumerate(batch_generator):
-            # Move to device
-            input_ids = input_ids.to(self.device)
-            labels = labels.to(self.device)
+        # Use the efficient infinite dataloader
+        for batch in dataloader:
+            # Get input_ids and labels from batch dict
+            input_ids = batch['input_ids'].to(self.device, non_blocking=True)
+            labels = batch['labels'].to(self.device, non_blocking=True)
+            tokens_in_batch = input_ids.numel()
 
             # Forward pass with mixed precision
             with autocast('cuda', dtype=self.dtype, enabled=self.train_config.use_amp):
@@ -1059,9 +968,10 @@ class Trainer:
 
             accumulated_loss += loss.item() * self.train_config.gradient_accumulation_steps
             accumulated_tokens += tokens_in_batch
+            batch_idx += 1
 
             # Gradient accumulation step
-            if (batch_idx + 1) % self.train_config.gradient_accumulation_steps == 0:
+            if batch_idx % self.train_config.gradient_accumulation_steps == 0:
                 # Gradient clipping
                 if self.train_config.use_amp and self.dtype == torch.float16:
                     self.scaler.unscale_(self.optimizer)
@@ -1078,7 +988,7 @@ class Trainer:
                 else:
                     self.optimizer.step()
 
-                self.optimizer.zero_grad()
+                self.optimizer.zero_grad(set_to_none=True)  # More efficient
 
                 # Update learning rate
                 current_lr = self._get_lr()
@@ -1194,8 +1104,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight_decay", type=float, default=0.1, help="Weight decay")
 
     # Data arguments
+    parser.add_argument("--data_dir", type=str, default="./data/tokenized",
+                        help="Directory containing pre-tokenized data (run preprocess_datasets.py first)")
     parser.add_argument("--en_ratio", type=float, default=0.5, help="English data ratio")
     parser.add_argument("--pt_ratio", type=float, default=0.5, help="Portuguese data ratio")
+    parser.add_argument("--num_workers", type=int, default=4, help="Number of dataloader workers")
+    parser.add_argument("--prefetch_factor", type=int, default=2, help="Dataloader prefetch factor")
+    parser.add_argument("--no_pin_memory", action="store_true", help="Disable pinned memory for dataloader")
 
     # Output arguments
     parser.add_argument("--output_dir", type=str, default="./ai-model-forge/bitnet-mamba-hybrid",
@@ -1204,6 +1119,7 @@ def parse_args() -> argparse.Namespace:
     # Other arguments
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--no_amp", action="store_true", help="Disable automatic mixed precision")
+    parser.add_argument("--skip_mamba_check", action="store_true", help="Skip Mamba optimization verification")
 
     # Weights & Biases arguments
     parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
@@ -1232,6 +1148,18 @@ def main():
     # Set random seeds
     torch.manual_seed(args.seed)
     random.seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+
+    # Verify Mamba optimizations at startup
+    if not args.skip_mamba_check:
+        opt_status = verify_mamba_optimizations()
+        print_optimization_status(opt_status)
+
+        if not opt_status['optimizations_ok']:
+            print("\nWARNING: Some critical optimizations are missing.")
+            print("Training will proceed but may be slower than expected.")
+            print("Use --skip_mamba_check to suppress this warning.\n")
 
     # Create configurations
     model_config = ModelConfig(
@@ -1253,8 +1181,14 @@ def main():
         warmup_steps=args.warmup_steps,
         weight_decay=args.weight_decay,
         use_amp=not args.no_amp,
+        # Data settings
+        data_dir=args.data_dir,
         en_ratio=args.en_ratio,
         pt_ratio=args.pt_ratio,
+        num_workers=args.num_workers,
+        pin_memory=not args.no_pin_memory,
+        prefetch_factor=args.prefetch_factor,
+        # Output paths
         output_dir=args.output_dir,
         checkpoint_dir=f"{args.output_dir}/checkpoints",
         log_file=f"{args.output_dir}/training.log",
@@ -1274,23 +1208,31 @@ def main():
     print(f"Training Config: {asdict(train_config)}")
     print("=" * 60)
 
-    # Create tokenizer
-    tokenizer = TokenizerWrapper()
-    model_config.vocab_size = tokenizer.vocab_size
-
     # Create model
     model = BitNetMambaLM(model_config)
     print(f"Model created with {model.get_num_params():,} parameters")
 
-    # Create data pipeline
-    data_pipeline = BilingualDataPipeline(tokenizer, train_config, seed=args.seed)
+    # Create efficient dataloader (memory-mapped, no HTTP requests)
+    try:
+        dataloader = create_efficient_dataloader(train_config, seed=args.seed)
+    except FileNotFoundError as e:
+        print(f"\nERROR: {e}")
+        print("\nTo preprocess the datasets, run:")
+        print(f"  python preprocess_datasets.py --output_dir {args.data_dir}")
+        print("\nThis will download and tokenize the datasets once.")
+        print("Subsequent training runs will load data from disk instantly.")
+        sys.exit(1)
+    except ImportError as e:
+        print(f"\nERROR: {e}")
+        print("\nMake sure data_loader.py is in the same directory as this script.")
+        sys.exit(1)
 
     # Get wandb API key from argument or environment variable
     wandb_api_key = args.wandb_api_key or os.environ.get('WANDB_API_KEY')
 
     # Create trainer and start training
     trainer = Trainer(model, train_config, model_config, wandb_api_key=wandb_api_key)
-    trainer.train(data_pipeline)
+    trainer.train(dataloader)
 
 
 if __name__ == "__main__":
