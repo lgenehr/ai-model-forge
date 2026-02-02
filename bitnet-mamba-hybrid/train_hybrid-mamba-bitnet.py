@@ -25,12 +25,36 @@ import csv
 import math
 import json
 import random
+import signal
 import logging
 import argparse
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass, field, asdict
 from typing import Optional, Iterator, Tuple, Dict, Any, List
+
+# =============================================================================
+# Graceful Shutdown Handling
+# =============================================================================
+_shutdown_requested = False
+_trainer_instance = None  # Global reference for signal handler
+
+
+def _training_signal_handler(signum, frame):
+    """Handle interrupt signals gracefully during training"""
+    global _shutdown_requested
+
+    if _shutdown_requested:
+        print("\n" + "=" * 60)
+        print("Forced shutdown requested. Exiting immediately...")
+        print("=" * 60)
+        sys.exit(1)
+
+    _shutdown_requested = True
+    print("\n" + "=" * 60)
+    print("Interrupt received! Finishing current step and saving checkpoint...")
+    print("Press Ctrl+C again to force quit (may lose current step)")
+    print("=" * 60)
 
 import torch
 import torch.nn as nn
@@ -921,13 +945,57 @@ class Trainer:
 
         self.logger.info(f"Resumed from step {self.global_step}, tokens: {self.total_tokens:,}")
 
+    def _save_interrupt_checkpoint(self):
+        """Save checkpoint when training is interrupted (Ctrl+C)"""
+        self.logger.info("=" * 60)
+        self.logger.info("Saving interrupt checkpoint...")
+
+        checkpoint = {
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict(),
+            'global_step': self.global_step,
+            'total_tokens': self.total_tokens,
+            'best_loss': self.best_loss,
+            'model_config': asdict(self.model_config),
+            'train_config': asdict(self.train_config),
+            'interrupted': True,
+        }
+
+        # Save interrupt checkpoint with special naming
+        checkpoint_path = Path(self.train_config.checkpoint_dir) / f"checkpoint_interrupt_{self.global_step:08d}.pt"
+        torch.save(checkpoint, checkpoint_path)
+        self.logger.info(f"Saved interrupt checkpoint: {checkpoint_path}")
+
+        # Also save as latest checkpoint for easy resume
+        latest_path = Path(self.train_config.checkpoint_dir) / f"checkpoint_{self.global_step:08d}.pt"
+        if not latest_path.exists():
+            torch.save(checkpoint, latest_path)
+            self.logger.info(f"Saved checkpoint: {latest_path}")
+
+        self.logger.info("=" * 60)
+        self.logger.info("Training interrupted safely. To resume, run the same command.")
+        self.logger.info(f"Progress: Step {self.global_step:,}, Tokens {self.total_tokens:,}")
+        self.logger.info("=" * 60)
+
     def train(self, dataloader: InfiniteDataLoader):
         """
         Main training loop using efficient memory-mapped dataloader.
 
         Args:
             dataloader: InfiniteDataLoader instance from data_loader module
+
+        Supports graceful shutdown:
+        - Press Ctrl+C once to finish current step and save checkpoint
+        - Press Ctrl+C twice to force quit immediately
         """
+        global _shutdown_requested, _trainer_instance
+
+        # Setup signal handler for graceful shutdown
+        _trainer_instance = self
+        signal.signal(signal.SIGINT, _training_signal_handler)
+        signal.signal(signal.SIGTERM, _training_signal_handler)
+
         self.model.train()
 
         self.logger.info("=" * 60)
@@ -940,6 +1008,8 @@ class Trainer:
         self.logger.info(f"Dtype: {self.dtype}")
         self.logger.info(f"Num workers: {self.train_config.num_workers}")
         self.logger.info(f"Pin memory: {self.train_config.pin_memory}")
+        self.logger.info("")
+        self.logger.info("Press Ctrl+C to save checkpoint and stop training")
         self.logger.info("=" * 60)
 
         # Training metrics
@@ -947,9 +1017,16 @@ class Trainer:
         accumulated_tokens = 0
         step_start_time = datetime.now()
         batch_idx = 0
+        interrupted = False
 
-        # Use the efficient infinite dataloader
-        for batch in dataloader:
+        try:
+            # Use the efficient infinite dataloader
+            for batch in dataloader:
+                # Check for shutdown request at start of each batch
+                if _shutdown_requested:
+                    self.logger.info("Shutdown requested, finishing current step...")
+                    interrupted = True
+                    break
             # Get input_ids and labels from batch dict
             input_ids = batch['input_ids'].to(self.device, non_blocking=True)
             labels = batch['labels'].to(self.device, non_blocking=True)
@@ -1054,7 +1131,32 @@ class Trainer:
                     self.logger.info("Reached max steps, training complete!")
                     break
 
-        # Final checkpoint and cleanup
+                # Check for shutdown request after each optimizer step
+                if _shutdown_requested:
+                    self.logger.info("Shutdown requested after step completion...")
+                    interrupted = True
+                    break
+
+        except KeyboardInterrupt:
+            # This catches any KeyboardInterrupt not handled by signal handler
+            self.logger.warning("KeyboardInterrupt caught!")
+            interrupted = True
+
+        except Exception as e:
+            # Save checkpoint on unexpected errors too
+            self.logger.error(f"Training error: {e}")
+            self.logger.info("Saving emergency checkpoint due to error...")
+            self._save_interrupt_checkpoint()
+            raise
+
+        # Handle interrupted training
+        if interrupted:
+            self._save_interrupt_checkpoint()
+            self.csv_file.close()
+            self._finish_wandb()
+            return
+
+        # Normal completion - Final checkpoint and cleanup
         self._save_checkpoint(is_best=True)
         self.csv_file.close()
 
