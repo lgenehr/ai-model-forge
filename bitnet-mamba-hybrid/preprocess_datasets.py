@@ -13,9 +13,8 @@ Datasets:
   3. Portuguese-PD - Largest Portuguese open corpus (public domain)
   4. CulturaX Portuguese - High-quality web corpus
   5. BrWaC - Brazilian Web as Corpus (3.53M docs, 2.68B tokens)
-  6. OSCAR Portuguese - Large web crawl (may have access restrictions)
-  7. Quati - Unicamp Brazilian Portuguese dataset
-  8. CC-100, mC4, News, Carolina Corpus - Additional sources
+  6. Quati - Unicamp Brazilian Portuguese dataset
+  7. CC-100, mC4, News, Carolina Corpus - Additional sources
 
 Features:
 - Saves progress in chunks (resilient to interruptions)
@@ -265,8 +264,8 @@ def load_english_dataset(max_samples: Optional[int] = None):
 # =============================================================================
 # Portuguese Dataset Sources - Multiple High-Quality Sources
 # =============================================================================
-# Updated: Added FineWeb2 Portuguese (multilingual fineweb), Portuguese-PD,
-# Quati, and BrWaC as high-quality alternatives to OSCAR
+# Multiple high-quality Portuguese sources including FineWeb2, Wikipedia,
+# Portuguese-PD, CulturaX, BrWaC, and Quati with automatic fallback
 # =============================================================================
 
 PORTUGUESE_SOURCES = [
@@ -316,21 +315,12 @@ PORTUGUESE_SOURCES = [
         "description": "BrWaC - Large Brazilian Portuguese web corpus (3.53M documents, 2.68B tokens)"
     },
     {
-        "name": "OSCAR Portuguese",
-        "dataset_id": "oscar-corpus/OSCAR-2301",
-        "config": "pt",
-        "split": "train",
-        "text_field": "text",
-        "priority": 6,
-        "description": "OSCAR 2301 - Large web crawl corpus (may have restricted access)"
-    },
-    {
         "name": "Quati (Unicamp)",
         "dataset_id": "unicamp-dl/quati",
         "config": None,
         "split": "train",
         "text_field": "text",
-        "priority": 7,
+        "priority": 6,
         "description": "Quati - High-quality Brazilian Portuguese dataset from Unicamp"
     },
     {
@@ -339,7 +329,7 @@ PORTUGUESE_SOURCES = [
         "config": "pt",
         "split": "train",
         "text_field": "text",
-        "priority": 8,
+        "priority": 7,
         "description": "CC-100 - CommonCrawl based corpus"
     },
     {
@@ -348,7 +338,7 @@ PORTUGUESE_SOURCES = [
         "config": "pt",
         "split": "train",
         "text_field": "text",
-        "priority": 9,
+        "priority": 8,
         "description": "mC4 - Multilingual C4 Portuguese subset"
     },
     {
@@ -357,7 +347,7 @@ PORTUGUESE_SOURCES = [
         "config": None,
         "split": "train",
         "text_field": "text",
-        "priority": 10,
+        "priority": 9,
         "description": "Brazilian Web as Corpus - Brazilian Portuguese web content (legacy sample)"
     },
     {
@@ -366,7 +356,7 @@ PORTUGUESE_SOURCES = [
         "config": None,
         "split": "train",
         "text_field": "content",
-        "priority": 11,
+        "priority": 10,
         "description": "Portuguese news articles"
     },
     {
@@ -375,7 +365,7 @@ PORTUGUESE_SOURCES = [
         "config": None,
         "split": "train",
         "text_field": "text",
-        "priority": 12,
+        "priority": 11,
         "description": "Carolina Corpus - Brazilian Portuguese reference corpus"
     },
 ]
