@@ -1027,115 +1027,115 @@ class Trainer:
                     self.logger.info("Shutdown requested, finishing current step...")
                     interrupted = True
                     break
-            # Get input_ids and labels from batch dict
-            input_ids = batch['input_ids'].to(self.device, non_blocking=True)
-            labels = batch['labels'].to(self.device, non_blocking=True)
-            tokens_in_batch = input_ids.numel()
+                # Get input_ids and labels from batch dict
+                input_ids = batch['input_ids'].to(self.device, non_blocking=True)
+                labels = batch['labels'].to(self.device, non_blocking=True)
+                tokens_in_batch = input_ids.numel()
 
-            # Forward pass with mixed precision
-            with autocast('cuda', dtype=self.dtype, enabled=self.train_config.use_amp):
-                outputs = self.model(input_ids, labels)
-                loss = outputs['loss'] / self.train_config.gradient_accumulation_steps
+                # Forward pass with mixed precision
+                with autocast('cuda', dtype=self.dtype, enabled=self.train_config.use_amp):
+                    outputs = self.model(input_ids, labels)
+                    loss = outputs['loss'] / self.train_config.gradient_accumulation_steps
 
-            # Backward pass
-            if self.train_config.use_amp and self.dtype == torch.float16:
-                self.scaler.scale(loss).backward()
-            else:
-                loss.backward()
-
-            accumulated_loss += loss.item() * self.train_config.gradient_accumulation_steps
-            accumulated_tokens += tokens_in_batch
-            batch_idx += 1
-
-            # Gradient accumulation step
-            if batch_idx % self.train_config.gradient_accumulation_steps == 0:
-                # Gradient clipping
+                # Backward pass
                 if self.train_config.use_amp and self.dtype == torch.float16:
-                    self.scaler.unscale_(self.optimizer)
-
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
-                    self.train_config.max_grad_norm
-                )
-
-                # Optimizer step
-                if self.train_config.use_amp and self.dtype == torch.float16:
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
+                    self.scaler.scale(loss).backward()
                 else:
-                    self.optimizer.step()
+                    loss.backward()
 
-                self.optimizer.zero_grad(set_to_none=True)  # More efficient
+                accumulated_loss += loss.item() * self.train_config.gradient_accumulation_steps
+                accumulated_tokens += tokens_in_batch
+                batch_idx += 1
 
-                # Update learning rate
-                current_lr = self._get_lr()
-                self._set_lr(current_lr)
+                # Gradient accumulation step
+                if batch_idx % self.train_config.gradient_accumulation_steps == 0:
+                    # Gradient clipping
+                    if self.train_config.use_amp and self.dtype == torch.float16:
+                        self.scaler.unscale_(self.optimizer)
 
-                if self.global_step >= self.train_config.warmup_steps:
-                    self.scheduler.step()
-
-                self.global_step += 1
-                self.total_tokens += accumulated_tokens
-
-                # Logging
-                if self.global_step % self.train_config.log_interval == 0:
-                    step_time = (datetime.now() - step_start_time).total_seconds()
-                    tokens_per_sec = accumulated_tokens / step_time if step_time > 0 else 0
-
-                    avg_loss = accumulated_loss / self.train_config.log_interval
-
-                    self.logger.info(
-                        f"Step {self.global_step:>7} | "
-                        f"Loss: {avg_loss:.4f} | "
-                        f"LR: {current_lr:.2e} | "
-                        f"Tokens: {self.total_tokens:>12,} | "
-                        f"Tok/s: {tokens_per_sec:>8,.0f}"
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(),
+                        self.train_config.max_grad_norm
                     )
 
-                    # Write to CSV
-                    self.csv_writer.writerow([
-                        self.global_step,
-                        avg_loss,
-                        current_lr,
-                        self.total_tokens,
-                        tokens_per_sec,
-                        datetime.now().isoformat()
-                    ])
-                    self.csv_file.flush()
+                    # Optimizer step
+                    if self.train_config.use_amp and self.dtype == torch.float16:
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                    else:
+                        self.optimizer.step()
 
-                    # Log to Weights & Biases
-                    self._log_to_wandb({
-                        'train/loss': avg_loss,
-                        'train/learning_rate': current_lr,
-                        'train/tokens': self.total_tokens,
-                        'train/tokens_per_sec': tokens_per_sec,
-                        'train/epoch': self.total_tokens / self.train_config.max_tokens,
-                    }, step=self.global_step)
+                    self.optimizer.zero_grad(set_to_none=True)  # More efficient
 
-                    # Track best loss
-                    if avg_loss < self.best_loss:
-                        self.best_loss = avg_loss
-                        self._log_to_wandb({'train/best_loss': self.best_loss}, step=self.global_step)
+                    # Update learning rate
+                    current_lr = self._get_lr()
+                    self._set_lr(current_lr)
 
-                    accumulated_loss = 0.0
-                    step_start_time = datetime.now()
+                    if self.global_step >= self.train_config.warmup_steps:
+                        self.scheduler.step()
 
-                accumulated_tokens = 0
+                    self.global_step += 1
+                    self.total_tokens += accumulated_tokens
 
-                # Checkpoint
-                if self.global_step % self.train_config.checkpoint_interval == 0:
-                    self._save_checkpoint(is_best=False)
+                    # Logging
+                    if self.global_step % self.train_config.log_interval == 0:
+                        step_time = (datetime.now() - step_start_time).total_seconds()
+                        tokens_per_sec = accumulated_tokens / step_time if step_time > 0 else 0
 
-                # Check if training is complete
-                if self.global_step >= self.train_config.max_steps:
-                    self.logger.info("Reached max steps, training complete!")
-                    break
+                        avg_loss = accumulated_loss / self.train_config.log_interval
 
-                # Check for shutdown request after each optimizer step
-                if _shutdown_requested:
-                    self.logger.info("Shutdown requested after step completion...")
-                    interrupted = True
-                    break
+                        self.logger.info(
+                            f"Step {self.global_step:>7} | "
+                            f"Loss: {avg_loss:.4f} | "
+                            f"LR: {current_lr:.2e} | "
+                            f"Tokens: {self.total_tokens:>12,} | "
+                            f"Tok/s: {tokens_per_sec:>8,.0f}"
+                        )
+
+                        # Write to CSV
+                        self.csv_writer.writerow([
+                            self.global_step,
+                            avg_loss,
+                            current_lr,
+                            self.total_tokens,
+                            tokens_per_sec,
+                            datetime.now().isoformat()
+                        ])
+                        self.csv_file.flush()
+
+                        # Log to Weights & Biases
+                        self._log_to_wandb({
+                            'train/loss': avg_loss,
+                            'train/learning_rate': current_lr,
+                            'train/tokens': self.total_tokens,
+                            'train/tokens_per_sec': tokens_per_sec,
+                            'train/epoch': self.total_tokens / self.train_config.max_tokens,
+                        }, step=self.global_step)
+
+                        # Track best loss
+                        if avg_loss < self.best_loss:
+                            self.best_loss = avg_loss
+                            self._log_to_wandb({'train/best_loss': self.best_loss}, step=self.global_step)
+
+                        accumulated_loss = 0.0
+                        step_start_time = datetime.now()
+
+                    accumulated_tokens = 0
+
+                    # Checkpoint
+                    if self.global_step % self.train_config.checkpoint_interval == 0:
+                        self._save_checkpoint(is_best=False)
+
+                    # Check if training is complete
+                    if self.global_step >= self.train_config.max_steps:
+                        self.logger.info("Reached max steps, training complete!")
+                        break
+
+                    # Check for shutdown request after each optimizer step
+                    if _shutdown_requested:
+                        self.logger.info("Shutdown requested after step completion...")
+                        interrupted = True
+                        break
 
         except KeyboardInterrupt:
             # This catches any KeyboardInterrupt not handled by signal handler
