@@ -7,12 +7,13 @@ Eliminates HTTP requests during training by pre-processing all data.
 
 Datasets:
 - English: HuggingFaceFW/fineweb-edu (sample-10BT split)
-- Portuguese: eduagarcia/portuguese_benchmark (train split)
+- Portuguese: Multiple high-quality sources (Wikipedia, CulturaX, OSCAR, etc.)
 
 Features:
 - Saves progress in chunks (resilient to interruptions)
 - Can merge chunks from interrupted downloads with --merge_chunks
 - Graceful shutdown on Ctrl+C (saves current progress)
+- Validates already processed datasets (skips if tokens.bin exists)
 
 Usage:
     # Normal preprocessing
@@ -21,8 +22,8 @@ Usage:
     # Merge chunks from interrupted download
     python preprocess_datasets.py --output_dir ./data/tokenized --merge_chunks
 
-    # Merge only English chunks
-    python preprocess_datasets.py --output_dir ./data/tokenized --merge_chunks --merge_lang en
+    # Force reprocessing even if tokens.bin exists
+    python preprocess_datasets.py --output_dir ./data/tokenized --force
 """
 
 import os
@@ -32,7 +33,7 @@ import argparse
 import logging
 import json
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple, Iterator
 from dataclasses import dataclass
 
 import numpy as np
@@ -156,6 +157,55 @@ def get_tokenizer():
         raise ImportError("transformers library required: pip install transformers")
 
 
+def check_dataset_already_processed(output_path: Path) -> Tuple[bool, Optional[int]]:
+    """
+    Check if a dataset has already been processed by validating tokens.bin.
+
+    Args:
+        output_path: Path to the dataset directory (e.g., ./data/tokenized/en)
+
+    Returns:
+        Tuple of (is_processed, token_count)
+    """
+    tokens_file = output_path / "tokens.bin"
+    metadata_file = output_path / "metadata.json"
+
+    if not tokens_file.exists():
+        return False, None
+
+    # Validate the tokens.bin file
+    try:
+        file_size = tokens_file.stat().st_size
+        if file_size == 0:
+            logger.warning(f"tokens.bin exists but is empty at {output_path}")
+            return False, None
+
+        # Check metadata
+        if metadata_file.exists():
+            with open(metadata_file, 'r') as f:
+                metadata = json.load(f)
+                token_count = metadata.get('total_tokens', 0)
+
+                if token_count > 0:
+                    # Validate file size matches expected
+                    expected_size = token_count * 2  # uint16 = 2 bytes
+                    if abs(file_size - expected_size) < 100:  # Allow small tolerance
+                        return True, token_count
+                    else:
+                        logger.warning(f"tokens.bin size mismatch at {output_path}")
+                        logger.warning(f"  Expected: {expected_size:,} bytes, Got: {file_size:,} bytes")
+
+        # If no valid metadata, estimate from file size
+        estimated_tokens = file_size // 2  # Assume uint16
+        if estimated_tokens > 1000:  # At least 1000 tokens
+            return True, estimated_tokens
+
+    except Exception as e:
+        logger.warning(f"Error validating {tokens_file}: {e}")
+
+    return False, None
+
+
 def load_english_dataset(max_samples: Optional[int] = None):
     """Load English dataset from HuggingFace"""
     try:
@@ -200,52 +250,302 @@ def load_english_dataset(max_samples: Optional[int] = None):
             return dataset, "text"
 
 
-def load_portuguese_dataset(max_samples: Optional[int] = None):
-    """Load Portuguese dataset from HuggingFace"""
+# =============================================================================
+# Portuguese Dataset Sources - Multiple High-Quality Sources
+# =============================================================================
+
+PORTUGUESE_SOURCES = [
+    {
+        "name": "Wikipedia Portuguese",
+        "dataset_id": "wikimedia/wikipedia",
+        "config": "20231101.pt",
+        "split": "train",
+        "text_field": "text",
+        "priority": 1,
+        "description": "Portuguese Wikipedia - High quality encyclopedic content"
+    },
+    {
+        "name": "CulturaX Portuguese",
+        "dataset_id": "uonlp/CulturaX",
+        "config": "pt",
+        "split": "train",
+        "text_field": "text",
+        "priority": 2,
+        "description": "CulturaX - High quality multilingual web corpus"
+    },
+    {
+        "name": "OSCAR Portuguese",
+        "dataset_id": "oscar-corpus/OSCAR-2301",
+        "config": "pt",
+        "split": "train",
+        "text_field": "text",
+        "priority": 3,
+        "description": "OSCAR 2301 - Large web crawl corpus"
+    },
+    {
+        "name": "CC-100 Portuguese",
+        "dataset_id": "cc100",
+        "config": "pt",
+        "split": "train",
+        "text_field": "text",
+        "priority": 4,
+        "description": "CC-100 - CommonCrawl based corpus"
+    },
+    {
+        "name": "MC4 Portuguese",
+        "dataset_id": "mc4",
+        "config": "pt",
+        "split": "train",
+        "text_field": "text",
+        "priority": 5,
+        "description": "mC4 - Multilingual C4 Portuguese subset"
+    },
+    {
+        "name": "BrWac Sample",
+        "dataset_id": "eduagarcia/brwac",
+        "config": None,
+        "split": "train",
+        "text_field": "text",
+        "priority": 6,
+        "description": "Brazilian Web as Corpus - Brazilian Portuguese web content"
+    },
+    {
+        "name": "Portuguese News",
+        "dataset_id": "recogna-nlp/publico-news",
+        "config": None,
+        "split": "train",
+        "text_field": "content",
+        "priority": 7,
+        "description": "Portuguese news articles"
+    },
+    {
+        "name": "Carolina Corpus",
+        "dataset_id": "carolina-c4ai/corpus-carolina",
+        "config": None,
+        "split": "train",
+        "text_field": "text",
+        "priority": 8,
+        "description": "Carolina Corpus - Brazilian Portuguese reference corpus"
+    },
+]
+
+
+def load_portuguese_dataset(max_samples: Optional[int] = None) -> Tuple[Optional[Iterator], Optional[str], Optional[str]]:
+    """
+    Load Portuguese dataset from multiple high-quality sources.
+
+    Tries multiple sources in order of priority until one works.
+
+    Returns:
+        Tuple of (dataset_iterator, text_field, source_name) or (None, None, None) if all fail
+    """
+    from datasets import load_dataset
+
+    logger.info("=" * 60)
+    logger.info("Loading Portuguese/Brazilian Portuguese Datasets")
+    logger.info("=" * 60)
+
+    # Try each source in priority order
+    for source in sorted(PORTUGUESE_SOURCES, key=lambda x: x["priority"]):
+        try:
+            logger.info(f"\nTrying: {source['name']}")
+            logger.info(f"  Dataset: {source['dataset_id']}")
+            logger.info(f"  Description: {source['description']}")
+
+            # Build load_dataset arguments
+            load_args = {
+                "path": source["dataset_id"],
+                "split": source["split"],
+                "streaming": True,
+                "trust_remote_code": True,
+            }
+
+            if source["config"]:
+                load_args["name"] = source["config"]
+
+            dataset = load_dataset(**load_args)
+
+            # Test that we can iterate and get text
+            test_iter = iter(dataset)
+            test_sample = next(test_iter)
+
+            # Find the text field
+            text_field = source["text_field"]
+            if text_field not in test_sample:
+                # Try to find an alternative text field
+                for alt_field in ['text', 'content', 'sentence', 'document', 'article', 'body']:
+                    if alt_field in test_sample:
+                        text_field = alt_field
+                        break
+                else:
+                    logger.warning(f"  Could not find text field. Available: {list(test_sample.keys())}")
+                    continue
+
+            test_text = test_sample.get(text_field, "")
+            if not test_text or len(str(test_text).strip()) < 10:
+                logger.warning(f"  Text field '{text_field}' is empty or too short")
+                continue
+
+            logger.info(f"  ✓ Successfully loaded!")
+            logger.info(f"  Text field: {text_field}")
+            logger.info(f"  Sample preview: {str(test_text)[:100]}...")
+
+            # Return a fresh iterator (the test consumed one sample)
+            dataset = load_dataset(**load_args)
+            return iter(dataset), text_field, source['name']
+
+        except Exception as e:
+            logger.warning(f"  ✗ Failed: {str(e)[:100]}")
+            continue
+
+    # If all primary sources fail, try a simple Wikipedia fallback
+    logger.warning("\nAll primary sources failed. Trying simple Wikipedia fallback...")
+
     try:
-        from datasets import load_dataset
-
-        logger.info("Loading Portuguese dataset: eduagarcia/portuguese_benchmark")
-
         dataset = load_dataset(
-            "eduagarcia/portuguese_benchmark",
-            "assin2-rte",
+            "wikipedia",
+            "20220301.pt",
             split="train",
-            streaming=True
+            streaming=True,
+            trust_remote_code=True,
         )
 
-        logger.info("Successfully loaded Portuguese dataset (streaming mode)")
-        # This dataset has 'premise' and 'hypothesis' fields
-        return dataset, "premise"
+        test_iter = iter(dataset)
+        test_sample = next(test_iter)
+
+        text_field = "text"
+        if text_field in test_sample and len(test_sample[text_field]) > 10:
+            logger.info("✓ Wikipedia 20220301.pt fallback successful!")
+            dataset = load_dataset(
+                "wikipedia",
+                "20220301.pt",
+                split="train",
+                streaming=True,
+                trust_remote_code=True,
+            )
+            return iter(dataset), text_field, "Wikipedia PT (fallback)"
 
     except Exception as e:
-        logger.warning(f"Could not load Portuguese dataset: {e}")
-        logger.info("Trying mc4 Portuguese subset")
+        logger.warning(f"Wikipedia fallback also failed: {e}")
+
+    logger.error("=" * 60)
+    logger.error("FAILED: Could not load any Portuguese dataset!")
+    logger.error("Please check your internet connection and HuggingFace access.")
+    logger.error("=" * 60)
+
+    return None, None, None
+
+
+def create_combined_portuguese_iterator(
+    max_samples: Optional[int] = None,
+    sources_to_use: int = 3
+) -> Tuple[Optional[Iterator], str]:
+    """
+    Create a combined iterator from multiple Portuguese sources.
+
+    This interleaves samples from multiple sources for better diversity.
+
+    Args:
+        max_samples: Maximum samples to process
+        sources_to_use: Number of sources to combine
+
+    Returns:
+        Combined iterator and a description string
+    """
+    from datasets import load_dataset
+
+    loaded_sources = []
+
+    for source in sorted(PORTUGUESE_SOURCES, key=lambda x: x["priority"]):
+        if len(loaded_sources) >= sources_to_use:
+            break
 
         try:
-            from datasets import load_dataset
+            load_args = {
+                "path": source["dataset_id"],
+                "split": source["split"],
+                "streaming": True,
+                "trust_remote_code": True,
+            }
 
-            dataset = load_dataset(
-                "mc4",
-                "pt",
-                split="train",
-                streaming=True
-            )
-            return dataset, "text"
-        except Exception as e2:
-            logger.warning(f"Could not load mc4 Portuguese: {e2}")
-            return None, None
+            if source["config"]:
+                load_args["name"] = source["config"]
+
+            dataset = load_dataset(**load_args)
+            test_iter = iter(dataset)
+            test_sample = next(test_iter)
+
+            text_field = source["text_field"]
+            if text_field not in test_sample:
+                for alt_field in ['text', 'content', 'body']:
+                    if alt_field in test_sample:
+                        text_field = alt_field
+                        break
+                else:
+                    continue
+
+            if test_sample.get(text_field) and len(str(test_sample[text_field])) > 10:
+                # Reload fresh iterator
+                dataset = load_dataset(**load_args)
+                loaded_sources.append({
+                    "name": source["name"],
+                    "iterator": iter(dataset),
+                    "text_field": text_field,
+                    "exhausted": False,
+                })
+                logger.info(f"✓ Added source: {source['name']}")
+
+        except Exception as e:
+            logger.debug(f"Could not load {source['name']}: {e}")
+            continue
+
+    if not loaded_sources:
+        return None, ""
+
+    source_names = ", ".join(s["name"] for s in loaded_sources)
+    logger.info(f"\nCombined {len(loaded_sources)} Portuguese sources: {source_names}")
+
+    def combined_generator():
+        """Generate samples from multiple sources in round-robin fashion"""
+        sample_count = 0
+        active_sources = loaded_sources.copy()
+
+        while active_sources:
+            for source in active_sources[:]:  # Copy to allow modification
+                if max_samples and sample_count >= max_samples:
+                    return
+
+                try:
+                    sample = next(source["iterator"])
+                    text = sample.get(source["text_field"], "")
+
+                    if text and len(str(text).strip()) > 10:
+                        yield {"text": str(text), "_source": source["name"]}
+                        sample_count += 1
+
+                except StopIteration:
+                    source["exhausted"] = True
+                    active_sources.remove(source)
+                    logger.info(f"Source exhausted: {source['name']}")
+
+                except Exception as e:
+                    logger.debug(f"Error from {source['name']}: {e}")
+                    continue
+
+    return combined_generator(), source_names
 
 
 def extract_text(sample: Dict[str, Any], text_field: str) -> str:
     """Extract text from a dataset sample"""
     if text_field in sample:
-        return sample[text_field]
+        text = sample[text_field]
+        if text:
+            return str(text)
 
     # Try common text field names
-    for key in ['text', 'content', 'sentence', 'document', 'article', 'premise']:
-        if key in sample:
-            return sample[key]
+    for key in ['text', 'content', 'sentence', 'document', 'article', 'premise', 'body']:
+        if key in sample and sample[key]:
+            return str(sample[key])
 
     return ""
 
@@ -471,6 +771,7 @@ def tokenize_and_save_dataset(
     total_samples = 0
     total_tokens = 0
     chunk_idx = 0
+    empty_samples = 0
 
     # Process in batches
     batch_texts = []
@@ -486,6 +787,9 @@ def tokenize_and_save_dataset(
                 text = extract_text(sample, text_field)
 
                 if not text or len(text.strip()) < 10:
+                    empty_samples += 1
+                    if empty_samples <= 10:
+                        logger.debug(f"Skipping empty/short sample. Keys: {list(sample.keys()) if isinstance(sample, dict) else 'N/A'}")
                     continue
 
                 batch_texts.append(text)
@@ -511,7 +815,8 @@ def tokenize_and_save_dataset(
                     pbar.update(len(batch_texts))
                     pbar.set_postfix({
                         'tokens': f'{total_tokens:,}',
-                        'chunks': chunk_idx
+                        'chunks': chunk_idx,
+                        'skipped': empty_samples
                     })
 
                     batch_texts = []
@@ -566,6 +871,10 @@ def tokenize_and_save_dataset(
 
         total_samples += len(batch_texts)
 
+    # Log statistics
+    if empty_samples > 0:
+        logger.info(f"Skipped {empty_samples:,} empty/short samples")
+
     # Save final tokens
     if all_tokens:
         if chunk_idx > 0:
@@ -599,6 +908,7 @@ def tokenize_and_save_dataset(
         "max_seq_len": config.max_seq_len,
         "tokenizer": "gpt2",
         "dtype": "uint16",
+        "empty_samples_skipped": empty_samples,
     }
 
     with open(metadata_file, 'w') as f:
@@ -614,6 +924,10 @@ def tokenize_and_save_dataset(
 
 def save_tokens_memmap(tokens: List[int], output_path: Path):
     """Save tokens as memory-mapped numpy array"""
+    if not tokens:
+        logger.warning(f"No tokens to save to {output_path}")
+        return
+
     # Use uint16 for vocab sizes up to 65535, otherwise uint32
     dtype = np.uint16 if max(tokens) < 65535 else np.uint32
 
@@ -648,8 +962,9 @@ def verify_preprocessed_data(output_dir: Path, tokenizer):
             metadata = json.load(f)
 
         logger.info(f"\nVerifying {lang} dataset:")
+        logger.info(f"  Dataset: {metadata.get('dataset_name', 'Unknown')}")
         logger.info(f"  Total tokens: {metadata['total_tokens']:,}")
-        logger.info(f"  Total samples: {metadata.get('total_samples', 'N/A'):,}")
+        logger.info(f"  Total samples: {metadata.get('total_samples', 'N/A')}")
 
         # Load and decode sample
         tokens = np.memmap(tokens_file, dtype=np.uint16, mode='r')
@@ -667,32 +982,45 @@ def verify_preprocessed_data(output_dir: Path, tokenizer):
 def list_chunks(output_dir: Path):
     """List all chunks in the output directory"""
     logger.info("=" * 60)
-    logger.info("Chunk Status")
+    logger.info("Dataset Status")
     logger.info("=" * 60)
 
     for lang in ['en', 'pt']:
         lang_dir = output_dir / lang
         if not lang_dir.exists():
+            logger.info(f"\n{lang.upper()} dataset: Not found")
             continue
 
         chunks = find_existing_chunks(lang_dir)
         tokens_file = lang_dir / "tokens.bin"
+        metadata_file = lang_dir / "metadata.json"
 
         logger.info(f"\n{lang.upper()} dataset ({lang_dir}):")
 
         if tokens_file.exists():
             size_gb = tokens_file.stat().st_size / (1024**3)
-            logger.info(f"  tokens.bin: {size_gb:.2f} GB (COMPLETE)")
+
+            # Load metadata for more info
+            if metadata_file.exists():
+                with open(metadata_file, 'r') as f:
+                    metadata = json.load(f)
+                token_count = metadata.get('total_tokens', 0)
+                dataset_name = metadata.get('dataset_name', 'Unknown')
+                logger.info(f"  ✓ COMPLETE: {token_count:,} tokens ({size_gb:.2f} GB)")
+                logger.info(f"    Source: {dataset_name}")
+            else:
+                logger.info(f"  ✓ tokens.bin: {size_gb:.2f} GB")
+
         elif chunks:
             total_size = sum(c.stat().st_size for c in chunks)
             size_gb = total_size / (1024**3)
-            logger.info(f"  {len(chunks)} chunks found ({size_gb:.2f} GB total)")
-            logger.info("  Status: INCOMPLETE - run with --merge_chunks to complete")
+            logger.info(f"  ⚠ INCOMPLETE: {len(chunks)} chunks ({size_gb:.2f} GB total)")
+            logger.info("    Run with --merge_chunks to complete")
             for chunk in chunks:
                 size_mb = chunk.stat().st_size / (1024**1024)
-                logger.info(f"    - {chunk.name}: {size_mb:.1f} MB")
+                logger.info(f"      - {chunk.name}: {size_mb:.1f} MB")
         else:
-            logger.info("  No data found")
+            logger.info("  ✗ No data found")
 
 
 def main():
@@ -756,6 +1084,11 @@ def main():
         action="store_true",
         help="Verify preprocessed data after completion"
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Force reprocessing even if tokens.bin already exists"
+    )
 
     # Chunk management options
     parser.add_argument(
@@ -779,6 +1112,14 @@ def main():
         "--list_chunks",
         action="store_true",
         help="List existing chunks and their status"
+    )
+
+    # Portuguese source options
+    parser.add_argument(
+        "--pt_combined_sources",
+        type=int,
+        default=1,
+        help="Number of Portuguese sources to combine (1=single best, 2+=combined)"
     )
 
     args = parser.parse_args()
@@ -817,7 +1158,7 @@ def main():
                 tokens = merge_chunks_from_directory(
                     pt_dir,
                     delete_chunks=not args.keep_chunks,
-                    dataset_name="Portuguese (portuguese_benchmark)"
+                    dataset_name="Portuguese"
                 )
                 total_merged += tokens
 
@@ -847,6 +1188,7 @@ def main():
     logger.info(f"Max sequence length: {config.max_seq_len}")
     logger.info(f"Tokenizer batch size: {config.tokenizer_batch_size}")
     logger.info(f"Tokens per chunk: {config.tokens_per_chunk:,}")
+    logger.info(f"Force reprocess: {args.force}")
     logger.info("")
     logger.info("Press Ctrl+C to interrupt (progress will be saved)")
     logger.info("=" * 60)
@@ -859,35 +1201,66 @@ def main():
 
     # Process English dataset
     if not args.skip_english and not _shutdown_requested:
-        en_dataset, en_text_field = load_english_dataset(config.en_max_samples)
-        if en_dataset:
-            total_en_tokens = tokenize_and_save_dataset(
-                en_dataset,
-                en_text_field,
-                output_dir / "en",
-                tokenizer,
-                config,
-                "English (fineweb-edu)",
-                config.en_max_samples
-            )
+        en_output = output_dir / "en"
+        is_processed, token_count = check_dataset_already_processed(en_output)
+
+        if is_processed and not args.force:
+            logger.info(f"\n✓ English dataset already processed: {token_count:,} tokens")
+            logger.info(f"  Use --force to reprocess")
+            total_en_tokens = token_count
+        else:
+            if is_processed:
+                logger.info(f"\nForce reprocessing English dataset...")
+            en_dataset, en_text_field = load_english_dataset(config.en_max_samples)
+            if en_dataset:
+                total_en_tokens = tokenize_and_save_dataset(
+                    en_dataset,
+                    en_text_field,
+                    en_output,
+                    tokenizer,
+                    config,
+                    "English (fineweb-edu)",
+                    config.en_max_samples
+                )
     else:
         logger.info("Skipping English dataset")
 
     # Process Portuguese dataset
     if not args.skip_portuguese and not _shutdown_requested:
-        pt_dataset, pt_text_field = load_portuguese_dataset(config.pt_max_samples)
-        if pt_dataset:
-            total_pt_tokens = tokenize_and_save_dataset(
-                pt_dataset,
-                pt_text_field,
-                output_dir / "pt",
-                tokenizer,
-                config,
-                "Portuguese (portuguese_benchmark)",
-                config.pt_max_samples
-            )
+        pt_output = output_dir / "pt"
+        is_processed, token_count = check_dataset_already_processed(pt_output)
+
+        if is_processed and not args.force:
+            logger.info(f"\n✓ Portuguese dataset already processed: {token_count:,} tokens")
+            logger.info(f"  Use --force to reprocess")
+            total_pt_tokens = token_count
         else:
-            logger.warning("Portuguese dataset not available")
+            if is_processed:
+                logger.info(f"\nForce reprocessing Portuguese dataset...")
+
+            # Load Portuguese dataset(s)
+            if args.pt_combined_sources > 1:
+                pt_dataset, source_name = create_combined_portuguese_iterator(
+                    config.pt_max_samples,
+                    sources_to_use=args.pt_combined_sources
+                )
+                text_field = "text"
+            else:
+                pt_dataset, text_field, source_name = load_portuguese_dataset(config.pt_max_samples)
+
+            if pt_dataset:
+                total_pt_tokens = tokenize_and_save_dataset(
+                    pt_dataset,
+                    text_field,
+                    pt_output,
+                    tokenizer,
+                    config,
+                    f"Portuguese ({source_name})",
+                    config.pt_max_samples
+                )
+            else:
+                logger.error("Could not load any Portuguese dataset!")
+                logger.error("Please check your internet connection.")
     else:
         logger.info("Skipping Portuguese dataset")
 
