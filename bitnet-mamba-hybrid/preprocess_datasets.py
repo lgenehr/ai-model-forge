@@ -9,15 +9,28 @@ Datasets:
 - English: HuggingFaceFW/fineweb-edu (sample-10BT split)
 - Portuguese: eduagarcia/portuguese_benchmark (train split)
 
+Features:
+- Saves progress in chunks (resilient to interruptions)
+- Can merge chunks from interrupted downloads with --merge_chunks
+- Graceful shutdown on Ctrl+C (saves current progress)
+
 Usage:
+    # Normal preprocessing
     python preprocess_datasets.py --output_dir ./data/tokenized
-    python preprocess_datasets.py --output_dir ./data/tokenized --max_samples 1000000
+
+    # Merge chunks from interrupted download
+    python preprocess_datasets.py --output_dir ./data/tokenized --merge_chunks
+
+    # Merge only English chunks
+    python preprocess_datasets.py --output_dir ./data/tokenized --merge_chunks --merge_lang en
 """
 
 import os
 import sys
+import signal
 import argparse
 import logging
+import json
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from dataclasses import dataclass
@@ -33,6 +46,80 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger(__name__)
+
+# Global flag for graceful shutdown
+_shutdown_requested = False
+_current_tokens = []
+_current_output_path = None
+_current_chunk_idx = 0
+
+
+def signal_handler(signum, frame):
+    """Handle interrupt signals gracefully"""
+    global _shutdown_requested
+    if _shutdown_requested:
+        logger.warning("\nForced shutdown requested. Exiting immediately...")
+        sys.exit(1)
+
+    _shutdown_requested = True
+    logger.warning("\n" + "=" * 60)
+    logger.warning("Interrupt received! Saving current progress...")
+    logger.warning("Press Ctrl+C again to force quit (may lose unsaved data)")
+    logger.warning("=" * 60)
+
+    # Save current tokens if any
+    if _current_tokens and _current_output_path:
+        save_emergency_chunk()
+
+
+def save_emergency_chunk():
+    """Save current tokens as an emergency chunk"""
+    global _current_tokens, _current_output_path, _current_chunk_idx
+
+    if not _current_tokens or not _current_output_path:
+        return
+
+    chunk_file = _current_output_path / f"tokens_chunk_{_current_chunk_idx:04d}.bin"
+    logger.info(f"Saving emergency chunk: {chunk_file}")
+
+    try:
+        dtype = np.uint16 if max(_current_tokens) < 65535 else np.uint32
+        tokens_array = np.array(_current_tokens, dtype=dtype)
+
+        memmap = np.memmap(
+            chunk_file,
+            dtype=dtype,
+            mode='w+',
+            shape=tokens_array.shape
+        )
+        memmap[:] = tokens_array
+        memmap.flush()
+        del memmap
+
+        logger.info(f"Saved {len(_current_tokens):,} tokens to emergency chunk")
+
+        # Save chunk progress metadata
+        save_chunk_progress(_current_output_path, _current_chunk_idx + 1)
+
+    except Exception as e:
+        logger.error(f"Failed to save emergency chunk: {e}")
+
+
+def save_chunk_progress(output_path: Path, num_chunks: int):
+    """Save progress metadata for resuming later"""
+    progress_file = output_path / "chunk_progress.json"
+    progress = {
+        "num_chunks": num_chunks,
+        "status": "interrupted",
+        "message": "Use --merge_chunks to complete processing"
+    }
+
+    try:
+        with open(progress_file, 'w') as f:
+            json.dump(progress, f, indent=2)
+        logger.info(f"Progress saved to {progress_file}")
+    except Exception as e:
+        logger.error(f"Failed to save progress: {e}")
 
 
 @dataclass
@@ -163,6 +250,171 @@ def extract_text(sample: Dict[str, Any], text_field: str) -> str:
     return ""
 
 
+def find_existing_chunks(output_path: Path) -> List[Path]:
+    """Find all existing chunk files in the output directory"""
+    chunk_files = sorted(output_path.glob("tokens_chunk_*.bin"))
+    return chunk_files
+
+
+def detect_chunk_dtype(chunk_file: Path) -> np.dtype:
+    """Detect the dtype of a chunk file by checking file size"""
+    file_size = chunk_file.stat().st_size
+
+    # Try uint16 first (most common)
+    try:
+        test_mmap = np.memmap(chunk_file, dtype=np.uint16, mode='r')
+        expected_size = len(test_mmap) * 2  # uint16 = 2 bytes
+        del test_mmap
+
+        if expected_size == file_size:
+            return np.uint16
+    except Exception:
+        pass
+
+    # Try uint32
+    try:
+        test_mmap = np.memmap(chunk_file, dtype=np.uint32, mode='r')
+        expected_size = len(test_mmap) * 4  # uint32 = 4 bytes
+        del test_mmap
+
+        if expected_size == file_size:
+            return np.uint32
+    except Exception:
+        pass
+
+    # Default to uint16
+    return np.uint16
+
+
+def merge_chunks_from_directory(
+    output_path: Path,
+    delete_chunks: bool = True,
+    dataset_name: str = "Unknown"
+) -> int:
+    """
+    Merge all chunk files in a directory into a single tokens.bin file.
+
+    Args:
+        output_path: Directory containing chunk files
+        delete_chunks: Whether to delete chunk files after merging
+        dataset_name: Name of the dataset for metadata
+
+    Returns:
+        Total number of tokens merged
+    """
+    chunk_files = find_existing_chunks(output_path)
+
+    if not chunk_files:
+        logger.warning(f"No chunk files found in {output_path}")
+        return 0
+
+    logger.info(f"Found {len(chunk_files)} chunk files in {output_path}")
+    for chunk_file in chunk_files:
+        size_mb = chunk_file.stat().st_size / (1024 * 1024)
+        logger.info(f"  - {chunk_file.name}: {size_mb:.1f} MB")
+
+    tokens_file = output_path / "tokens.bin"
+    metadata_file = output_path / "metadata.json"
+
+    # Check if tokens.bin already exists
+    if tokens_file.exists():
+        logger.warning(f"tokens.bin already exists at {tokens_file}")
+        response = input("Overwrite? [y/N]: ").strip().lower()
+        if response != 'y':
+            logger.info("Merge cancelled")
+            return 0
+        tokens_file.unlink()
+
+    # Detect dtype from first chunk
+    dtype = detect_chunk_dtype(chunk_files[0])
+    logger.info(f"Detected dtype: {dtype}")
+
+    # First pass: count total tokens
+    total_tokens = 0
+    chunk_sizes = []
+
+    logger.info("Counting tokens in chunks...")
+    for chunk_file in tqdm(chunk_files, desc="Scanning chunks"):
+        try:
+            chunk_data = np.memmap(chunk_file, dtype=dtype, mode='r')
+            chunk_size = len(chunk_data)
+            chunk_sizes.append(chunk_size)
+            total_tokens += chunk_size
+            del chunk_data
+        except Exception as e:
+            logger.error(f"Error reading {chunk_file}: {e}")
+            return 0
+
+    logger.info(f"Total tokens to merge: {total_tokens:,}")
+    total_size_gb = (total_tokens * np.dtype(dtype).itemsize) / (1024**3)
+    logger.info(f"Output file size: {total_size_gb:.2f} GB")
+
+    # Create output memmap
+    logger.info(f"Creating output file: {tokens_file}")
+    output_memmap = np.memmap(
+        tokens_file,
+        dtype=dtype,
+        mode='w+',
+        shape=(total_tokens,)
+    )
+
+    # Second pass: copy data
+    offset = 0
+    for i, chunk_file in enumerate(tqdm(chunk_files, desc="Merging chunks")):
+        chunk_data = np.memmap(chunk_file, dtype=dtype, mode='r')
+        chunk_size = chunk_sizes[i]
+
+        output_memmap[offset:offset + chunk_size] = chunk_data[:]
+        offset += chunk_size
+
+        del chunk_data
+
+        # Flush periodically to avoid memory issues
+        if (i + 1) % 10 == 0:
+            output_memmap.flush()
+
+    output_memmap.flush()
+    del output_memmap
+
+    logger.info(f"Successfully merged {len(chunk_files)} chunks into {tokens_file}")
+
+    # Save metadata
+    metadata = {
+        "dataset_name": dataset_name,
+        "total_samples": 0,  # Unknown when merging from chunks
+        "total_tokens": total_tokens,
+        "vocab_size": 50304,
+        "max_seq_len": 2048,
+        "tokenizer": "gpt2",
+        "dtype": "uint16" if dtype == np.uint16 else "uint32",
+        "merged_from_chunks": len(chunk_files),
+    }
+
+    with open(metadata_file, 'w') as f:
+        json.dump(metadata, f, indent=2)
+
+    logger.info(f"Saved metadata to {metadata_file}")
+
+    # Delete chunk files if requested
+    if delete_chunks:
+        logger.info("Deleting chunk files...")
+        for chunk_file in chunk_files:
+            try:
+                chunk_file.unlink()
+                logger.debug(f"Deleted {chunk_file}")
+            except Exception as e:
+                logger.warning(f"Failed to delete {chunk_file}: {e}")
+
+        # Also delete progress file if exists
+        progress_file = output_path / "chunk_progress.json"
+        if progress_file.exists():
+            progress_file.unlink()
+
+        logger.info(f"Deleted {len(chunk_files)} chunk files")
+
+    return total_tokens
+
+
 def tokenize_and_save_dataset(
     dataset,
     text_field: str,
@@ -178,16 +430,42 @@ def tokenize_and_save_dataset(
     Creates:
     - {output_path}/tokens.bin - memory-mapped token array
     - {output_path}/metadata.json - dataset metadata
+
+    Saves progress in chunks for resilience to interruptions.
     """
-    import json
+    global _shutdown_requested, _current_tokens, _current_output_path, _current_chunk_idx
 
     output_path.mkdir(parents=True, exist_ok=True)
 
     tokens_file = output_path / "tokens.bin"
     metadata_file = output_path / "metadata.json"
 
+    # Check for existing chunks (interrupted download)
+    existing_chunks = find_existing_chunks(output_path)
+    if existing_chunks:
+        logger.warning(f"Found {len(existing_chunks)} existing chunks in {output_path}")
+        logger.warning("This may be from an interrupted download.")
+        logger.warning("Options:")
+        logger.warning("  1. Run with --merge_chunks to merge existing chunks")
+        logger.warning("  2. Delete the chunks manually to start fresh")
+
+        response = input("Continue anyway (will overwrite)? [y/N]: ").strip().lower()
+        if response != 'y':
+            logger.info("Preprocessing cancelled")
+            return 0
+
+        # Delete existing chunks
+        for chunk_file in existing_chunks:
+            chunk_file.unlink()
+        logger.info("Deleted existing chunks")
+
     logger.info(f"Processing {dataset_name} dataset...")
     logger.info(f"Output: {output_path}")
+
+    # Setup for interrupt handling
+    _current_output_path = output_path
+    _current_chunk_idx = 0
+    _current_tokens = []
 
     all_tokens = []
     total_samples = 0
@@ -197,53 +475,79 @@ def tokenize_and_save_dataset(
     # Process in batches
     batch_texts = []
 
-    with tqdm(desc=f"Tokenizing {dataset_name}", unit=" samples") as pbar:
-        for sample in dataset:
-            text = extract_text(sample, text_field)
+    try:
+        with tqdm(desc=f"Tokenizing {dataset_name}", unit=" samples") as pbar:
+            for sample in dataset:
+                # Check for shutdown request
+                if _shutdown_requested:
+                    logger.info("Shutdown requested, stopping tokenization...")
+                    break
 
-            if not text or len(text.strip()) < 10:
-                continue
+                text = extract_text(sample, text_field)
 
-            batch_texts.append(text)
+                if not text or len(text.strip()) < 10:
+                    continue
 
-            # Process batch
-            if len(batch_texts) >= config.tokenizer_batch_size:
-                # Tokenize batch
-                encoded = tokenizer(
-                    batch_texts,
-                    add_special_tokens=True,
-                    truncation=False,
-                    return_attention_mask=False,
-                    return_token_type_ids=False,
-                )
+                batch_texts.append(text)
 
-                for token_ids in encoded['input_ids']:
-                    # Add EOS token at the end of each document
-                    token_ids = token_ids + [tokenizer.eos_token_id]
-                    all_tokens.extend(token_ids)
-                    total_tokens += len(token_ids)
+                # Process batch
+                if len(batch_texts) >= config.tokenizer_batch_size:
+                    # Tokenize batch
+                    encoded = tokenizer(
+                        batch_texts,
+                        add_special_tokens=True,
+                        truncation=False,
+                        return_attention_mask=False,
+                        return_token_type_ids=False,
+                    )
 
-                total_samples += len(batch_texts)
-                pbar.update(len(batch_texts))
-                pbar.set_postfix({
-                    'tokens': f'{total_tokens:,}',
-                    'samples': f'{total_samples:,}'
-                })
+                    for token_ids in encoded['input_ids']:
+                        # Add EOS token at the end of each document
+                        token_ids = token_ids + [tokenizer.eos_token_id]
+                        all_tokens.extend(token_ids)
+                        total_tokens += len(token_ids)
 
-                batch_texts = []
+                    total_samples += len(batch_texts)
+                    pbar.update(len(batch_texts))
+                    pbar.set_postfix({
+                        'tokens': f'{total_tokens:,}',
+                        'chunks': chunk_idx
+                    })
 
-            # Check sample limit
-            if max_samples and total_samples >= max_samples:
-                logger.info(f"Reached max samples limit: {max_samples}")
-                break
+                    batch_texts = []
 
-            # Save chunk if accumulated enough tokens
-            if len(all_tokens) >= config.tokens_per_chunk:
-                chunk_file = output_path / f"tokens_chunk_{chunk_idx:04d}.bin"
-                save_tokens_memmap(all_tokens, chunk_file)
-                logger.info(f"Saved chunk {chunk_idx}: {len(all_tokens):,} tokens")
-                chunk_idx += 1
-                all_tokens = []
+                    # Update global state for interrupt handling
+                    _current_tokens = all_tokens.copy()
+                    _current_chunk_idx = chunk_idx
+
+                # Check sample limit
+                if max_samples and total_samples >= max_samples:
+                    logger.info(f"Reached max samples limit: {max_samples}")
+                    break
+
+                # Save chunk if accumulated enough tokens
+                if len(all_tokens) >= config.tokens_per_chunk:
+                    chunk_file = output_path / f"tokens_chunk_{chunk_idx:04d}.bin"
+                    save_tokens_memmap(all_tokens, chunk_file)
+                    logger.info(f"Saved chunk {chunk_idx}: {len(all_tokens):,} tokens")
+                    chunk_idx += 1
+                    all_tokens = []
+                    _current_tokens = []
+
+    except KeyboardInterrupt:
+        # This shouldn't happen if signal handler works, but just in case
+        logger.warning("KeyboardInterrupt caught, saving progress...")
+        if all_tokens:
+            chunk_file = output_path / f"tokens_chunk_{chunk_idx:04d}.bin"
+            save_tokens_memmap(all_tokens, chunk_file)
+            save_chunk_progress(output_path, chunk_idx + 1)
+        raise
+
+    # Check if we were interrupted
+    if _shutdown_requested:
+        # Progress already saved by signal handler
+        logger.info("Processing interrupted. Use --merge_chunks to complete.")
+        return 0
 
     # Process remaining batch
     if batch_texts:
@@ -269,15 +573,24 @@ def tokenize_and_save_dataset(
             chunk_file = output_path / f"tokens_chunk_{chunk_idx:04d}.bin"
             save_tokens_memmap(all_tokens, chunk_file)
             logger.info(f"Saved final chunk {chunk_idx}: {len(all_tokens):,} tokens")
+            chunk_idx += 1
         else:
-            # Single file
+            # Single file (small dataset)
             save_tokens_memmap(all_tokens, tokens_file)
+
+    # Clear global state
+    _current_tokens = []
+    _current_output_path = None
 
     # Merge chunks if multiple exist
     if chunk_idx > 0:
-        merge_chunks(output_path, tokens_file, chunk_idx + 1)
+        total_tokens = merge_chunks_from_directory(
+            output_path,
+            delete_chunks=True,
+            dataset_name=dataset_name
+        )
 
-    # Save metadata
+    # Save/update metadata
     metadata = {
         "dataset_name": dataset_name,
         "total_samples": total_samples,
@@ -285,7 +598,7 @@ def tokenize_and_save_dataset(
         "vocab_size": config.vocab_size,
         "max_seq_len": config.max_seq_len,
         "tokenizer": "gpt2",
-        "dtype": "uint16",  # Fits vocab_size up to 65535
+        "dtype": "uint16",
     }
 
     with open(metadata_file, 'w') as f:
@@ -320,54 +633,8 @@ def save_tokens_memmap(tokens: List[int], output_path: Path):
     logger.info(f"Saved {len(tokens):,} tokens to {output_path}")
 
 
-def merge_chunks(output_dir: Path, output_file: Path, num_chunks: int):
-    """Merge multiple token chunks into a single file"""
-    logger.info(f"Merging {num_chunks} chunks into {output_file}...")
-
-    # First pass: count total tokens
-    total_tokens = 0
-    chunk_files = []
-
-    for i in range(num_chunks):
-        chunk_file = output_dir / f"tokens_chunk_{i:04d}.bin"
-        if chunk_file.exists():
-            chunk_files.append(chunk_file)
-            chunk_data = np.memmap(chunk_file, dtype=np.uint16, mode='r')
-            total_tokens += len(chunk_data)
-            del chunk_data
-
-    logger.info(f"Total tokens to merge: {total_tokens:,}")
-
-    # Create output memmap
-    output_memmap = np.memmap(
-        output_file,
-        dtype=np.uint16,
-        mode='w+',
-        shape=(total_tokens,)
-    )
-
-    # Second pass: copy data
-    offset = 0
-    for chunk_file in tqdm(chunk_files, desc="Merging chunks"):
-        chunk_data = np.memmap(chunk_file, dtype=np.uint16, mode='r')
-        output_memmap[offset:offset + len(chunk_data)] = chunk_data
-        offset += len(chunk_data)
-        del chunk_data
-
-    output_memmap.flush()
-    del output_memmap
-
-    # Delete chunk files
-    for chunk_file in chunk_files:
-        chunk_file.unlink()
-
-    logger.info(f"Merged {num_chunks} chunks into {output_file}")
-
-
 def verify_preprocessed_data(output_dir: Path, tokenizer):
     """Verify preprocessed data by decoding a sample"""
-    import json
-
     for lang in ['en', 'pt']:
         lang_dir = output_dir / lang
         tokens_file = lang_dir / "tokens.bin"
@@ -382,7 +649,7 @@ def verify_preprocessed_data(output_dir: Path, tokenizer):
 
         logger.info(f"\nVerifying {lang} dataset:")
         logger.info(f"  Total tokens: {metadata['total_tokens']:,}")
-        logger.info(f"  Total samples: {metadata['total_samples']:,}")
+        logger.info(f"  Total samples: {metadata.get('total_samples', 'N/A'):,}")
 
         # Load and decode sample
         tokens = np.memmap(tokens_file, dtype=np.uint16, mode='r')
@@ -397,7 +664,42 @@ def verify_preprocessed_data(output_dir: Path, tokenizer):
         del tokens
 
 
+def list_chunks(output_dir: Path):
+    """List all chunks in the output directory"""
+    logger.info("=" * 60)
+    logger.info("Chunk Status")
+    logger.info("=" * 60)
+
+    for lang in ['en', 'pt']:
+        lang_dir = output_dir / lang
+        if not lang_dir.exists():
+            continue
+
+        chunks = find_existing_chunks(lang_dir)
+        tokens_file = lang_dir / "tokens.bin"
+
+        logger.info(f"\n{lang.upper()} dataset ({lang_dir}):")
+
+        if tokens_file.exists():
+            size_gb = tokens_file.stat().st_size / (1024**3)
+            logger.info(f"  tokens.bin: {size_gb:.2f} GB (COMPLETE)")
+        elif chunks:
+            total_size = sum(c.stat().st_size for c in chunks)
+            size_gb = total_size / (1024**3)
+            logger.info(f"  {len(chunks)} chunks found ({size_gb:.2f} GB total)")
+            logger.info("  Status: INCOMPLETE - run with --merge_chunks to complete")
+            for chunk in chunks:
+                size_mb = chunk.stat().st_size / (1024**1024)
+                logger.info(f"    - {chunk.name}: {size_mb:.1f} MB")
+        else:
+            logger.info("  No data found")
+
+
 def main():
+    # Setup signal handlers for graceful shutdown
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
     parser = argparse.ArgumentParser(
         description="Preprocess datasets for BitNet-Mamba training",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
@@ -434,6 +736,12 @@ def main():
         help="Batch size for tokenization"
     )
     parser.add_argument(
+        "--tokens_per_chunk",
+        type=int,
+        default=100_000_000,
+        help="Number of tokens per chunk (100M default)"
+    )
+    parser.add_argument(
         "--skip_english",
         action="store_true",
         help="Skip English dataset preprocessing"
@@ -449,18 +757,88 @@ def main():
         help="Verify preprocessed data after completion"
     )
 
+    # Chunk management options
+    parser.add_argument(
+        "--merge_chunks",
+        action="store_true",
+        help="Merge existing chunks from interrupted downloads into final tokens.bin files"
+    )
+    parser.add_argument(
+        "--merge_lang",
+        type=str,
+        choices=['en', 'pt', 'all'],
+        default='all',
+        help="Which language chunks to merge (default: all)"
+    )
+    parser.add_argument(
+        "--keep_chunks",
+        action="store_true",
+        help="Keep chunk files after merging (don't delete)"
+    )
+    parser.add_argument(
+        "--list_chunks",
+        action="store_true",
+        help="List existing chunks and their status"
+    )
+
     args = parser.parse_args()
 
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # List chunks mode
+    if args.list_chunks:
+        list_chunks(output_dir)
+        return
+
+    # Merge chunks mode
+    if args.merge_chunks:
+        logger.info("=" * 60)
+        logger.info("Merging Chunks from Interrupted Downloads")
+        logger.info("=" * 60)
+
+        total_merged = 0
+
+        if args.merge_lang in ['en', 'all']:
+            en_dir = output_dir / "en"
+            if en_dir.exists() and find_existing_chunks(en_dir):
+                logger.info("\nMerging English chunks...")
+                tokens = merge_chunks_from_directory(
+                    en_dir,
+                    delete_chunks=not args.keep_chunks,
+                    dataset_name="English (fineweb-edu)"
+                )
+                total_merged += tokens
+
+        if args.merge_lang in ['pt', 'all']:
+            pt_dir = output_dir / "pt"
+            if pt_dir.exists() and find_existing_chunks(pt_dir):
+                logger.info("\nMerging Portuguese chunks...")
+                tokens = merge_chunks_from_directory(
+                    pt_dir,
+                    delete_chunks=not args.keep_chunks,
+                    dataset_name="Portuguese (portuguese_benchmark)"
+                )
+                total_merged += tokens
+
+        if total_merged > 0:
+            logger.info("=" * 60)
+            logger.info(f"Merge Complete! Total tokens: {total_merged:,}")
+            logger.info("=" * 60)
+        else:
+            logger.warning("No chunks found to merge")
+
+        return
+
+    # Normal preprocessing mode
     config = PreprocessConfig(
         output_dir=args.output_dir,
         max_seq_len=args.max_seq_len,
         en_max_samples=args.en_max_samples,
         pt_max_samples=args.pt_max_samples,
         tokenizer_batch_size=args.tokenizer_batch_size,
+        tokens_per_chunk=args.tokens_per_chunk,
     )
-
-    output_dir = Path(config.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info("=" * 60)
     logger.info("BitNet-Mamba Dataset Preprocessing")
@@ -468,6 +846,10 @@ def main():
     logger.info(f"Output directory: {output_dir}")
     logger.info(f"Max sequence length: {config.max_seq_len}")
     logger.info(f"Tokenizer batch size: {config.tokenizer_batch_size}")
+    logger.info(f"Tokens per chunk: {config.tokens_per_chunk:,}")
+    logger.info("")
+    logger.info("Press Ctrl+C to interrupt (progress will be saved)")
+    logger.info("=" * 60)
 
     # Initialize tokenizer
     tokenizer = get_tokenizer()
@@ -476,7 +858,7 @@ def main():
     total_pt_tokens = 0
 
     # Process English dataset
-    if not args.skip_english:
+    if not args.skip_english and not _shutdown_requested:
         en_dataset, en_text_field = load_english_dataset(config.en_max_samples)
         if en_dataset:
             total_en_tokens = tokenize_and_save_dataset(
@@ -492,7 +874,7 @@ def main():
         logger.info("Skipping English dataset")
 
     # Process Portuguese dataset
-    if not args.skip_portuguese:
+    if not args.skip_portuguese and not _shutdown_requested:
         pt_dataset, pt_text_field = load_portuguese_dataset(config.pt_max_samples)
         if pt_dataset:
             total_pt_tokens = tokenize_and_save_dataset(
@@ -508,6 +890,16 @@ def main():
             logger.warning("Portuguese dataset not available")
     else:
         logger.info("Skipping Portuguese dataset")
+
+    # Check if we were interrupted
+    if _shutdown_requested:
+        logger.info("=" * 60)
+        logger.info("Preprocessing Interrupted")
+        logger.info("=" * 60)
+        logger.info("Progress has been saved as chunks.")
+        logger.info("To complete preprocessing, run:")
+        logger.info(f"  python preprocess_datasets.py --output_dir {output_dir} --merge_chunks")
+        return
 
     # Summary
     logger.info("=" * 60)
