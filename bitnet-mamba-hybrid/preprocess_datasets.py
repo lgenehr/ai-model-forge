@@ -7,13 +7,22 @@ Eliminates HTTP requests during training by pre-processing all data.
 
 Datasets:
 - English: HuggingFaceFW/fineweb-edu (sample-10BT split)
-- Portuguese: Multiple high-quality sources (Wikipedia, CulturaX, OSCAR, etc.)
+- Portuguese: Multiple high-quality Brazilian Portuguese sources with automatic fallback:
+  1. FineWeb2 Portuguese - Multilingual fineweb (curated, high-quality)
+  2. Wikipedia Portuguese - Encyclopedic content
+  3. Portuguese-PD - Largest Portuguese open corpus (public domain)
+  4. CulturaX Portuguese - High-quality web corpus
+  5. BrWaC - Brazilian Web as Corpus (3.53M docs, 2.68B tokens)
+  6. OSCAR Portuguese - Large web crawl (may have access restrictions)
+  7. Quati - Unicamp Brazilian Portuguese dataset
+  8. CC-100, mC4, News, Carolina Corpus - Additional sources
 
 Features:
 - Saves progress in chunks (resilient to interruptions)
 - Can merge chunks from interrupted downloads with --merge_chunks
 - Graceful shutdown on Ctrl+C (saves current progress)
 - Validates already processed datasets (skips if tokens.bin exists)
+- Automatic fallback if primary Portuguese sources are unavailable
 
 Usage:
     # Normal preprocessing
@@ -24,6 +33,9 @@ Usage:
 
     # Force reprocessing even if tokens.bin exists
     python preprocess_datasets.py --output_dir ./data/tokenized --force
+
+    # Combine multiple Portuguese sources for diversity
+    python preprocess_datasets.py --pt_combined_sources 3
 """
 
 import os
@@ -253,16 +265,37 @@ def load_english_dataset(max_samples: Optional[int] = None):
 # =============================================================================
 # Portuguese Dataset Sources - Multiple High-Quality Sources
 # =============================================================================
+# Updated: Added FineWeb2 Portuguese (multilingual fineweb), Portuguese-PD,
+# Quati, and BrWaC as high-quality alternatives to OSCAR
+# =============================================================================
 
 PORTUGUESE_SOURCES = [
+    {
+        "name": "FineWeb2 Portuguese",
+        "dataset_id": "HuggingFaceFW/fineweb-2",
+        "config": "pt",
+        "split": "train",
+        "text_field": "text",
+        "priority": 1,
+        "description": "FineWeb2 - Multilingual high-quality curated web corpus (Portuguese subset, similar to fineweb-edu)"
+    },
     {
         "name": "Wikipedia Portuguese",
         "dataset_id": "wikimedia/wikipedia",
         "config": "20231101.pt",
         "split": "train",
         "text_field": "text",
-        "priority": 1,
+        "priority": 2,
         "description": "Portuguese Wikipedia - High quality encyclopedic content"
+    },
+    {
+        "name": "Portuguese-PD (Public Domain)",
+        "dataset_id": "PleIAs/Portuguese-PD",
+        "config": None,
+        "split": "train",
+        "text_field": "text",
+        "priority": 3,
+        "description": "Portuguese-PD - Largest Portuguese open corpus with public domain content"
     },
     {
         "name": "CulturaX Portuguese",
@@ -270,8 +303,17 @@ PORTUGUESE_SOURCES = [
         "config": "pt",
         "split": "train",
         "text_field": "text",
-        "priority": 2,
+        "priority": 4,
         "description": "CulturaX - High quality multilingual web corpus"
+    },
+    {
+        "name": "BrWaC (Brazilian Web as Corpus)",
+        "dataset_id": "UFRGS/brwac",
+        "config": None,
+        "split": "train",
+        "text_field": "text",
+        "priority": 5,
+        "description": "BrWaC - Large Brazilian Portuguese web corpus (3.53M documents, 2.68B tokens)"
     },
     {
         "name": "OSCAR Portuguese",
@@ -279,8 +321,17 @@ PORTUGUESE_SOURCES = [
         "config": "pt",
         "split": "train",
         "text_field": "text",
-        "priority": 3,
-        "description": "OSCAR 2301 - Large web crawl corpus"
+        "priority": 6,
+        "description": "OSCAR 2301 - Large web crawl corpus (may have restricted access)"
+    },
+    {
+        "name": "Quati (Unicamp)",
+        "dataset_id": "unicamp-dl/quati",
+        "config": None,
+        "split": "train",
+        "text_field": "text",
+        "priority": 7,
+        "description": "Quati - High-quality Brazilian Portuguese dataset from Unicamp"
     },
     {
         "name": "CC-100 Portuguese",
@@ -288,7 +339,7 @@ PORTUGUESE_SOURCES = [
         "config": "pt",
         "split": "train",
         "text_field": "text",
-        "priority": 4,
+        "priority": 8,
         "description": "CC-100 - CommonCrawl based corpus"
     },
     {
@@ -297,17 +348,17 @@ PORTUGUESE_SOURCES = [
         "config": "pt",
         "split": "train",
         "text_field": "text",
-        "priority": 5,
+        "priority": 9,
         "description": "mC4 - Multilingual C4 Portuguese subset"
     },
     {
-        "name": "BrWac Sample",
+        "name": "BrWac Sample (legacy)",
         "dataset_id": "eduagarcia/brwac",
         "config": None,
         "split": "train",
         "text_field": "text",
-        "priority": 6,
-        "description": "Brazilian Web as Corpus - Brazilian Portuguese web content"
+        "priority": 10,
+        "description": "Brazilian Web as Corpus - Brazilian Portuguese web content (legacy sample)"
     },
     {
         "name": "Portuguese News",
@@ -315,7 +366,7 @@ PORTUGUESE_SOURCES = [
         "config": None,
         "split": "train",
         "text_field": "content",
-        "priority": 7,
+        "priority": 11,
         "description": "Portuguese news articles"
     },
     {
@@ -324,7 +375,7 @@ PORTUGUESE_SOURCES = [
         "config": None,
         "split": "train",
         "text_field": "text",
-        "priority": 8,
+        "priority": 12,
         "description": "Carolina Corpus - Brazilian Portuguese reference corpus"
     },
 ]
@@ -357,7 +408,6 @@ def load_portuguese_dataset(max_samples: Optional[int] = None) -> Tuple[Optional
                 "path": source["dataset_id"],
                 "split": source["split"],
                 "streaming": True,
-                "trust_remote_code": True,
             }
 
             if source["config"]:
@@ -407,7 +457,6 @@ def load_portuguese_dataset(max_samples: Optional[int] = None) -> Tuple[Optional
             "20220301.pt",
             split="train",
             streaming=True,
-            trust_remote_code=True,
         )
 
         test_iter = iter(dataset)
@@ -421,7 +470,6 @@ def load_portuguese_dataset(max_samples: Optional[int] = None) -> Tuple[Optional
                 "20220301.pt",
                 split="train",
                 streaming=True,
-                trust_remote_code=True,
             )
             return iter(dataset), text_field, "Wikipedia PT (fallback)"
 
@@ -465,7 +513,6 @@ def create_combined_portuguese_iterator(
                 "path": source["dataset_id"],
                 "split": source["split"],
                 "streaming": True,
-                "trust_remote_code": True,
             }
 
             if source["config"]:
