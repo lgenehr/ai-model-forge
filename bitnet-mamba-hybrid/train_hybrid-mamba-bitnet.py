@@ -24,6 +24,7 @@ import sys
 import csv
 import math
 import json
+import pickle
 import random
 import signal
 import logging
@@ -909,9 +910,28 @@ class Trainer:
         checkpoints = sorted(checkpoint_dir.glob("checkpoint_*.pt"))
 
         if checkpoints:
-            latest_checkpoint = checkpoints[-1]
-            self.logger.info(f"Resuming from checkpoint: {latest_checkpoint}")
-            self._load_checkpoint(latest_checkpoint)
+            # Try checkpoints from newest to oldest
+            for checkpoint_path in reversed(checkpoints):
+                self.logger.info(f"Attempting to resume from checkpoint: {checkpoint_path}")
+                if self._load_checkpoint(checkpoint_path):
+                    return  # Successfully loaded
+                else:
+                    self.logger.warning(f"Failed to load checkpoint: {checkpoint_path}")
+
+            self.logger.warning("All checkpoints failed to load. Starting from scratch.")
+
+    def _save_checkpoint_atomic(self, checkpoint: dict, target_path: Path):
+        """Save checkpoint atomically to prevent corruption from interrupts"""
+        temp_path = target_path.with_suffix('.pt.tmp')
+        try:
+            torch.save(checkpoint, temp_path)
+            # Atomic rename - if this is interrupted, old checkpoint remains valid
+            os.replace(temp_path, target_path)
+        except Exception:
+            # Clean up temp file if save failed
+            if temp_path.exists():
+                temp_path.unlink()
+            raise
 
     def _save_checkpoint(self, is_best: bool = False):
         """Save training checkpoint"""
@@ -926,15 +946,15 @@ class Trainer:
             'train_config': asdict(self.train_config)
         }
 
-        # Save regular checkpoint
+        # Save regular checkpoint (atomic to prevent corruption)
         checkpoint_path = Path(self.train_config.checkpoint_dir) / f"checkpoint_{self.global_step:08d}.pt"
-        torch.save(checkpoint, checkpoint_path)
+        self._save_checkpoint_atomic(checkpoint, checkpoint_path)
         self.logger.info(f"Saved checkpoint: {checkpoint_path}")
 
-        # Save best model
+        # Save best model (atomic)
         if is_best:
             best_path = Path(self.train_config.output_dir) / "best_model.pt"
-            torch.save(checkpoint, best_path)
+            self._save_checkpoint_atomic(checkpoint, best_path)
             self.logger.info(f"Saved best model: {best_path}")
 
         # Clean up old checkpoints (keep last 3)
@@ -942,18 +962,34 @@ class Trainer:
         for old_checkpoint in checkpoints[:-3]:
             old_checkpoint.unlink()
 
-    def _load_checkpoint(self, checkpoint_path: Path):
-        """Load training checkpoint"""
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+    def _load_checkpoint(self, checkpoint_path: Path) -> bool:
+        """Load training checkpoint
 
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        self.global_step = checkpoint['global_step']
-        self.total_tokens = checkpoint['total_tokens']
-        self.best_loss = checkpoint['best_loss']
+        Returns:
+            True if checkpoint was loaded successfully, False otherwise
+        """
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location=self.device)
 
-        self.logger.info(f"Resumed from step {self.global_step}, tokens: {self.total_tokens:,}")
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            self.global_step = checkpoint['global_step']
+            self.total_tokens = checkpoint['total_tokens']
+            self.best_loss = checkpoint['best_loss']
+
+            self.logger.info(f"Resumed from step {self.global_step}, tokens: {self.total_tokens:,}")
+            return True
+        except (RuntimeError, KeyError, EOFError, pickle.UnpicklingError) as e:
+            self.logger.error(f"Failed to load checkpoint {checkpoint_path}: {e}")
+            # Rename corrupted checkpoint so it won't be tried again
+            corrupted_path = checkpoint_path.with_suffix('.pt.corrupted')
+            try:
+                checkpoint_path.rename(corrupted_path)
+                self.logger.info(f"Renamed corrupted checkpoint to: {corrupted_path}")
+            except OSError as rename_error:
+                self.logger.warning(f"Could not rename corrupted checkpoint: {rename_error}")
+            return False
 
     def _save_interrupt_checkpoint(self):
         """Save checkpoint when training is interrupted (Ctrl+C)"""
@@ -972,15 +1008,15 @@ class Trainer:
             'interrupted': True,
         }
 
-        # Save interrupt checkpoint with special naming
+        # Save interrupt checkpoint with special naming (atomic to prevent corruption)
         checkpoint_path = Path(self.train_config.checkpoint_dir) / f"checkpoint_interrupt_{self.global_step:08d}.pt"
-        torch.save(checkpoint, checkpoint_path)
+        self._save_checkpoint_atomic(checkpoint, checkpoint_path)
         self.logger.info(f"Saved interrupt checkpoint: {checkpoint_path}")
 
-        # Also save as latest checkpoint for easy resume
+        # Also save as latest checkpoint for easy resume (atomic)
         latest_path = Path(self.train_config.checkpoint_dir) / f"checkpoint_{self.global_step:08d}.pt"
         if not latest_path.exists():
-            torch.save(checkpoint, latest_path)
+            self._save_checkpoint_atomic(checkpoint, latest_path)
             self.logger.info(f"Saved checkpoint: {latest_path}")
 
         self.logger.info("=" * 60)
