@@ -273,7 +273,7 @@ PORTUGUESE_SOURCES = [
     {
         "name": "FineWeb2 Portuguese",
         "dataset_id": "HuggingFaceFW/fineweb-2",
-        "config": "pt",
+        "config": "por_Latn",
         "split": "train",
         "text_field": "text",
         "priority": 1,
