@@ -75,6 +75,12 @@ torch.backends.cudnn.benchmark = True
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
+# Disable torch.compile/Dynamo by default (incompatible with Mamba CUDA kernels)
+# This prevents accidental compilation that hurts performance
+import torch._dynamo
+torch._dynamo.config.suppress_errors = True
+torch._dynamo.config.disable = True
+
 # Reduce verbosity of HTTP requests and dataset loading
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("requests").setLevel(logging.WARNING)
