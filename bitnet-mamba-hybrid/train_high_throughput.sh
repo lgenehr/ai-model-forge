@@ -20,7 +20,7 @@
 #
 # If you get OOM errors, try reducing batch_size to 10 or 8
 
-cd "$(dirname "$0")"
+cd "$(dirname -- "$0")"
 
 python train_hybrid-mamba-bitnet.py \
     --high_throughput \

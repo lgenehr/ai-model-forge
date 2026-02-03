@@ -965,13 +965,33 @@ class Trainer:
     def _load_checkpoint(self, checkpoint_path: Path) -> bool:
         """Load training checkpoint
 
+        Handles both regular and torch.compile() models by remapping state_dict keys.
+
         Returns:
             True if checkpoint was loaded successfully, False otherwise
         """
         try:
             checkpoint = torch.load(checkpoint_path, map_location=self.device)
+            model_state = checkpoint['model_state_dict']
 
-            self.model.load_state_dict(checkpoint['model_state_dict'])
+            # Check if model is compiled (has _orig_mod prefix in keys)
+            model_keys = list(self.model.state_dict().keys())
+            checkpoint_keys = list(model_state.keys())
+
+            model_is_compiled = any(k.startswith('_orig_mod.') for k in model_keys)
+            checkpoint_is_compiled = any(k.startswith('_orig_mod.') for k in checkpoint_keys)
+
+            # Remap keys if there's a mismatch
+            if model_is_compiled and not checkpoint_is_compiled:
+                # Model is compiled but checkpoint is not - add _orig_mod. prefix
+                self.logger.info("Remapping checkpoint keys for compiled model...")
+                model_state = {'_orig_mod.' + k: v for k, v in model_state.items()}
+            elif not model_is_compiled and checkpoint_is_compiled:
+                # Model is not compiled but checkpoint is - remove _orig_mod. prefix
+                self.logger.info("Remapping checkpoint keys for non-compiled model...")
+                model_state = {k.replace('_orig_mod.', ''): v for k, v in model_state.items()}
+
+            self.model.load_state_dict(model_state)
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             self.global_step = checkpoint['global_step']
@@ -980,15 +1000,20 @@ class Trainer:
 
             self.logger.info(f"Resumed from step {self.global_step}, tokens: {self.total_tokens:,}")
             return True
-        except (RuntimeError, KeyError, EOFError, pickle.UnpicklingError) as e:
-            self.logger.error(f"Failed to load checkpoint {checkpoint_path}: {e}")
-            # Rename corrupted checkpoint so it won't be tried again
+        except (EOFError, pickle.UnpicklingError) as e:
+            # Only rename truly corrupted files (file format issues)
+            self.logger.error(f"Checkpoint file corrupted {checkpoint_path}: {e}")
             corrupted_path = checkpoint_path.with_suffix('.pt.corrupted')
             try:
                 checkpoint_path.rename(corrupted_path)
                 self.logger.info(f"Renamed corrupted checkpoint to: {corrupted_path}")
             except OSError as rename_error:
                 self.logger.warning(f"Could not rename corrupted checkpoint: {rename_error}")
+            return False
+        except (RuntimeError, KeyError) as e:
+            # Key mismatches or missing keys - don't rename, just skip
+            self.logger.error(f"Failed to load checkpoint {checkpoint_path}: {e}")
+            self.logger.warning("Checkpoint may have incompatible architecture. Trying next...")
             return False
 
     def _save_interrupt_checkpoint(self):
