@@ -5,25 +5,21 @@
 # and want to maximize tokens/second throughput.
 #
 # Key Optimizations:
-# 1. torch.compile() with default mode (JIT compilation - reduce-overhead has issues with Mamba)
-# 2. Optimized batch_size (8) - balanced for 16-17GB GPUs with torch.compile()
-# 3. Increased num_workers (8) and prefetch_factor (4) for faster data loading
-# 4. NO gradient checkpointing (prioritizes speed over memory)
+# 1. Larger batch_size (8) to better utilize GPU memory
+# 2. Increased num_workers (8) and prefetch_factor (4) for faster data loading
+# 3. NO gradient checkpointing (prioritizes speed over memory)
+#
+# NOTE: torch.compile() is NOT used because Mamba's selective_scan CUDA kernel
+# is incompatible with PyTorch Dynamo, causing graph breaks and overhead.
 #
 # Expected Memory Usage: ~85-90% of GPU VRAM
-# Expected Throughput: +20-40% tokens/second compared to memory_optimized config
-#
-# Requirements:
-# - PyTorch 2.0+ for torch.compile()
-# - GPU with sufficient VRAM (16GB+ recommended)
+# Expected Throughput: ~2500-3000 tokens/sec on RTX 4070 Ti SUPER
 #
 # If you get OOM errors, try reducing batch_size to 6
 
 cd "$(dirname -- "$0")"
 
 python train_hybrid-mamba-bitnet.py \
-    --compile \
-    --compile_mode "default" \
     --d_model 1024 \
     --n_layers 12 \
     --d_state 16 \
