@@ -5,7 +5,7 @@
 # and want to maximize tokens/second throughput.
 #
 # Key Optimizations:
-# 1. torch.compile() with reduce-overhead mode (JIT compilation for faster execution)
+# 1. torch.compile() with default mode (JIT compilation - reduce-overhead has issues with Mamba)
 # 2. Optimized batch_size (8) - balanced for 16-17GB GPUs with torch.compile()
 # 3. Increased num_workers (8) and prefetch_factor (4) for faster data loading
 # 4. NO gradient checkpointing (prioritizes speed over memory)
@@ -23,7 +23,7 @@ cd "$(dirname -- "$0")"
 
 python train_hybrid-mamba-bitnet.py \
     --compile \
-    --compile_mode "reduce-overhead" \
+    --compile_mode "default" \
     --d_model 1024 \
     --n_layers 12 \
     --d_state 16 \
