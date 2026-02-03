@@ -1271,6 +1271,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no_amp", action="store_true", help="Disable automatic mixed precision")
     parser.add_argument("--skip_mamba_check", action="store_true", help="Skip Mamba optimization verification")
 
+    # High throughput optimization arguments
+    parser.add_argument("--compile", action="store_true",
+                        help="Enable torch.compile() for model optimization (requires PyTorch 2.0+)")
+    parser.add_argument("--compile_mode", type=str, default="reduce-overhead",
+                        choices=["default", "reduce-overhead", "max-autotune"],
+                        help="torch.compile optimization mode")
+    parser.add_argument("--high_throughput", action="store_true",
+                        help="Enable high throughput mode: larger batch, more workers, torch.compile")
+
     # Weights & Biases arguments
     parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
     parser.add_argument("--wandb_api_key", type=str, default=None,
@@ -1294,6 +1303,44 @@ def main():
         format='%(asctime)s | %(levelname)s | %(message)s',
         handlers=[logging.StreamHandler(sys.stdout)]
     )
+
+    # High throughput mode: automatically adjust parameters for maximum GPU utilization
+    if args.high_throughput:
+        print("=" * 60)
+        print("HIGH THROUGHPUT MODE ENABLED")
+        print("=" * 60)
+        print("Adjusting parameters for maximum GPU utilization...")
+
+        # Increase batch size if not explicitly set higher
+        if args.batch_size <= 8:
+            args.batch_size = 12
+            print(f"  -> batch_size: 12 (increased from default)")
+
+        # Reduce gradient accumulation to compensate
+        if args.grad_accum >= 4:
+            args.grad_accum = 3
+            print(f"  -> grad_accum: 3 (adjusted for larger batch)")
+
+        # Increase data loading parallelism
+        if args.num_workers <= 4:
+            args.num_workers = 8
+            print(f"  -> num_workers: 8 (increased for faster data loading)")
+
+        if args.prefetch_factor <= 2:
+            args.prefetch_factor = 4
+            print(f"  -> prefetch_factor: 4 (increased for better pipelining)")
+
+        # Enable torch.compile by default in high throughput mode
+        if hasattr(torch, 'compile') and not args.compile:
+            args.compile = True
+            print(f"  -> torch.compile: enabled (JIT optimization)")
+
+        # Disable gradient checkpointing for speed (uses more memory but faster)
+        if args.gradient_checkpointing:
+            args.gradient_checkpointing = False
+            print(f"  -> gradient_checkpointing: disabled (speed over memory)")
+
+        print("=" * 60)
 
     # Set random seeds
     torch.manual_seed(args.seed)
@@ -1362,6 +1409,19 @@ def main():
     # Create model
     model = BitNetMambaLM(model_config)
     print(f"Model created with {model.get_num_params():,} parameters")
+
+    # Apply torch.compile() for optimized execution (PyTorch 2.0+)
+    if args.compile and hasattr(torch, 'compile'):
+        print(f"Compiling model with torch.compile(mode='{args.compile_mode}')...")
+        print("  This may take a few minutes on first run but speeds up training significantly.")
+        try:
+            model = torch.compile(model, mode=args.compile_mode)
+            print("  Model compiled successfully!")
+        except Exception as e:
+            print(f"  Warning: torch.compile() failed: {e}")
+            print("  Continuing without compilation...")
+    elif args.compile:
+        print("Warning: torch.compile requested but not available (requires PyTorch 2.0+)")
 
     # Create efficient dataloader (memory-mapped, no HTTP requests)
     try:
