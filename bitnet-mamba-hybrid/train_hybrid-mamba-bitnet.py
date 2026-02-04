@@ -1392,8 +1392,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_seq_len", type=int, default=2048, help="Maximum sequence length")
     parser.add_argument("--max_tokens", type=int, default=4_000_000_000, help="Maximum tokens to train on")
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
+    parser.add_argument("--min_lr", type=float, default=1e-6, help="Minimum learning rate")
     parser.add_argument("--warmup_steps", type=int, default=2000, help="Warmup steps")
     parser.add_argument("--weight_decay", type=float, default=0.1, help="Weight decay")
+    parser.add_argument("--max_grad_norm", type=float, default=0.5, help="Maximum gradient norm for clipping")
 
     # Data arguments
     parser.add_argument("--data_dir", type=str, default="./data/tokenized",
@@ -1518,8 +1520,10 @@ def main():
         max_seq_len=args.max_seq_len,
         max_tokens=args.max_tokens,
         learning_rate=args.lr,
+        min_lr=args.min_lr,
         warmup_steps=args.warmup_steps,
         weight_decay=args.weight_decay,
+        max_grad_norm=args.max_grad_norm,
         use_amp=not args.no_amp,
         # Data settings
         data_dir=args.data_dir,
