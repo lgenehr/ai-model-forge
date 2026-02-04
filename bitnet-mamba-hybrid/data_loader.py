@@ -31,7 +31,7 @@ import json
 import random
 import logging
 from pathlib import Path
-from typing import Optional, Dict, List, Tuple, Iterator
+from typing import Optional, Dict, List, Tuple, Iterator, Union
 
 import numpy as np
 import torch
@@ -206,8 +206,15 @@ class PreTokenizedDataset(Dataset):
 
         return "en" if self.rng.random() < self.en_ratio_norm else "pt"
 
-    def _get_random_sequence(self, lang: str) -> np.ndarray:
-        """Get a random sequence of max_seq_len + 1 tokens"""
+    def _get_random_sequence(self, lang: str) -> Tuple[np.ndarray, int]:
+        """
+        Get a random sequence of max_seq_len + 1 tokens.
+
+        Returns:
+            Tuple of (sequence, valid_length) where valid_length is the number
+            of real tokens (excluding padding). Padding positions should use
+            ignore_index=-100 in the labels.
+        """
         tokens = self.en_tokens if lang == "en" else self.pt_tokens
 
         if tokens is None:
@@ -220,30 +227,42 @@ class PreTokenizedDataset(Dataset):
 
         # Get sequence (max_seq_len + 1 for input/label split)
         sequence = tokens.get_chunk(start_idx, self.max_seq_len + 1)
+        valid_length = len(sequence)
 
-        # Pad if necessary
+        # Pad if necessary (pad with 0 for input_ids, but we'll handle labels separately)
         if len(sequence) < self.max_seq_len + 1:
             pad_length = self.max_seq_len + 1 - len(sequence)
             sequence = np.pad(sequence, (0, pad_length), constant_values=0)
 
-        return sequence
+        return sequence, valid_length
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """
         Get a training sample.
 
         Returns:
-            Dict with 'input_ids' and 'labels' tensors
+            Dict with 'input_ids' and 'labels' tensors.
+            Labels use -100 (ignore_index) for padding positions to exclude
+            them from loss computation.
         """
         # Sample language
         lang = self._sample_language()
 
-        # Get sequence
-        sequence = self._get_random_sequence(lang)
+        # Get sequence and valid length
+        sequence, valid_length = self._get_random_sequence(lang)
 
         # Split into input and labels
         input_ids = torch.from_numpy(sequence[:-1].astype(np.int64))
         labels = torch.from_numpy(sequence[1:].astype(np.int64))
+
+        # CRITICAL: Set padding positions in labels to -100 (ignore_index)
+        # This prevents the model from learning to predict padding tokens
+        # valid_length includes the +1 for labels, so valid positions are [0, valid_length-1)
+        # Since labels = sequence[1:], valid label positions are [0, valid_length-2]
+        if valid_length < self.max_seq_len + 1:
+            # Positions from valid_length-1 onwards in labels should be ignored
+            # (they correspond to sequence[valid_length:] which are padding)
+            labels[valid_length - 1:] = -100
 
         return {
             'input_ids': input_ids,

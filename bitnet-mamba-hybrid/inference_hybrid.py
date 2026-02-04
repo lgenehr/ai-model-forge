@@ -60,9 +60,13 @@ class ModelConfig:
 # =============================================================================
 
 class RMSNorm(nn.Module):
-    """Root Mean Square Layer Normalization"""
+    """
+    Root Mean Square Layer Normalization
 
-    def __init__(self, dim: int, eps: float = 1e-6):
+    Uses eps=1e-5 for bfloat16 numerical safety (matches training).
+    """
+
+    def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
@@ -189,7 +193,9 @@ class MambaBlock(nn.Module):
         batch_size = x.shape[0]
         d_state = self.config.d_state
 
-        A = -torch.exp(self.A_log.float())
+        # STABILITY: Clamp A_log to prevent numerical issues (matches training)
+        A_log_clamped = self.A_log.float().clamp(min=-20.0, max=2.0)
+        A = -torch.exp(A_log_clamped)
         dt = F.softplus(dt)
 
         # Initialize state if needed
@@ -224,7 +230,9 @@ class MambaBlock(nn.Module):
         batch_size, seq_len, d_inner = x.shape
         d_state = self.config.d_state
 
-        A = -torch.exp(self.A_log.float())
+        # STABILITY: Clamp A_log to prevent numerical issues (matches training)
+        A_log_clamped = self.A_log.float().clamp(min=-20.0, max=2.0)
+        A = -torch.exp(A_log_clamped)
         dt = F.softplus(dt)
 
         h = torch.zeros(batch_size, d_inner, d_state, device=x.device, dtype=x.dtype)

@@ -254,20 +254,28 @@ class ModelConfig:
 
 @dataclass
 class TrainingConfig:
-    """Configuration for training hyperparameters"""
+    """
+    Configuration for training hyperparameters.
+
+    IMPORTANT: These defaults are tuned for BitNet + Mamba stability:
+    - Lower learning rate (1e-4) due to BitNet's STE gradient noise
+    - Lower weight decay (0.05) to prevent fighting against noisy gradients
+    - Longer warmup (4000 steps) for gentler optimization ramp-up
+    - Conservative gradient clipping (0.5) for SSM stability
+    """
     # Data
     batch_size: int = 8
     gradient_accumulation_steps: int = 4
     max_seq_len: int = 2048
 
-    # Training
+    # Training - TUNED FOR BITNET + MAMBA STABILITY
     max_tokens: int = 4_000_000_000  # 4B tokens target
     max_steps: Optional[int] = None  # Will be computed
-    warmup_steps: int = 2000
-    learning_rate: float = 3e-4
-    min_lr: float = 1e-5
-    weight_decay: float = 0.1
-    max_grad_norm: float = 1.0
+    warmup_steps: int = 4000  # Longer warmup for BitNet stability (was 2000)
+    learning_rate: float = 1e-4  # Lower LR for BitNet + Mamba (was 3e-4)
+    min_lr: float = 1e-6  # Lower min LR (was 1e-5)
+    weight_decay: float = 0.05  # Less aggressive decay (was 0.1)
+    max_grad_norm: float = 0.5  # Tighter clipping for SSM stability (was 1.0)
 
     # Mixed precision
     use_amp: bool = True
@@ -312,14 +320,20 @@ class TrainingConfig:
 # =============================================================================
 
 class RMSNorm(nn.Module):
-    """Root Mean Square Layer Normalization"""
+    """
+    Root Mean Square Layer Normalization
 
-    def __init__(self, dim: int, eps: float = 1e-6):
+    Uses eps=1e-5 for bfloat16 numerical safety (1e-6 is too close to
+    bfloat16 precision limits and can cause instability).
+    """
+
+    def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Cast to float32 for numerical stability, then back to input dtype
         norm = x.float().pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
         return (x.float() * norm).type_as(x) * self.weight
 
@@ -458,6 +472,15 @@ class MambaBlock(nn.Module):
         # 4. Projeção dt
         self.dt_proj = nn.Linear(1, self.d_inner, bias=True)
 
+        # STABILITY FIX: Initialize dt_proj bias for reasonable initial time steps
+        # After softplus, we want dt ≈ 0.1 to 1.0 for stable SSM dynamics
+        # softplus(x) ≈ x for x >> 0, so bias ≈ 0.5 gives dt ≈ 0.5 initially
+        # This prevents very large or very small initial time steps
+        with torch.no_grad():
+            self.dt_proj.bias.fill_(0.5)
+            # Small weight initialization for dt_proj to prevent extreme values
+            nn.init.uniform_(self.dt_proj.weight, -0.1, 0.1)
+
         # Parâmetros A e D (Logarítmicos para estabilidade)
         A = repeat(
             torch.arange(1, config.d_state + 1, dtype=torch.float32),
@@ -499,7 +522,13 @@ class MambaBlock(nn.Module):
         # O kernel espera shapes específicos. Geralmente (Batch, Seq, Dim) ou (Batch, Dim, Seq)
         # Vamos usar a implementação oficial que lida com a matemática complexa
 
-        A = -torch.exp(self.A_log.float())  # Força float32 para estabilidade do SSM
+        # STABILITY FIX: Clamp A_log to prevent numerical instability
+        # Without clamping, A_log can grow unbounded causing:
+        # - Very large A_log → exp() overflow → NaN
+        # - Very negative A_log → huge negative A → unstable SSM dynamics
+        # Range [-20, 2] keeps A in approximately [-7.4, -0.14] which is stable
+        A_log_clamped = self.A_log.float().clamp(min=-20.0, max=2.0)
+        A = -torch.exp(A_log_clamped)  # Força float32 para estabilidade do SSM
 
         # Se tivermos o kernel instalado, usamos ele:
         if selective_scan_fn is not None:
@@ -905,6 +934,74 @@ class Trainer:
         else:
             return self.scheduler.get_last_lr()[0]
 
+    def _compute_gradient_stats(self) -> Dict[str, float]:
+        """
+        Compute gradient statistics for monitoring training stability.
+
+        Returns dict with:
+        - grad_norm_total: Total gradient norm across all parameters
+        - grad_norm_embedding: Gradient norm for embedding layer
+        - grad_norm_ssm: Gradient norm for SSM parameters (A_log, D)
+        - grad_norm_bitlinear: Gradient norm for BitLinear layers
+        """
+        stats = {}
+        total_norm = 0.0
+        embedding_norm = 0.0
+        ssm_norm = 0.0
+        bitlinear_norm = 0.0
+
+        for name, param in self.model.named_parameters():
+            if param.grad is not None:
+                param_norm = param.grad.data.norm(2).item() ** 2
+                total_norm += param_norm
+
+                if 'embedding' in name or 'lm_head' in name:
+                    embedding_norm += param_norm
+                elif 'A_log' in name or '.D' in name or 'dt_proj' in name:
+                    ssm_norm += param_norm
+                elif 'in_proj' in name or 'out_proj' in name:
+                    bitlinear_norm += param_norm
+
+        stats['grad_norm_total'] = total_norm ** 0.5
+        stats['grad_norm_embedding'] = embedding_norm ** 0.5
+        stats['grad_norm_ssm'] = ssm_norm ** 0.5
+        stats['grad_norm_bitlinear'] = bitlinear_norm ** 0.5
+
+        return stats
+
+    def _check_training_health(self, loss: float, grad_stats: Dict[str, float]) -> List[str]:
+        """
+        Check for training health issues and return warnings.
+
+        This implements early warning detection for:
+        - Loss explosions
+        - Gradient explosions/vanishing
+        - NaN/Inf values
+        """
+        warnings = []
+
+        # Check for NaN/Inf loss
+        if math.isnan(loss) or math.isinf(loss):
+            warnings.append(f"CRITICAL: Loss is {loss}! Training is diverging.")
+
+        # Check for loss explosion (loss > 20 is very high for language modeling)
+        if loss > 15.0:
+            warnings.append(f"WARNING: Loss ({loss:.2f}) is very high. Model may be struggling.")
+
+        # Check for gradient explosion
+        if grad_stats.get('grad_norm_total', 0) > 100.0:
+            warnings.append(f"WARNING: Gradient norm ({grad_stats['grad_norm_total']:.2f}) is very high.")
+
+        # Check for gradient vanishing
+        if grad_stats.get('grad_norm_total', 0) < 1e-7:
+            warnings.append(f"WARNING: Gradient norm ({grad_stats['grad_norm_total']:.2e}) is very small.")
+
+        # Check SSM gradients specifically
+        if grad_stats.get('grad_norm_ssm', 0) > 50.0:
+            warnings.append(f"WARNING: SSM gradient norm ({grad_stats['grad_norm_ssm']:.2f}) is high.")
+
+        return warnings
+
     def _set_lr(self, lr: float):
         """Set learning rate for all parameter groups"""
         for param_group in self.optimizer.param_groups:
@@ -1161,13 +1258,22 @@ class Trainer:
 
                         avg_loss = accumulated_loss / self.train_config.log_interval
 
+                        # Compute gradient statistics for monitoring
+                        grad_stats = self._compute_gradient_stats()
+
                         self.logger.info(
                             f"Step {self.global_step:>7} | "
                             f"Loss: {avg_loss:.4f} | "
                             f"LR: {current_lr:.2e} | "
                             f"Tokens: {self.total_tokens:>12,} | "
-                            f"Tok/s: {tokens_per_sec:>8,.0f}"
+                            f"Tok/s: {tokens_per_sec:>8,.0f} | "
+                            f"GradNorm: {grad_stats['grad_norm_total']:.2f}"
                         )
+
+                        # Check training health and log warnings
+                        warnings = self._check_training_health(avg_loss, grad_stats)
+                        for warning in warnings:
+                            self.logger.warning(warning)
 
                         # Write to CSV
                         self.csv_writer.writerow([
@@ -1180,14 +1286,19 @@ class Trainer:
                         ])
                         self.csv_file.flush()
 
-                        # Log to Weights & Biases
-                        self._log_to_wandb({
+                        # Log to Weights & Biases (including gradient stats)
+                        wandb_metrics = {
                             'train/loss': avg_loss,
                             'train/learning_rate': current_lr,
                             'train/tokens': self.total_tokens,
                             'train/tokens_per_sec': tokens_per_sec,
                             'train/epoch': self.total_tokens / self.train_config.max_tokens,
-                        }, step=self.global_step)
+                            'gradients/total_norm': grad_stats['grad_norm_total'],
+                            'gradients/embedding_norm': grad_stats['grad_norm_embedding'],
+                            'gradients/ssm_norm': grad_stats['grad_norm_ssm'],
+                            'gradients/bitlinear_norm': grad_stats['grad_norm_bitlinear'],
+                        }
+                        self._log_to_wandb(wandb_metrics, step=self.global_step)
 
                         # Track best loss
                         if avg_loss < self.best_loss:
