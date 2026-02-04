@@ -76,7 +76,7 @@ echo "Weight Decay:      0.05 (reduced for noisy gradients)"
 echo "Gradient Clip:     0.5 (tighter for SSM stability)"
 echo "Batch Size:        4 x 8 = 32 effective"
 echo "Sequence Length:   2048"
-echo "Target Tokens:     4B"
+echo "Target Tokens:     2.5B"
 echo "============================================================"
 echo ""
 
@@ -110,7 +110,7 @@ python train_hybrid-mamba-bitnet.py \
     --lr 1e-4 \
     --warmup_steps 4000 \
     --weight_decay 0.05 \
-    --max_tokens 4000000000 \
+    --max_tokens 2500000000 \
     \
     `# === DATA CONFIGURATION ===` \
     --data_dir "data/tokenized" \
