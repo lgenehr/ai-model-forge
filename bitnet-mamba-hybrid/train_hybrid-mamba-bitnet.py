@@ -62,7 +62,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.amp import autocast, GradScaler
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.checkpoint import checkpoint
 
 # ============================================================================
@@ -459,11 +459,16 @@ class MambaBlock(nn.Module):
         self.dt_proj = nn.Linear(1, self.d_inner, bias=True)
 
         # Parâmetros A e D (Logarítmicos para estabilidade)
-        A = repeat(
-            torch.arange(1, config.d_state + 1, dtype=torch.float32),
-            'n -> d n',
-            d=self.d_inner,
-        ).contiguous()
+        if repeat is not None:
+            A = repeat(
+                torch.arange(1, config.d_state + 1, dtype=torch.float32),
+                'n -> d n',
+                d=self.d_inner,
+            ).contiguous()
+        else:
+            A = torch.arange(1, config.d_state + 1, dtype=torch.float32).unsqueeze(0).expand(
+                self.d_inner, -1
+            ).clone()
         self.A_log = nn.Parameter(torch.log(A))
         self.D = nn.Parameter(torch.ones(self.d_inner))
 
@@ -745,12 +750,11 @@ class Trainer:
         # Optimizer
         self.optimizer = self._create_optimizer()
 
-        # Scheduler
-        self.scheduler = CosineAnnealingLR(
-            self.optimizer,
-            T_max=train_config.max_steps - train_config.warmup_steps,
-            eta_min=train_config.min_lr
-        )
+        # Scheduler (warmup + cosine decay)
+        self._lr_lambda = self._build_lr_lambda()
+        self.scheduler = LambdaLR(self.optimizer, lr_lambda=self._lr_lambda)
+        self._set_lr(self._lr_lambda(0) * self.train_config.learning_rate)
+        self.scheduler.last_epoch = 0
 
         # Gradient scaler for mixed precision
         self.scaler = GradScaler('cuda', enabled=train_config.use_amp and self.dtype == torch.float16)
@@ -773,13 +777,19 @@ class Trainer:
         self._try_resume()
 
     def _create_optimizer(self) -> AdamW:
-        """Create optimizer with weight decay for non-bias parameters"""
+        """Create optimizer with weight decay for select parameters"""
         decay_params = []
         no_decay_params = []
 
         for name, param in self.model.named_parameters():
             if param.requires_grad:
-                if 'bias' in name or 'norm' in name:
+                if (
+                    param.ndim < 2
+                    or 'bias' in name
+                    or 'norm' in name
+                    or 'A_log' in name
+                    or name.endswith('.D')
+                ):
                     no_decay_params.append(param)
                 else:
                     decay_params.append(param)
@@ -795,6 +805,22 @@ class Trainer:
             betas=(0.9, 0.95),
             eps=1e-8
         )
+
+    def _build_lr_lambda(self):
+        warmup_steps = max(0, self.train_config.warmup_steps)
+        total_steps = max(1, self.train_config.max_steps)
+        base_lr = self.train_config.learning_rate
+        min_lr = self.train_config.min_lr
+        min_ratio = min_lr / base_lr
+
+        def lr_lambda(step: int) -> float:
+            if warmup_steps > 0 and step < warmup_steps:
+                return (step + 1) / warmup_steps
+            progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return cosine * (1.0 - min_ratio) + min_ratio
+
+        return lr_lambda
 
     def _setup_paths(self):
         """Create necessary directories"""
@@ -897,14 +923,6 @@ class Trainer:
             wandb.finish()
             self.logger.info("Weights & Biases run finished")
 
-    def _get_lr(self) -> float:
-        """Get current learning rate with warmup"""
-        if self.global_step < self.train_config.warmup_steps:
-            # Linear warmup
-            return self.train_config.learning_rate * (self.global_step + 1) / self.train_config.warmup_steps
-        else:
-            return self.scheduler.get_last_lr()[0]
-
     def _set_lr(self, lr: float):
         """Set learning rate for all parameter groups"""
         for param_group in self.optimizer.param_groups:
@@ -999,7 +1017,8 @@ class Trainer:
 
             self.model.load_state_dict(model_state)
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            if 'scheduler_state_dict' in checkpoint:
+                self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             self.global_step = checkpoint['global_step']
             self.total_tokens = checkpoint['total_tokens']
             self.best_loss = checkpoint['best_loss']
@@ -1090,8 +1109,9 @@ class Trainer:
         self.logger.info("=" * 60)
 
         # Training metrics
-        accumulated_loss = 0.0
-        accumulated_tokens = 0
+        running_loss = 0.0
+        running_tokens = 0
+        tokens_in_step = 0
         step_start_time = datetime.now()
         batch_idx = 0
         interrupted = False
@@ -1110,7 +1130,8 @@ class Trainer:
                 tokens_in_batch = input_ids.numel()
 
                 # Forward pass with mixed precision
-                with autocast('cuda', dtype=self.dtype, enabled=self.train_config.use_amp):
+                device_type = "cuda" if self.device.type == "cuda" else "cpu"
+                with autocast(device_type, dtype=self.dtype, enabled=self.train_config.use_amp):
                     outputs = self.model(input_ids, labels)
                     loss = outputs['loss'] / self.train_config.gradient_accumulation_steps
 
@@ -1120,8 +1141,9 @@ class Trainer:
                 else:
                     loss.backward()
 
-                accumulated_loss += loss.item() * self.train_config.gradient_accumulation_steps
-                accumulated_tokens += tokens_in_batch
+                running_loss += outputs['loss'].item()
+                running_tokens += tokens_in_batch
+                tokens_in_step += tokens_in_batch
                 batch_idx += 1
 
                 # Gradient accumulation step
@@ -1144,22 +1166,19 @@ class Trainer:
 
                     self.optimizer.zero_grad(set_to_none=True)  # More efficient
 
-                    # Update learning rate
-                    current_lr = self._get_lr()
-                    self._set_lr(current_lr)
-
-                    if self.global_step >= self.train_config.warmup_steps:
-                        self.scheduler.step()
-
+                    # Update learning rate for the next step
                     self.global_step += 1
-                    self.total_tokens += accumulated_tokens
+                    self.total_tokens += tokens_in_step
+                    self.scheduler.step(self.global_step)
+                    current_lr = self.scheduler.get_last_lr()[0]
+                    tokens_in_step = 0
 
                     # Logging
                     if self.global_step % self.train_config.log_interval == 0:
                         step_time = (datetime.now() - step_start_time).total_seconds()
-                        tokens_per_sec = accumulated_tokens / step_time if step_time > 0 else 0
-
-                        avg_loss = accumulated_loss / self.train_config.log_interval
+                        tokens_per_sec = running_tokens / step_time if step_time > 0 else 0
+                        batches_per_log = self.train_config.log_interval * self.train_config.gradient_accumulation_steps
+                        avg_loss = running_loss / max(1, batches_per_log)
 
                         self.logger.info(
                             f"Step {self.global_step:>7} | "
@@ -1194,10 +1213,9 @@ class Trainer:
                             self.best_loss = avg_loss
                             self._log_to_wandb({'train/best_loss': self.best_loss}, step=self.global_step)
 
-                        accumulated_loss = 0.0
+                        running_loss = 0.0
+                        running_tokens = 0
                         step_start_time = datetime.now()
-
-                    accumulated_tokens = 0
 
                     # Checkpoint
                     if self.global_step % self.train_config.checkpoint_interval == 0:
@@ -1283,6 +1301,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
     parser.add_argument("--warmup_steps", type=int, default=2000, help="Warmup steps")
     parser.add_argument("--weight_decay", type=float, default=0.1, help="Weight decay")
+    parser.add_argument("--min_lr", type=float, default=1e-5, help="Minimum learning rate for cosine decay")
+    parser.add_argument("--max_grad_norm", type=float, default=1.0, help="Maximum gradient norm for clipping")
 
     # Data arguments
     parser.add_argument("--data_dir", type=str, default="./data/tokenized",
@@ -1408,7 +1428,9 @@ def main():
         max_tokens=args.max_tokens,
         learning_rate=args.lr,
         warmup_steps=args.warmup_steps,
+        min_lr=args.min_lr,
         weight_decay=args.weight_decay,
+        max_grad_norm=args.max_grad_norm,
         use_amp=not args.no_amp,
         # Data settings
         data_dir=args.data_dir,

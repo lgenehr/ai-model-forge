@@ -58,6 +58,8 @@ class MemoryMappedTokens:
         self.total_tokens = self.metadata['total_tokens']
         self.vocab_size = self.metadata.get('vocab_size', 50304)
         self.dtype_str = self.metadata.get('dtype', 'uint16')
+        self.eos_token_id = self.metadata.get('eos_token_id', 50256)
+        self.pad_token_id = self.metadata.get('pad_token_id', self.eos_token_id)
 
         # Determine numpy dtype
         self.dtype = np.uint16 if self.dtype_str == 'uint16' else np.uint32
@@ -150,6 +152,14 @@ class PreTokenizedDataset(Dataset):
         if self.pt_tokens:
             self.total_tokens += len(self.pt_tokens)
 
+        # Pad token id (prefer English, fallback to Portuguese)
+        if self.en_tokens:
+            self.pad_token_id = self.en_tokens.pad_token_id
+        elif self.pt_tokens:
+            self.pad_token_id = self.pt_tokens.pad_token_id
+        else:
+            self.pad_token_id = 50256
+
         # Epoch tokens for length calculation
         if epoch_tokens:
             self._epoch_sequences = epoch_tokens // max_seq_len
@@ -206,8 +216,8 @@ class PreTokenizedDataset(Dataset):
 
         return "en" if self.rng.random() < self.en_ratio_norm else "pt"
 
-    def _get_random_sequence(self, lang: str) -> np.ndarray:
-        """Get a random sequence of max_seq_len + 1 tokens"""
+    def _get_random_sequence(self, lang: str) -> Tuple[np.ndarray, np.ndarray]:
+        """Get a random sequence of max_seq_len + 1 tokens and pad mask"""
         tokens = self.en_tokens if lang == "en" else self.pt_tokens
 
         if tokens is None:
@@ -220,13 +230,15 @@ class PreTokenizedDataset(Dataset):
 
         # Get sequence (max_seq_len + 1 for input/label split)
         sequence = tokens.get_chunk(start_idx, self.max_seq_len + 1)
+        pad_mask = np.zeros(self.max_seq_len + 1, dtype=bool)
 
         # Pad if necessary
         if len(sequence) < self.max_seq_len + 1:
             pad_length = self.max_seq_len + 1 - len(sequence)
-            sequence = np.pad(sequence, (0, pad_length), constant_values=0)
+            sequence = np.pad(sequence, (0, pad_length), constant_values=self.pad_token_id)
+            pad_mask[-pad_length:] = True
 
-        return sequence
+        return sequence, pad_mask
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """
@@ -239,11 +251,13 @@ class PreTokenizedDataset(Dataset):
         lang = self._sample_language()
 
         # Get sequence
-        sequence = self._get_random_sequence(lang)
+        sequence, pad_mask = self._get_random_sequence(lang)
 
         # Split into input and labels
         input_ids = torch.from_numpy(sequence[:-1].astype(np.int64))
         labels = torch.from_numpy(sequence[1:].astype(np.int64))
+        if pad_mask.any():
+            labels = labels.masked_fill(torch.from_numpy(pad_mask[1:]), -100)
 
         return {
             'input_ids': input_ids,

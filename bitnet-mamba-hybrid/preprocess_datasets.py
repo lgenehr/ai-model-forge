@@ -725,6 +725,8 @@ def merge_chunks_from_directory(
         "tokenizer": "gpt2",
         "dtype": "uint16" if dtype == np.uint16 else "uint32",
         "merged_from_chunks": len(chunk_files),
+        "eos_token_id": 50256,
+        "pad_token_id": 50256,
     }
 
     with open(metadata_file, 'w') as f:
@@ -946,6 +948,8 @@ def tokenize_and_save_dataset(
         "tokenizer": "gpt2",
         "dtype": "uint16",
         "empty_samples_skipped": empty_samples,
+        "eos_token_id": tokenizer.eos_token_id,
+        "pad_token_id": tokenizer.pad_token_id,
     }
 
     with open(metadata_file, 'w') as f:

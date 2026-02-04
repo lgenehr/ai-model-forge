@@ -29,6 +29,5 @@ python train_hybrid-mamba-bitnet.py \
     --output_dir "model" \
     --data_dir "data/tokenized" \
     --wandb \
-    --wandb_api_key "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" \
     --wandb_project "bitnet-mamba-hybrid" \
     --wandb_run_name "d1024-seq2048-run-pt-en-optimized"
