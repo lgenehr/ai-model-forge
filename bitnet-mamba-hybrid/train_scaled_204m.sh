@@ -124,7 +124,9 @@ fi
 
 # Check VRAM before starting
 echo "Checking GPU memory..."
-nvidia-smi --query-gpu=memory.free,memory.total --format=csv,noheader,nounits | while read free total; do
+nvidia-smi --query-gpu=memory.free,memory.total --format=csv,noheader,nounits | while IFS=',' read -r free total; do
+    free=$(echo "$free" | xargs)
+    total=$(echo "$total" | xargs)
     free_gb=$(echo "scale=1; $free / 1024" | bc)
     total_gb=$(echo "scale=1; $total / 1024" | bc)
     echo "GPU Memory: ${free_gb}GB free / ${total_gb}GB total"
@@ -167,10 +169,10 @@ python train_hybrid-mamba-bitnet.py \
     --max_seq_len 2048 \
     \
     `# === HYPERPARAMETERS (RECALIBRATED FOR 204M) ===` \
-    --lr 2e-4 \
+    --lr 8e-5 \
     --min_lr 5e-7 \
-    --warmup_steps 2000 \
-    --weight_decay 0.03 \
+    --warmup_steps 3000 \
+    --weight_decay 0.04 \
     --max_grad_norm 0.5 \
     --max_tokens 3000000000 \
     \

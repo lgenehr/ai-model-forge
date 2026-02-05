@@ -1239,6 +1239,9 @@ class Trainer:
                     else:
                         self.optimizer.step()
 
+                    # Compute gradient statistics BEFORE clearing (for monitoring)
+                    grad_stats = self._compute_gradient_stats()
+
                     self.optimizer.zero_grad(set_to_none=True)  # More efficient
 
                     # Update learning rate
@@ -1256,10 +1259,8 @@ class Trainer:
                         step_time = (datetime.now() - step_start_time).total_seconds()
                         tokens_per_sec = accumulated_tokens / step_time if step_time > 0 else 0
 
-                        avg_loss = accumulated_loss / self.train_config.log_interval
-
-                        # Compute gradient statistics for monitoring
-                        grad_stats = self._compute_gradient_stats()
+                        # FIX: Divide by total number of batches, not just optimizer steps
+                        avg_loss = accumulated_loss / (self.train_config.log_interval * self.train_config.gradient_accumulation_steps)
 
                         self.logger.info(
                             f"Step {self.global_step:>7} | "
