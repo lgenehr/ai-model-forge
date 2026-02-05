@@ -232,7 +232,7 @@ def print_optimization_status(status: Dict[str, Any], logger=None):
 @dataclass
 class ModelConfig:
     """Configuration for BitNet-Mamba Hybrid Model"""
-    vocab_size: int = 50304  # Padded to multiple of 64 for efficiency
+    vocab_size: int = 50257  # Padded to multiple of 64 for efficiency
     d_model: int = 768
     n_layers: int = 12
     d_state: int = 16  # SSM state expansion factor

@@ -167,12 +167,12 @@ python train_hybrid-mamba-bitnet.py \
     --max_seq_len 2048 \
     \
     `# === HYPERPARAMETERS (RECALIBRATED FOR 204M) ===` \
-    --lr 8e-5 \
+    --lr 2e-4 \
     --min_lr 5e-7 \
-    --warmup_steps 5000 \
-    --weight_decay 0.04 \
+    --warmup_steps 2000 \
+    --weight_decay 0.03 \
     --max_grad_norm 0.5 \
-    --max_tokens 4000000000 \
+    --max_tokens 3000000000 \
     \
     `# === DATA CONFIGURATION ===` \
     --data_dir "data/tokenized" \
