@@ -275,7 +275,7 @@ class TrainingConfig:
     learning_rate: float = 1e-4  # Lower LR for BitNet + Mamba (was 3e-4)
     min_lr: float = 1e-6  # Lower min LR (was 1e-5)
     weight_decay: float = 0.05  # Less aggressive decay (was 0.1)
-    max_grad_norm: float = 0.5  # Tighter clipping for SSM stability (was 1.0)
+    max_grad_norm: float = 2.0  # Relaxed clipping after fixing double RMSNorm (was 0.5)
 
     # Mixed precision
     use_amp: bool = True
@@ -373,8 +373,16 @@ class BitLinear(nn.Module):
     BitNet b1.58 Linear Layer
 
     Weights are quantized to {-1, 0, 1} during forward pass.
-    Uses RMSNorm for activation normalization.
+    Uses RMSNorm for activation normalization (can be disabled via norm_input).
     Straight-Through Estimator enables gradient flow.
+
+    Args:
+        in_features: Input dimension
+        out_features: Output dimension
+        bias: Whether to include bias
+        groups: Number of groups (unused, kept for compatibility)
+        norm_input: If True, apply RMSNorm before quantization. If False, skip
+                   normalization but keep the module for checkpoint compatibility.
     """
 
     def __init__(
@@ -382,12 +390,14 @@ class BitLinear(nn.Module):
         in_features: int,
         out_features: int,
         bias: bool = False,
-        groups: int = 1
+        groups: int = 1,
+        norm_input: bool = True
     ):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.groups = groups
+        self.norm_input = norm_input
 
         # Full precision weights (will be quantized during forward)
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
@@ -397,18 +407,24 @@ class BitLinear(nn.Module):
         else:
             self.register_parameter('bias', None)
 
-        # Input normalization
+        # Input normalization - ALWAYS defined for checkpoint compatibility
+        # Behavior controlled by self.norm_input flag in forward()
         self.input_norm = RMSNorm(in_features)
 
         # Initialize weights
         self._init_weights()
 
     def _init_weights(self):
+        # Kaiming uniform prevents ternary quantization collapse at initialization
         nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Normalize input
-        x_norm = self.input_norm(x)
+        # Conditionally normalize input based on norm_input flag
+        # This prevents double RMSNorm when used after MambaBlock pre-norm
+        if self.norm_input:
+            x_norm = self.input_norm(x)
+        else:
+            x_norm = x
 
         # Quantize weights to ternary
         weight_quant, scale = quantize_weights_ternary(self.weight)
@@ -422,7 +438,7 @@ class BitLinear(nn.Module):
         return output
 
     def extra_repr(self) -> str:
-        return f'in_features={self.in_features}, out_features={self.out_features}, bias={self.bias is not None}'
+        return f'in_features={self.in_features}, out_features={self.out_features}, bias={self.bias is not None}, norm_input={self.norm_input}'
 
 
 # =============================================================================
@@ -446,10 +462,15 @@ class MambaBlock(nn.Module):
         self.expand = config.expand
 
         # Define qual Linear usar (BitNet ou Padrão)
-        Linear = BitLinear if use_bitlinear else nn.Linear
+        self.use_bitlinear = use_bitlinear
 
         # 1. Projeção de Entrada (Usa BitNet para economizar VRAM/Compute)
-        self.in_proj = Linear(self.d_model, 2 * self.d_inner, bias=config.bias)
+        # IMPORTANT: norm_input=False prevents double RMSNorm (pre-norm + BitLinear internal norm)
+        # This fixes statistical collapse where RMSNorm(RMSNorm(x)) reduces variance excessively
+        if use_bitlinear:
+            self.in_proj = BitLinear(self.d_model, 2 * self.d_inner, bias=config.bias, norm_input=False)
+        else:
+            self.in_proj = nn.Linear(self.d_model, 2 * self.d_inner, bias=config.bias)
 
         # 2. Convolução 1D (Contexto local)
         self.conv1d = nn.Conv1d(
@@ -491,7 +512,11 @@ class MambaBlock(nn.Module):
         self.D = nn.Parameter(torch.ones(self.d_inner))
 
         # 5. Projeção de Saída (Usa BitNet)
-        self.out_proj = Linear(self.d_inner, self.d_model, bias=config.bias)
+        # IMPORTANT: norm_input=True here because out_proj receives SSM output (not pre-normed)
+        if use_bitlinear:
+            self.out_proj = BitLinear(self.d_inner, self.d_model, bias=config.bias, norm_input=True)
+        else:
+            self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=config.bias)
         self.norm = RMSNorm(self.d_model)
         self.dropout = nn.Dropout(config.dropout)
 

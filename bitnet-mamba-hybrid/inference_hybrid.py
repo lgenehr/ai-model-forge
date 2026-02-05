@@ -86,19 +86,31 @@ def quantize_weights_ternary(weight: torch.Tensor):
 
 
 class BitLinear(nn.Module):
-    """BitNet b1.58 Linear Layer"""
+    """
+    BitNet b1.58 Linear Layer
+
+    Args:
+        in_features: Input dimension
+        out_features: Output dimension
+        bias: Whether to include bias
+        groups: Number of groups (unused, kept for compatibility)
+        norm_input: If True, apply RMSNorm before quantization. If False, skip
+                   normalization but keep the module for checkpoint compatibility.
+    """
 
     def __init__(
         self,
         in_features: int,
         out_features: int,
         bias: bool = False,
-        groups: int = 1
+        groups: int = 1,
+        norm_input: bool = True
     ):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.groups = groups
+        self.norm_input = norm_input
 
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
 
@@ -107,6 +119,7 @@ class BitLinear(nn.Module):
         else:
             self.register_parameter('bias', None)
 
+        # Input normalization - ALWAYS defined for checkpoint compatibility
         self.input_norm = RMSNorm(in_features)
         self._init_weights()
 
@@ -114,7 +127,11 @@ class BitLinear(nn.Module):
         nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x_norm = self.input_norm(x)
+        # Conditionally normalize input based on norm_input flag
+        if self.norm_input:
+            x_norm = self.input_norm(x)
+        else:
+            x_norm = x
         weight_quant, scale = quantize_weights_ternary(self.weight)
         output = F.linear(x_norm, weight_quant, self.bias)
         output = output * scale
@@ -137,9 +154,13 @@ class MambaBlock(nn.Module):
         self.d_inner = config.d_inner
         self.expand = config.expand
 
-        Linear = BitLinear if use_bitlinear else nn.Linear
+        self.use_bitlinear = use_bitlinear
 
-        self.in_proj = Linear(self.d_model, 2 * self.d_inner, bias=config.bias)
+        # IMPORTANT: norm_input=False prevents double RMSNorm (pre-norm + BitLinear internal norm)
+        if use_bitlinear:
+            self.in_proj = BitLinear(self.d_model, 2 * self.d_inner, bias=config.bias, norm_input=False)
+        else:
+            self.in_proj = nn.Linear(self.d_model, 2 * self.d_inner, bias=config.bias)
 
         self.conv1d = nn.Conv1d(
             in_channels=self.d_inner,
@@ -169,7 +190,11 @@ class MambaBlock(nn.Module):
 
         self.A_log = nn.Parameter(torch.log(A))
         self.D = nn.Parameter(torch.ones(self.d_inner))
-        self.out_proj = Linear(self.d_inner, self.d_model, bias=config.bias)
+        # IMPORTANT: norm_input=True here because out_proj receives SSM output (not pre-normed)
+        if use_bitlinear:
+            self.out_proj = BitLinear(self.d_inner, self.d_model, bias=config.bias, norm_input=True)
+        else:
+            self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=config.bias)
         self.norm = RMSNorm(self.d_model)
         self.dropout = nn.Dropout(config.dropout)
 
