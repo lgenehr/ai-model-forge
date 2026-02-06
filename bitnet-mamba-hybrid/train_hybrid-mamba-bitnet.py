@@ -783,11 +783,13 @@ class Trainer:
         model: BitNetMambaLM,
         train_config: TrainingConfig,
         model_config: ModelConfig,
-        wandb_api_key: Optional[str] = None
+        wandb_api_key: Optional[str] = None,
+        weights_only_resume: bool = False,
     ):
         self.model = model
         self.train_config = train_config
         self.model_config = model_config
+        self.weights_only_resume = weights_only_resume
 
         # Setup device
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -824,7 +826,7 @@ class Trainer:
         self._setup_wandb(wandb_api_key)
 
         # Try to resume from checkpoint
-        self._try_resume()
+        self._try_resume(weights_only=self.weights_only_resume)
 
     def _create_optimizer(self) -> AdamW:
         """Create optimizer with weight decay for non-bias parameters"""
@@ -1032,21 +1034,67 @@ class Trainer:
         for param_group in self.optimizer.param_groups:
             param_group['lr'] = lr
 
-    def _try_resume(self):
-        """Try to resume from the latest checkpoint"""
+    def _try_resume(self, weights_only: bool = False):
+        """Try to resume from the latest checkpoint.
+
+        Args:
+            weights_only: When True, restore model weights and training
+                counters (global_step, total_tokens, best_loss) but skip
+                optimizer and scheduler state. This allows new hyperparameters
+                (LR, warmup, weight decay, grad clipping) to take effect for
+                a second training phase.
+        """
         checkpoint_dir = Path(self.train_config.checkpoint_dir)
         checkpoints = sorted(checkpoint_dir.glob("checkpoint_*.pt"))
 
         if checkpoints:
+            load_opt = not weights_only
+            load_sched = not weights_only
+
             # Try checkpoints from newest to oldest
             for checkpoint_path in reversed(checkpoints):
                 self.logger.info(f"Attempting to resume from checkpoint: {checkpoint_path}")
-                if self._load_checkpoint(checkpoint_path):
+                if weights_only:
+                    self.logger.info("Weights-only resume: optimizer and scheduler state will NOT be restored")
+                if self._load_checkpoint(checkpoint_path, load_opt=load_opt, load_sched=load_sched):
+                    # Re-initialize scheduler when not loading scheduler state
+                    if not load_sched:
+                        self._reinit_scheduler_after_resume()
                     return  # Successfully loaded
                 else:
                     self.logger.warning(f"Failed to load checkpoint: {checkpoint_path}")
 
             self.logger.warning("All checkpoints failed to load. Starting from scratch.")
+
+    def _reinit_scheduler_after_resume(self):
+        """Re-initialize the LR scheduler after a weights-only resume.
+
+        Sets optimizer LR to the configured learning_rate and creates a fresh
+        CosineAnnealingLR positioned at the correct phase based on the
+        restored global_step.
+        """
+        # Reset optimizer LR to the new configured value
+        for group in self.optimizer.param_groups:
+            group["lr"] = self.train_config.learning_rate
+
+        # Recreate scheduler with current config, positioned correctly
+        self.scheduler = CosineAnnealingLR(
+            self.optimizer,
+            T_max=self.train_config.max_steps - self.train_config.warmup_steps,
+            eta_min=self.train_config.min_lr,
+            last_epoch=(
+                self.global_step - self.train_config.warmup_steps - 1
+                if self.global_step >= self.train_config.warmup_steps
+                else -1
+            ),
+        )
+
+        self.logger.info(
+            f"Scheduler re-initialized: lr={self.train_config.learning_rate:.2e}, "
+            f"warmup_steps={self.train_config.warmup_steps}, "
+            f"global_step={self.global_step}, "
+            f"T_max={self.train_config.max_steps - self.train_config.warmup_steps}"
+        )
 
     def _save_checkpoint_atomic(self, checkpoint: dict, target_path: Path):
         """Save checkpoint atomically to prevent corruption from interrupts"""
@@ -1090,10 +1138,24 @@ class Trainer:
         for old_checkpoint in checkpoints[:-3]:
             old_checkpoint.unlink()
 
-    def _load_checkpoint(self, checkpoint_path: Path) -> bool:
+    def _load_checkpoint(
+        self,
+        checkpoint_path: Path,
+        load_opt: bool = True,
+        load_sched: bool = True,
+    ) -> bool:
         """Load training checkpoint
 
         Handles both regular and torch.compile() models by remapping state_dict keys.
+
+        Args:
+            checkpoint_path: Path to the checkpoint file
+            load_opt: Whether to restore optimizer state. When False, optimizer
+                keeps its freshly-initialized state so new hyperparameters
+                (LR, weight decay) take effect immediately.
+            load_sched: Whether to restore scheduler state. When False, the
+                scheduler is recreated from current TrainingConfig so a new
+                LR schedule takes effect.
 
         Returns:
             True if checkpoint was loaded successfully, False otherwise
@@ -1120,8 +1182,17 @@ class Trainer:
                 model_state = {k.replace('_orig_mod.', ''): v for k, v in model_state.items()}
 
             self.model.load_state_dict(model_state)
-            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+
+            if load_opt:
+                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            else:
+                self.logger.info("Skipping optimizer state restore (weights-only resume)")
+
+            if load_sched:
+                self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            else:
+                self.logger.info("Skipping scheduler state restore (weights-only resume)")
+
             self.global_step = checkpoint['global_step']
             self.total_tokens = checkpoint['total_tokens']
             self.best_loss = checkpoint['best_loss']
@@ -1248,14 +1319,14 @@ class Trainer:
 
                 # Gradient accumulation step
                 if batch_idx % self.train_config.gradient_accumulation_steps == 0:
-                    # Gradient clipping
-                    if self.train_config.use_amp and self.dtype == torch.float16:
-                        self.scaler.unscale_(self.optimizer)
-
-                    torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(),
-                        self.train_config.max_grad_norm
-                    )
+                    # Gradient clipping (works for both FP16 and BF16)
+                    if self.train_config.max_grad_norm is not None:
+                        if self.train_config.use_amp and self.dtype == torch.float16:
+                            self.scaler.unscale_(self.optimizer)
+                        torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(),
+                            self.train_config.max_grad_norm,
+                        )
 
                     # Optimizer step
                     if self.train_config.use_amp and self.dtype == torch.float16:
@@ -1440,6 +1511,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--no_amp", action="store_true", help="Disable automatic mixed precision")
     parser.add_argument("--skip_mamba_check", action="store_true", help="Skip Mamba optimization verification")
+    parser.add_argument("--weights_only", action="store_true",
+                        help="Resume only model weights and training counters from checkpoint, "
+                             "skipping optimizer and scheduler state. Use this for second-phase "
+                             "training with new hyperparameters (LR, warmup, weight decay).")
 
     # High throughput optimization arguments
     parser.add_argument("--compile", action="store_true",
@@ -1614,7 +1689,11 @@ def main():
     wandb_api_key = args.wandb_api_key or os.environ.get('WANDB_API_KEY')
 
     # Create trainer and start training
-    trainer = Trainer(model, train_config, model_config, wandb_api_key=wandb_api_key)
+    trainer = Trainer(
+        model, train_config, model_config,
+        wandb_api_key=wandb_api_key,
+        weights_only_resume=args.weights_only,
+    )
     trainer.train(dataloader)
 
 
