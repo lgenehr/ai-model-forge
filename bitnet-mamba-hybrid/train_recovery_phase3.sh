@@ -99,7 +99,7 @@ python train_hybrid-mamba-bitnet.py \
     --weight_decay 0.005 \
     --max_grad_norm 3.0 \
     --bitlinear_lr_scale 5.0 \
-    --weights_only \
+    #--weights_only \
     --max_tokens 4000000000 \
     \
     `# === DATA CONFIGURATION (UNCHANGED) ===` \
