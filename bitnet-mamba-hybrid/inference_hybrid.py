@@ -290,7 +290,8 @@ class MambaBlock(nn.Module):
         x: torch.Tensor,
         dt: torch.Tensor,
         B: torch.Tensor,
-        C: torch.Tensor
+        C: torch.Tensor,
+        save_state: bool = False
     ) -> torch.Tensor:
         """Full SSM computation for parallel processing"""
         batch_size, seq_len, d_inner = x.shape
@@ -319,6 +320,10 @@ class MambaBlock(nn.Module):
             h = A_bar * h + B_bar * x_t.expand(-1, -1, d_state)
             y_t = (h * C_t.expand(-1, d_inner, -1)).sum(dim=-1)
             outputs.append(y_t)
+
+        # Save final hidden state for autoregressive continuation
+        if save_state:
+            self._ssm_state = h
 
         return torch.stack(outputs, dim=1)
 
@@ -352,9 +357,13 @@ class MambaBlock(nn.Module):
             x_path = self.conv1d(conv_input)[:, :, -1:]
             x_path = x_path.transpose(1, 2)
         else:
+            x_path_pre_conv = x_path.transpose(1, 2)  # [B, D, L]
+            x_path = self.conv1d(x_path_pre_conv)[:, :, :seq_len]
             x_path = x_path.transpose(1, 2)
-            x_path = self.conv1d(x_path)[:, :, :seq_len]
-            x_path = x_path.transpose(1, 2)
+
+            # Save conv cache: last (d_conv - 1) pre-conv values for continuation
+            if use_cache:
+                self._conv_cache = x_path_pre_conv[:, :, -(self.d_conv - 1):]
 
         x_path = F.silu(x_path)
 
@@ -368,7 +377,7 @@ class MambaBlock(nn.Module):
             y = self.ssm_step(x_path.squeeze(1), dt.squeeze(1), B.squeeze(1), C.squeeze(1))
             y = y.unsqueeze(1)
         else:
-            y = self.ssm(x_path, dt, B, C)
+            y = self.ssm(x_path, dt, B, C, save_state=use_cache)
 
         # Skip connection and gate
         y = y + x_path * self.D
