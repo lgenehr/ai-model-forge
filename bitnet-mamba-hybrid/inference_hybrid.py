@@ -354,7 +354,11 @@ class MambaBlock(nn.Module):
             conv_input = torch.cat([self._conv_cache, x_path.transpose(1, 2)], dim=-1)
             self._conv_cache = conv_input[:, :, 1:]
 
-            x_path = self.conv1d(conv_input)[:, :, -1:]
+            # conv1d with padding=d_conv-1 adds symmetric padding, producing
+            # 2*d_conv-1 outputs for d_conv inputs. The causal output for the
+            # last input position is at index d_conv-1 (not -1, which uses
+            # right-side zero padding and gives wrong results).
+            x_path = self.conv1d(conv_input)[:, :, self.d_conv - 1:self.d_conv]
             x_path = x_path.transpose(1, 2)
         else:
             x_path_pre_conv = x_path.transpose(1, 2)  # [B, D, L]
