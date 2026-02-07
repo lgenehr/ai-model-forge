@@ -276,6 +276,7 @@ class TrainingConfig:
     min_lr: float = 1e-6  # Lower min LR (was 1e-5)
     weight_decay: float = 0.05  # Less aggressive decay (was 0.1)
     max_grad_norm: float = 2.0  # Relaxed clipping after fixing double RMSNorm (was 0.5)
+    bitlinear_lr_scale: float = 1.0  # LR multiplier for BitLinear params (STE needs higher LR)
 
     # Mixed precision
     use_amp: bool = True
@@ -801,12 +802,17 @@ class Trainer:
         # Optimizer
         self.optimizer = self._create_optimizer()
 
-        # Scheduler
+        # Scheduler — set all groups to base LR so CosineAnnealingLR tracks
+        # a single unscaled cosine curve; _set_lr() applies per-group scaling.
+        base_lr = train_config.learning_rate
+        for group in self.optimizer.param_groups:
+            group['lr'] = base_lr
         self.scheduler = CosineAnnealingLR(
             self.optimizer,
             T_max=train_config.max_steps - train_config.warmup_steps,
             eta_min=train_config.min_lr
         )
+        self._set_lr(base_lr)
 
         # Gradient scaler for mixed precision
         self.scaler = GradScaler('cuda', enabled=train_config.use_amp and self.dtype == torch.float16)
@@ -829,25 +835,81 @@ class Trainer:
         self._try_resume(weights_only=self.weights_only_resume)
 
     def _create_optimizer(self) -> AdamW:
-        """Create optimizer with weight decay for non-bias parameters"""
-        decay_params = []
-        no_decay_params = []
+        """Create optimizer with per-group learning rates.
+
+        Creates 4 parameter groups:
+        - bitlinear_decay: BitLinear weight params (in_proj, out_proj) → higher LR via lr_scale
+        - ssm_decay: SSM params (A_log, D, dt_proj, x_proj, conv1d) → base LR
+        - embedding_decay: embedding weight → base LR
+        - no_decay: all bias + norm params → base LR, no weight decay
+
+        BitLinear params get lr * bitlinear_lr_scale because the STE
+        (Straight-Through Estimator) for ternary quantization adds gradient
+        noise that requires a higher learning rate to overcome.
+        """
+        bitlinear_decay = []
+        ssm_decay = []
+        embedding_decay = []
+        no_decay = []
+
+        # Track data_ptr to avoid duplicating weight-tied params (embedding/lm_head)
+        seen_ptrs = set()
 
         for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                if 'bias' in name or 'norm' in name:
-                    no_decay_params.append(param)
-                else:
-                    decay_params.append(param)
+            if not param.requires_grad:
+                continue
+            ptr = param.data_ptr()
+            if ptr in seen_ptrs:
+                continue
+            seen_ptrs.add(ptr)
+
+            if 'bias' in name or 'norm' in name:
+                no_decay.append(param)
+            elif 'in_proj.weight' in name or 'out_proj.weight' in name:
+                bitlinear_decay.append(param)
+            elif 'embedding' in name or 'embed' in name:
+                embedding_decay.append(param)
+            else:
+                # SSM params: A_log, D, dt_proj, x_proj, conv1d, etc.
+                ssm_decay.append(param)
+
+        lr = self.train_config.learning_rate
+        bl_scale = self.train_config.bitlinear_lr_scale
 
         optimizer_groups = [
-            {'params': decay_params, 'weight_decay': self.train_config.weight_decay},
-            {'params': no_decay_params, 'weight_decay': 0.0}
+            {
+                'params': bitlinear_decay,
+                'weight_decay': self.train_config.weight_decay,
+                'lr': lr * bl_scale,
+                'lr_scale': bl_scale,
+                'group_name': 'bitlinear_decay',
+            },
+            {
+                'params': ssm_decay,
+                'weight_decay': self.train_config.weight_decay,
+                'lr': lr,
+                'lr_scale': 1.0,
+                'group_name': 'ssm_decay',
+            },
+            {
+                'params': embedding_decay,
+                'weight_decay': self.train_config.weight_decay,
+                'lr': lr,
+                'lr_scale': 1.0,
+                'group_name': 'embedding_decay',
+            },
+            {
+                'params': no_decay,
+                'weight_decay': 0.0,
+                'lr': lr,
+                'lr_scale': 1.0,
+                'group_name': 'no_decay',
+            },
         ]
 
         return AdamW(
             optimizer_groups,
-            lr=self.train_config.learning_rate,
+            lr=lr,
             betas=(0.9, 0.95),
             eps=1e-8
         )
@@ -954,12 +1016,24 @@ class Trainer:
             self.logger.info("Weights & Biases run finished")
 
     def _get_lr(self) -> float:
-        """Get current learning rate with warmup"""
+        """Get current base learning rate (unscaled) with warmup + cosine decay.
+
+        Uses closed-form computation so per-group LR scaling (_set_lr) does
+        not feed back into the next LR calculation.  The old recursive
+        CosineAnnealingLR read group['lr'] each step, but _set_lr() had
+        already multiplied it by lr_scale, causing exponential LR explosion.
+        """
         if self.global_step < self.train_config.warmup_steps:
             # Linear warmup
             return self.train_config.learning_rate * (self.global_step + 1) / self.train_config.warmup_steps
-        else:
-            return self.scheduler.get_last_lr()[0]
+
+        # Closed-form cosine annealing (no dependency on group['lr'])
+        T_max = self.train_config.max_steps - self.train_config.warmup_steps
+        if T_max <= 0:
+            return self.train_config.min_lr
+        progress = min(self.global_step - self.train_config.warmup_steps, T_max)
+        cosine = math.cos(math.pi * progress / T_max)
+        return self.train_config.min_lr + (self.train_config.learning_rate - self.train_config.min_lr) * (1 + cosine) / 2
 
     def _compute_gradient_stats(self) -> Dict[str, float]:
         """
@@ -1030,9 +1104,9 @@ class Trainer:
         return warnings
 
     def _set_lr(self, lr: float):
-        """Set learning rate for all parameter groups"""
+        """Set learning rate for all parameter groups, applying per-group scaling"""
         for param_group in self.optimizer.param_groups:
-            param_group['lr'] = lr
+            param_group['lr'] = lr * param_group.get('lr_scale', 1.0)
 
     def _try_resume(self, weights_only: bool = False):
         """Try to resume from the latest checkpoint.
@@ -1067,30 +1141,19 @@ class Trainer:
             self.logger.warning("All checkpoints failed to load. Starting from scratch.")
 
     def _reinit_scheduler_after_resume(self):
-        """Re-initialize the LR scheduler after a weights-only resume.
+        """Apply correct LR after a weights-only resume.
 
-        Sets optimizer LR to the configured learning_rate and creates a fresh
-        CosineAnnealingLR positioned at the correct phase based on the
-        restored global_step.
+        With closed-form cosine LR, no scheduler re-creation is needed —
+        _get_lr() computes the right value for any global_step.
         """
-        # Reset optimizer LR to the new configured value
-        for group in self.optimizer.param_groups:
-            group["lr"] = self.train_config.learning_rate
+        current_lr = self._get_lr()
+        self._set_lr(current_lr)
 
-        # Recreate scheduler with current config, positioned correctly
-        self.scheduler = CosineAnnealingLR(
-            self.optimizer,
-            T_max=self.train_config.max_steps - self.train_config.warmup_steps,
-            eta_min=self.train_config.min_lr,
-            last_epoch=(
-                self.global_step - self.train_config.warmup_steps - 1
-                if self.global_step >= self.train_config.warmup_steps
-                else -1
-            ),
-        )
-
+        bl_scale = self.train_config.bitlinear_lr_scale
         self.logger.info(
-            f"Scheduler re-initialized: lr={self.train_config.learning_rate:.2e}, "
+            f"LR re-initialized: base_lr={current_lr:.2e}, "
+            f"bitlinear_lr_scale={bl_scale:.1f}, "
+            f"effective_bitlinear_lr={current_lr * bl_scale:.2e}, "
             f"warmup_steps={self.train_config.warmup_steps}, "
             f"global_step={self.global_step}, "
             f"T_max={self.train_config.max_steps - self.train_config.warmup_steps}"
@@ -1184,7 +1247,13 @@ class Trainer:
             self.model.load_state_dict(model_state)
 
             if load_opt:
-                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                try:
+                    self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                except (ValueError, KeyError) as e:
+                    self.logger.warning(
+                        f"Could not restore optimizer state (param group mismatch): {e}. "
+                        f"Continuing with fresh optimizer state."
+                    )
             else:
                 self.logger.info("Skipping optimizer state restore (weights-only resume)")
 
@@ -1276,6 +1345,8 @@ class Trainer:
         self.logger.info(f"Effective batch size: {self.train_config.batch_size * self.train_config.gradient_accumulation_steps}")
         self.logger.info(f"Device: {self.device}")
         self.logger.info(f"Dtype: {self.dtype}")
+        bl_scale = self.train_config.bitlinear_lr_scale
+        self.logger.info(f"BitLinear LR scale: {bl_scale:.1f}x (effective LR: {self.train_config.learning_rate * bl_scale:.2e})")
         self.logger.info(f"Num workers: {self.train_config.num_workers}")
         self.logger.info(f"Pin memory: {self.train_config.pin_memory}")
         self.logger.info("")
@@ -1340,12 +1411,9 @@ class Trainer:
 
                     self.optimizer.zero_grad(set_to_none=True)  # More efficient
 
-                    # Update learning rate
+                    # Update learning rate (closed-form, no scheduler.step())
                     current_lr = self._get_lr()
                     self._set_lr(current_lr)
-
-                    if self.global_step >= self.train_config.warmup_steps:
-                        self.scheduler.step()
 
                     self.global_step += 1
                     self.total_tokens += accumulated_tokens
@@ -1387,6 +1455,7 @@ class Trainer:
                         wandb_metrics = {
                             'train/loss': avg_loss,
                             'train/learning_rate': current_lr,
+                            'train/bitlinear_lr': current_lr * self.train_config.bitlinear_lr_scale,
                             'train/tokens': self.total_tokens,
                             'train/tokens_per_sec': tokens_per_sec,
                             'train/epoch': self.total_tokens / self.train_config.max_tokens,
@@ -1493,6 +1562,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup_steps", type=int, default=2000, help="Warmup steps")
     parser.add_argument("--weight_decay", type=float, default=0.1, help="Weight decay")
     parser.add_argument("--max_grad_norm", type=float, default=0.5, help="Maximum gradient norm for clipping")
+    parser.add_argument("--bitlinear_lr_scale", type=float, default=1.0,
+                        help="LR multiplier for BitLinear params (STE needs higher LR to overcome gradient noise)")
 
     # Data arguments
     parser.add_argument("--data_dir", type=str, default="./data/tokenized",
@@ -1625,6 +1696,7 @@ def main():
         warmup_steps=args.warmup_steps,
         weight_decay=args.weight_decay,
         max_grad_norm=args.max_grad_norm,
+        bitlinear_lr_scale=args.bitlinear_lr_scale,
         use_amp=not args.no_amp,
         # Data settings
         data_dir=args.data_dir,
