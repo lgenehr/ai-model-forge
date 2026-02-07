@@ -10,6 +10,8 @@
 # Expected Memory Usage: ~12-14 GB (within 17GB budget)
 # Training Speed: ~10-20% slower due to gradient checkpointing (worth it!)
 
+cd "$(dirname -- "$0")/.."
+
 python train_hybrid-mamba-bitnet.py \
     --d_model 1024 \
     --n_layers 12 \

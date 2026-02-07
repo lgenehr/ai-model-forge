@@ -25,7 +25,7 @@
 set -e  # Exit on error
 
 # Change to script directory
-cd "$(dirname -- "$0")"
+cd "$(dirname -- "$0")/.."
 
 # Print configuration summary
 echo "============================================================"

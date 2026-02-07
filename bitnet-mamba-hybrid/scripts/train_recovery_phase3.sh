@@ -30,7 +30,7 @@
 
 set -e
 
-cd "$(dirname -- "$0")"
+cd "$(dirname -- "$0")/.."
 
 echo "============================================================"
 echo "BitNet-Mamba RECOVERY PHASE 3 - Per-Group Learning Rates"

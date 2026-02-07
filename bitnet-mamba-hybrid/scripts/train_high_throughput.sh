@@ -17,7 +17,7 @@
 #
 # If you get OOM errors, try reducing batch_size to 6
 
-cd "$(dirname -- "$0")"
+cd "$(dirname -- "$0")/.."
 
 python train_hybrid-mamba-bitnet.py \
     --d_model 1024 \

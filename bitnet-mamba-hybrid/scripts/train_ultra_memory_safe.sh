@@ -11,7 +11,9 @@
 # Expected Memory Usage: ~8-10 GB (very safe for 17GB GPU)
 # Training Speed: ~30% slower, but guaranteed to fit in memory
 
-python bitnet-mamba-hybrid/train_hybrid-mamba-bitnet.py \
+cd "$(dirname -- "$0")/.."
+
+python train_hybrid-mamba-bitnet.py \
     --d_model 1024 \
     --n_layers 12 \
     --d_state 16 \
@@ -27,8 +29,8 @@ python bitnet-mamba-hybrid/train_hybrid-mamba-bitnet.py \
     --weight_decay 0.1 \
     --en_ratio 0.5 \
     --pt_ratio 0.5 \
-    --output_dir "bitnet-mamba-hybrid/model" \
-    --data_dir "bitnet-mamba-hybrid/data/tokenized" \
+    --output_dir "model" \
+    --data_dir "data/tokenized" \
     --wandb \
     --wandb_api_key "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" \
     --wandb_project "bitnet-mamba-hybrid" \
