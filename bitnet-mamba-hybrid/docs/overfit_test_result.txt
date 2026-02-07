@@ -1,0 +1,56 @@
+================================================================================
+OVERFIT SANITY TEST - THE MOST CRITICAL TEST
+================================================================================
+
+Goal: Model must memorize 3 simple sentences
+Success: Loss < 0.5 after 500 epochs
+Failure: Architecture is broken
+
+Loading tokenizer...
+Tokenizing mini dataset...
+Dataset shape: torch.Size([15, 20])
+Sample tokens: [46, 39452, 346, 38251, 23781, 14187, 41200, 4490, 68, 13, 50256, 50256, 50256, 50256, 50256, 50256, 50256, 50256, 50256, 50256]
+
+Creating SMALL model for overfitting test...
+Model parameters: 14,559,744
+Device: cuda
+
+================================================================================
+TRAINING - Target: Loss < 0.5
+================================================================================
+
+
+🎉 SUCCESS at epoch 25!
+   Loss: 0.432336 < 0.5
+   Grad norm: 1.0219
+
+================================================================================
+TEST RESULTS
+================================================================================
+
+Best loss achieved: 0.432336
+Success threshold:  0.5
+
+✅ TEST PASSED - Architecture is FUNCTIONAL
+
+Conclusion:
+  - Model CAN learn (architecture works)
+  - Main training issues are likely:
+    1. Learning rate too low
+    2. Gradient clipping too aggressive
+    3. Weight decay too high
+    4. Numerical instability in SSM at scale
+
+Recommended action: RECOVER training with adjusted hyperparameters
+
+================================================================================
+
+Testing generation from memorized sequence...
+--------------------------------------------------------------------------------
+Prompt tokens: [46, 39452, 346, 38251, 23781]
+Prompt text: O Brasil é um
+
+Generated text: O Brasil é um país grande.<|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|>
+
+
+✅ ARCHITECTURE VALIDATED - PROCEED TO HYPERPARAMETER TUNING
