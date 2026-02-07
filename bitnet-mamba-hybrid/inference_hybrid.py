@@ -113,6 +113,8 @@ class BitLinear(nn.Module):
         self.norm_input = norm_input
 
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.register_buffer('weight_quant', None)
+        self.register_buffer('weight_scale', None)
 
         if bias:
             self.bias = nn.Parameter(torch.zeros(out_features))
@@ -126,12 +128,32 @@ class BitLinear(nn.Module):
     def _init_weights(self):
         nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
 
+    def freeze_for_inference(self):
+        """Pre-computes quantized weights to avoid overhead during generation."""
+        if self.weight_quant is not None:
+            return
+
+        with torch.no_grad():
+            w_quant, scale = quantize_weights_ternary(self.weight)
+            self.weight_quant = w_quant
+            self.weight_scale = scale
+            # Note: We keep self.weight for now to avoid breaking state_dict saving/loading
+            # but we could delete it to save memory: del self.weight
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Conditionally normalize input based on norm_input flag
         if self.norm_input:
             x_norm = self.input_norm(x)
         else:
             x_norm = x
+
+        # Fast inference path using pre-computed weights
+        if self.weight_quant is not None:
+            output = F.linear(x_norm, self.weight_quant, self.bias)
+            output = output * self.weight_scale
+            return output
+
+        # Regular training/slow inference path
         weight_quant, scale = quantize_weights_ternary(self.weight)
         output = F.linear(x_norm, weight_quant, self.bias)
         output = output * scale
@@ -201,6 +223,21 @@ class MambaBlock(nn.Module):
         # Cache for autoregressive generation
         self._conv_cache: Optional[torch.Tensor] = None
         self._ssm_state: Optional[torch.Tensor] = None
+        
+        # Pre-computed constants for inference
+        self.register_buffer('A_cached', None)
+
+    def freeze_for_inference(self):
+        """Pre-computes SSM parameters for efficiency."""
+        # Pre-compute A from A_log
+        A_log_clamped = self.A_log.float().clamp(min=-20.0, max=2.0)
+        self.A_cached = -torch.exp(A_log_clamped)
+
+        # Propagate to BitLinear sub-modules
+        if isinstance(self.in_proj, BitLinear):
+            self.in_proj.freeze_for_inference()
+        if isinstance(self.out_proj, BitLinear):
+            self.out_proj.freeze_for_inference()
 
     def reset_cache(self):
         """Reset the inference cache"""
@@ -219,8 +256,12 @@ class MambaBlock(nn.Module):
         d_state = self.config.d_state
 
         # STABILITY: Clamp A_log to prevent numerical issues (matches training)
-        A_log_clamped = self.A_log.float().clamp(min=-20.0, max=2.0)
-        A = -torch.exp(A_log_clamped)
+        if self.A_cached is not None:
+            A = self.A_cached.to(dtype=x.dtype)
+        else:
+            A_log_clamped = self.A_log.float().clamp(min=-20.0, max=2.0)
+            A = -torch.exp(A_log_clamped)
+
         dt = F.softplus(dt)
 
         # Initialize state if needed
@@ -256,8 +297,11 @@ class MambaBlock(nn.Module):
         d_state = self.config.d_state
 
         # STABILITY: Clamp A_log to prevent numerical issues (matches training)
-        A_log_clamped = self.A_log.float().clamp(min=-20.0, max=2.0)
-        A = -torch.exp(A_log_clamped)
+        if self.A_cached is not None:
+            A = self.A_cached.to(dtype=x.dtype)
+        else:
+            A_log_clamped = self.A_log.float().clamp(min=-20.0, max=2.0)
+            A = -torch.exp(A_log_clamped)
         dt = F.softplus(dt)
 
         h = torch.zeros(batch_size, d_inner, d_state, device=x.device, dtype=x.dtype)
@@ -372,6 +416,12 @@ class BitNetMambaLM(nn.Module):
         """Reset all layer caches"""
         for layer in self.layers:
             layer.reset_cache()
+            
+    def freeze_for_inference(self):
+        """Optimize model for inference by pre-computing constants."""
+        print("Freezing model for inference (pre-computing BitLinear weights and SSM parameters)...")
+        for layer in self.layers:
+            layer.freeze_for_inference()
 
     def forward(
         self,
@@ -660,6 +710,9 @@ def load_model(
 
     model.to(device)
     model.eval()
+    
+    # Pre-compute quantization and constants for fast inference
+    model.freeze_for_inference()
 
     # Create tokenizer
     tokenizer = TokenizerWrapper()
