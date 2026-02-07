@@ -131,10 +131,10 @@ nvidia-smi --query-gpu=memory.free,memory.total --format=csv,noheader,nounits | 
     total_gb=$(echo "scale=1; $total / 1024" | bc)
     echo "GPU Memory: ${free_gb}GB free / ${total_gb}GB total"
 
-    if (( $(echo "$free < 15000" | bc -l) )); then
+    if (( $(echo "$free < 14000" | bc -l) )); then
         echo ""
-        echo "WARNING: Less than 15 GB free VRAM detected!"
-        echo "This configuration requires ~15-17 GB."
+        echo "WARNING: Less than 14 GB free VRAM detected!"
+        echo "This configuration requires ~14-17 GB."
         echo "Consider closing other applications or using train_scaled_204m_safe.sh"
         echo ""
         read -p "Continue anyway? (y/n) " -n 1 -r
@@ -169,17 +169,18 @@ python train_hybrid-mamba-bitnet.py \
     --max_seq_len 2048 \
     \
     `# === HYPERPARAMETERS (RECALIBRATED FOR 204M) ===` \
-    --lr 8e-5 \
+    --lr 3e-05 \
     --min_lr 5e-7 \
-    --warmup_steps 3000 \
-    --weight_decay 0.04 \
-    --max_grad_norm 0.5 \
-    --max_tokens 3000000000 \
+    --warmup_steps 400 \
+    --weight_decay 0.03 \
+    --max_grad_norm 0.3 \
+    --weights_only \
+    --max_tokens 4000000000 \
     \
     `# === DATA CONFIGURATION ===` \
     --data_dir "data/tokenized" \
-    --en_ratio 0.5 \
-    --pt_ratio 0.5 \
+    --en_ratio 0.3 \
+    --pt_ratio 0.7 \
     --num_workers 4 \
     --prefetch_factor 2 \
     \
