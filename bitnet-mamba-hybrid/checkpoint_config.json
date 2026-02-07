@@ -1,0 +1,60 @@
+{
+  "model_config": {
+    "vocab_size": 50257,
+    "d_model": 1280,
+    "n_layers": 14,
+    "d_state": 16,
+    "d_conv": 4,
+    "expand": 2,
+    "dropout": 0.1,
+    "bias": false,
+    "max_seq_len": 2048,
+    "bitnet_groups": 1,
+    "use_gradient_checkpointing": true
+  },
+  "train_config": {
+    "batch_size": 4,
+    "gradient_accumulation_steps": 8,
+    "max_seq_len": 2048,
+    "max_tokens": 4000000000,
+    "max_steps": 61035,
+    "warmup_steps": 400,
+    "learning_rate": 3e-05,
+    "min_lr": 5e-07,
+    "weight_decay": 0.03,
+    "max_grad_norm": 0.3,
+    "use_amp": true,
+    "dtype": "bfloat16",
+    "log_interval": 10,
+    "eval_interval": 500,
+    "checkpoint_interval": 1000,
+    "en_ratio": 0.3,
+    "pt_ratio": 0.7,
+    "data_dir": "data/tokenized",
+    "output_dir": "model_204m",
+    "checkpoint_dir": "model_204m/checkpoints",
+    "log_file": "model_204m/training.log",
+    "csv_file": "model_204m/loss_history.csv",
+    "num_workers": 4,
+    "pin_memory": true,
+    "prefetch_factor": 2,
+    "use_wandb": true,
+    "wandb_project": "bitnet-mamba-hybrid",
+    "wandb_run_name": "scaled-204m-d1280-L14-20260206-112412",
+    "wandb_entity": null
+  },
+  "training_state": {
+    "global_step": 28438,
+    "total_tokens": 1863712768,
+    "best_loss": 1.1426578879356384
+  },
+  "health_check": {
+    "total_params": 268399360,
+    "nan_params": 0,
+    "inf_params": 0,
+    "issues": [
+      "\u26a0\ufe0f  WARNING: Gradient clipping (0.3) may be too aggressive",
+      "\u26a0\ufe0f  WARNING: Learning rate (3.00e-05) may be too low"
+    ]
+  }
+}
