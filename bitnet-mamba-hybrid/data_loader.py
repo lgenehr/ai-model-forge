@@ -100,7 +100,11 @@ class PreTokenizedDataset(Dataset):
     - Random sampling with language ratio control
     - Fixed-length sequence generation
     - Proper handling of document boundaries
+    - Train/val split support (last 0.5% reserved for validation)
     """
+
+    # Fraction of each dataset reserved for validation
+    VAL_FRACTION = 0.005  # 0.5%
 
     def __init__(
         self,
@@ -110,6 +114,7 @@ class PreTokenizedDataset(Dataset):
         pt_ratio: float = 0.5,
         seed: int = 42,
         epoch_tokens: Optional[int] = None,
+        split: str = "train",
     ):
         """
         Initialize the dataset.
@@ -121,12 +126,14 @@ class PreTokenizedDataset(Dataset):
             pt_ratio: Ratio of Portuguese samples (0.0-1.0)
             seed: Random seed for reproducibility
             epoch_tokens: Total tokens per epoch (for __len__ calculation)
+            split: "train" or "val" - determines which portion of data to use
         """
         self.data_dir = Path(data_dir)
         self.max_seq_len = max_seq_len
         self.en_ratio = en_ratio
         self.pt_ratio = pt_ratio
         self.seed = seed
+        self.split = split
 
         # Normalize ratios
         total_ratio = en_ratio + pt_ratio
@@ -143,24 +150,49 @@ class PreTokenizedDataset(Dataset):
 
         self._load_datasets()
 
+        # Compute split boundaries for each language
+        self.en_train_end = 0
+        self.en_val_start = 0
+        self.pt_train_end = 0
+        self.pt_val_start = 0
+
+        if self.en_tokens:
+            en_val_size = int(len(self.en_tokens) * self.VAL_FRACTION)
+            self.en_train_end = len(self.en_tokens) - en_val_size
+            self.en_val_start = self.en_train_end
+
+        if self.pt_tokens:
+            pt_val_size = int(len(self.pt_tokens) * self.VAL_FRACTION)
+            self.pt_train_end = len(self.pt_tokens) - pt_val_size
+            self.pt_val_start = self.pt_train_end
+
         # Calculate dataset length (number of possible sequences)
         self.total_tokens = 0
         if self.en_tokens:
-            self.total_tokens += len(self.en_tokens)
+            if split == "train":
+                self.total_tokens += self.en_train_end
+            else:
+                self.total_tokens += len(self.en_tokens) - self.en_val_start
         if self.pt_tokens:
-            self.total_tokens += len(self.pt_tokens)
+            if split == "train":
+                self.total_tokens += self.pt_train_end
+            else:
+                self.total_tokens += len(self.pt_tokens) - self.pt_val_start
 
         # Epoch tokens for length calculation
         if epoch_tokens:
             self._epoch_sequences = epoch_tokens // max_seq_len
         else:
-            # Default: use all available sequences
             self._epoch_sequences = self.total_tokens // max_seq_len
 
-        logger.info(f"Dataset initialized:")
-        logger.info(f"  Total tokens: {self.total_tokens:,}")
+        logger.info(f"Dataset initialized (split={split}):")
+        logger.info(f"  Total tokens in split: {self.total_tokens:,}")
         logger.info(f"  Sequences per epoch: {self._epoch_sequences:,}")
         logger.info(f"  EN/PT ratio: {self.en_ratio_norm:.2f}/{self.pt_ratio_norm:.2f}")
+        if self.en_tokens:
+            logger.info(f"  EN split: [0, {self.en_train_end:,}) train | [{self.en_val_start:,}, {len(self.en_tokens):,}) val")
+        if self.pt_tokens:
+            logger.info(f"  PT split: [0, {self.pt_train_end:,}) train | [{self.pt_val_start:,}, {len(self.pt_tokens):,}) val")
 
     def _load_datasets(self):
         """Load English and Portuguese token files"""
@@ -210,6 +242,10 @@ class PreTokenizedDataset(Dataset):
         """
         Get a random sequence of max_seq_len + 1 tokens.
 
+        Respects train/val split boundaries:
+        - train: samples from [0, train_end)
+        - val: samples from [val_start, total_len)
+
         Returns:
             Tuple of (sequence, valid_length) where valid_length is the number
             of real tokens (excluding padding). Padding positions should use
@@ -218,18 +254,28 @@ class PreTokenizedDataset(Dataset):
         tokens = self.en_tokens if lang == "en" else self.pt_tokens
 
         if tokens is None:
-            # Fallback to other language
             tokens = self.pt_tokens if lang == "en" else self.en_tokens
+            lang = "pt" if lang == "en" else "en"
 
-        # Random start position
-        max_start = max(0, len(tokens) - self.max_seq_len - 1)
-        start_idx = self.np_rng.randint(0, max_start + 1)
+        # Determine sampling range based on split
+        if self.split == "train":
+            range_start = 0
+            range_end = self.en_train_end if lang == "en" else self.pt_train_end
+        else:
+            range_start = self.en_val_start if lang == "en" else self.pt_val_start
+            range_end = len(tokens)
+
+        # Random start position within the split range
+        max_start = max(range_start, range_end - self.max_seq_len - 1)
+        start_idx = self.np_rng.randint(range_start, max_start + 1)
 
         # Get sequence (max_seq_len + 1 for input/label split)
-        sequence = tokens.get_chunk(start_idx, self.max_seq_len + 1)
+        # Clamp end to not exceed split boundary
+        end_idx = min(start_idx + self.max_seq_len + 1, range_end)
+        sequence = tokens.get_chunk(start_idx, end_idx - start_idx)
         valid_length = len(sequence)
 
-        # Pad if necessary (pad with 0 for input_ids, but we'll handle labels separately)
+        # Pad if necessary
         if len(sequence) < self.max_seq_len + 1:
             pad_length = self.max_seq_len + 1 - len(sequence)
             sequence = np.pad(sequence, (0, pad_length), constant_values=0)
@@ -321,6 +367,7 @@ def create_dataloader(
     seed: int = 42,
     epoch_tokens: Optional[int] = None,
     drop_last: bool = True,
+    split: str = "train",
 ) -> InfiniteDataLoader:
     """
     Create an efficient DataLoader for pre-tokenized data.
@@ -337,6 +384,7 @@ def create_dataloader(
         seed: Random seed
         epoch_tokens: Total tokens per epoch
         drop_last: Drop last incomplete batch
+        split: "train" or "val"
 
     Returns:
         InfiniteDataLoader instance
@@ -348,6 +396,7 @@ def create_dataloader(
         pt_ratio=pt_ratio,
         seed=seed,
         epoch_tokens=epoch_tokens,
+        split=split,
     )
 
     # Create DataLoader with optimizations

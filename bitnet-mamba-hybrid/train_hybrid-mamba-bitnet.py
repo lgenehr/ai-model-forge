@@ -62,7 +62,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.amp import autocast, GradScaler
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.checkpoint import checkpoint
 
 # ============================================================================
@@ -238,7 +237,7 @@ class ModelConfig:
     d_state: int = 16  # SSM state expansion factor
     d_conv: int = 4    # Local convolution width
     expand: int = 2    # Block expansion factor
-    dropout: float = 0.1
+    dropout: float = 0.0  # No dropout for pre-training models <1B
     bias: bool = False
     max_seq_len: int = 2048
 
@@ -257,26 +256,25 @@ class TrainingConfig:
     """
     Configuration for training hyperparameters.
 
-    IMPORTANT: These defaults are tuned for BitNet + Mamba stability:
-    - Lower learning rate (1e-4) due to BitNet's STE gradient noise
-    - Lower weight decay (0.05) to prevent fighting against noisy gradients
-    - Longer warmup (4000 steps) for gentler optimization ramp-up
-    - Conservative gradient clipping (0.5) for SSM stability
+    Defaults tuned based on literature:
+    - Mamba paper: LR=8e-4, BitNet paper: LR=1.5e-4 → 6e-4 hybrid
+    - Standard warmup (2000 steps), weight decay (0.1), grad clip (1.0)
+    - BitLinear LR scale 1.5x for STE gradient noise
     """
     # Data
     batch_size: int = 8
-    gradient_accumulation_steps: int = 4
+    gradient_accumulation_steps: int = 8  # Effective batch: 8*8*2048=131K tokens/step
     max_seq_len: int = 2048
 
-    # Training - TUNED FOR BITNET + MAMBA STABILITY
-    max_tokens: int = 4_000_000_000  # 4B tokens target
+    # Training - based on Mamba/BitNet literature
+    max_tokens: int = 8_000_000_000  # 8B tokens (~40x params for 204M)
     max_steps: Optional[int] = None  # Will be computed
-    warmup_steps: int = 4000  # Longer warmup for BitNet stability (was 2000)
-    learning_rate: float = 1e-4  # Lower LR for BitNet + Mamba (was 3e-4)
-    min_lr: float = 1e-6  # Lower min LR (was 1e-5)
-    weight_decay: float = 0.05  # Less aggressive decay (was 0.1)
-    max_grad_norm: float = 2.0  # Relaxed clipping after fixing double RMSNorm (was 0.5)
-    bitlinear_lr_scale: float = 1.0  # LR multiplier for BitLinear params (STE needs higher LR)
+    warmup_steps: int = 2000
+    learning_rate: float = 6e-4  # Mamba: 8e-4, BitNet: 1.5e-4, hybrid: 6e-4
+    min_lr: float = 6e-5  # 10% of peak LR
+    weight_decay: float = 0.1  # Standard for LLMs
+    max_grad_norm: float = 1.0  # Universal standard
+    bitlinear_lr_scale: float = 1.5  # BitLinear needs slightly higher LR for STE
 
     # Mixed precision
     use_amp: bool = True
@@ -287,9 +285,9 @@ class TrainingConfig:
     eval_interval: int = 500
     checkpoint_interval: int = 1000
 
-    # Data mixing (EN:PT ratio)
-    en_ratio: float = 0.5
-    pt_ratio: float = 0.5
+    # Data mixing (EN:PT ratio) - 70% Portuguese, 30% English
+    en_ratio: float = 0.3
+    pt_ratio: float = 0.7
 
     # Paths
     data_dir: str = "./data/tokenized"  # Pre-tokenized data directory
@@ -709,7 +707,7 @@ class BitNetMambaLM(nn.Module):
 # Data Pipeline (Efficient Memory-Mapped Loading)
 # =============================================================================
 
-def create_efficient_dataloader(train_config: TrainingConfig, seed: int = 42) -> InfiniteDataLoader:
+def create_efficient_dataloader(train_config: TrainingConfig, seed: int = 42, split: str = "train") -> InfiniteDataLoader:
     """
     Create an efficient dataloader using pre-tokenized memory-mapped data.
 
@@ -719,6 +717,7 @@ def create_efficient_dataloader(train_config: TrainingConfig, seed: int = 42) ->
     Args:
         train_config: Training configuration
         seed: Random seed
+        split: "train" or "val"
 
     Returns:
         InfiniteDataLoader instance
@@ -760,6 +759,7 @@ def create_efficient_dataloader(train_config: TrainingConfig, seed: int = 42) ->
         seed=seed,
         epoch_tokens=train_config.max_tokens,
         drop_last=True,
+        split=split,
     )
 
     return dataloader
@@ -802,25 +802,15 @@ class Trainer:
         # Optimizer
         self.optimizer = self._create_optimizer()
 
-        # Scheduler — set all groups to base LR so CosineAnnealingLR tracks
-        # a single unscaled cosine curve; _set_lr() applies per-group scaling.
-        base_lr = train_config.learning_rate
-        for group in self.optimizer.param_groups:
-            group['lr'] = base_lr
-        self.scheduler = CosineAnnealingLR(
-            self.optimizer,
-            T_max=train_config.max_steps - train_config.warmup_steps,
-            eta_min=train_config.min_lr
-        )
-        self._set_lr(base_lr)
-
         # Gradient scaler for mixed precision
         self.scaler = GradScaler('cuda', enabled=train_config.use_amp and self.dtype == torch.float16)
 
         # Training state
         self.global_step = 0
         self.total_tokens = 0
-        self.best_loss = float('inf')
+        self.best_loss = float('inf')  # Based on val_loss
+        self.last_val_loss = None
+        self.val_loss_history: List[float] = []  # For plateau detection
 
         # Setup paths
         self._setup_paths()
@@ -938,7 +928,7 @@ class Trainer:
         # Write header if file is empty
         if os.path.getsize(self.train_config.csv_file) == 0:
             self.csv_writer.writerow([
-                'step', 'loss', 'lr', 'tokens', 'tokens_per_sec', 'timestamp'
+                'step', 'loss', 'val_loss', 'lr', 'tokens', 'tokens_per_sec', 'timestamp'
             ])
             self.csv_file.flush()
 
@@ -1114,7 +1104,7 @@ class Trainer:
         Args:
             weights_only: When True, restore model weights and training
                 counters (global_step, total_tokens, best_loss) but skip
-                optimizer and scheduler state. This allows new hyperparameters
+                optimizer state. This allows new hyperparameters
                 (LR, warmup, weight decay, grad clipping) to take effect for
                 a second training phase.
         """
@@ -1123,16 +1113,14 @@ class Trainer:
 
         if checkpoints:
             load_opt = not weights_only
-            load_sched = not weights_only
 
             # Try checkpoints from newest to oldest
             for checkpoint_path in reversed(checkpoints):
                 self.logger.info(f"Attempting to resume from checkpoint: {checkpoint_path}")
                 if weights_only:
-                    self.logger.info("Weights-only resume: optimizer and scheduler state will NOT be restored")
-                if self._load_checkpoint(checkpoint_path, load_opt=load_opt, load_sched=load_sched):
-                    # Re-initialize scheduler when not loading scheduler state
-                    if not load_sched:
+                    self.logger.info("Weights-only resume: optimizer state will NOT be restored")
+                if self._load_checkpoint(checkpoint_path, load_opt=load_opt):
+                    if weights_only:
                         self._reinit_scheduler_after_resume()
                     return  # Successfully loaded
                 else:
@@ -1177,10 +1165,10 @@ class Trainer:
         checkpoint = {
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict(),
             'global_step': self.global_step,
             'total_tokens': self.total_tokens,
             'best_loss': self.best_loss,
+            'val_loss': getattr(self, 'last_val_loss', None),
             'model_config': asdict(self.model_config),
             'train_config': asdict(self.train_config)
         }
@@ -1216,9 +1204,7 @@ class Trainer:
             load_opt: Whether to restore optimizer state. When False, optimizer
                 keeps its freshly-initialized state so new hyperparameters
                 (LR, weight decay) take effect immediately.
-            load_sched: Whether to restore scheduler state. When False, the
-                scheduler is recreated from current TrainingConfig so a new
-                LR schedule takes effect.
+            load_sched: Kept for API compatibility, ignored (no scheduler).
 
         Returns:
             True if checkpoint was loaded successfully, False otherwise
@@ -1236,11 +1222,9 @@ class Trainer:
 
             # Remap keys if there's a mismatch
             if model_is_compiled and not checkpoint_is_compiled:
-                # Model is compiled but checkpoint is not - add _orig_mod. prefix
                 self.logger.info("Remapping checkpoint keys for compiled model...")
                 model_state = {'_orig_mod.' + k: v for k, v in model_state.items()}
             elif not model_is_compiled and checkpoint_is_compiled:
-                # Model is not compiled but checkpoint is - remove _orig_mod. prefix
                 self.logger.info("Remapping checkpoint keys for non-compiled model...")
                 model_state = {k.replace('_orig_mod.', ''): v for k, v in model_state.items()}
 
@@ -1257,14 +1241,9 @@ class Trainer:
             else:
                 self.logger.info("Skipping optimizer state restore (weights-only resume)")
 
-            if load_sched:
-                self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-            else:
-                self.logger.info("Skipping scheduler state restore (weights-only resume)")
-
             self.global_step = checkpoint['global_step']
             self.total_tokens = checkpoint['total_tokens']
-            self.best_loss = checkpoint['best_loss']
+            self.best_loss = checkpoint.get('best_loss', float('inf'))
 
             self.logger.info(f"Resumed from step {self.global_step}, tokens: {self.total_tokens:,}")
             return True
@@ -1292,10 +1271,10 @@ class Trainer:
         checkpoint = {
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict(),
             'global_step': self.global_step,
             'total_tokens': self.total_tokens,
             'best_loss': self.best_loss,
+            'val_loss': getattr(self, 'last_val_loss', None),
             'model_config': asdict(self.model_config),
             'train_config': asdict(self.train_config),
             'interrupted': True,
@@ -1317,6 +1296,137 @@ class Trainer:
         self.logger.info(f"Progress: Step {self.global_step:,}, Tokens {self.total_tokens:,}")
         self.logger.info("=" * 60)
 
+    def _create_val_dataloader(self) -> Optional[InfiniteDataLoader]:
+        """Create validation dataloader using the val split."""
+        if not DATA_LOADER_AVAILABLE:
+            return None
+        try:
+            val_loader = create_dataloader(
+                data_dir=self.train_config.data_dir,
+                batch_size=self.train_config.batch_size,
+                max_seq_len=self.train_config.max_seq_len,
+                en_ratio=self.train_config.en_ratio,
+                pt_ratio=self.train_config.pt_ratio,
+                num_workers=min(2, self.train_config.num_workers),
+                pin_memory=self.train_config.pin_memory,
+                prefetch_factor=self.train_config.prefetch_factor,
+                seed=self.train_config.warmup_steps,  # Different seed from train
+                split="val",
+            )
+            return val_loader
+        except Exception as e:
+            self.logger.warning(f"Could not create validation dataloader: {e}")
+            return None
+
+    @torch.no_grad()
+    def evaluate(self, val_dataloader: InfiniteDataLoader, num_batches: int = 50) -> float:
+        """Run evaluation on validation set.
+
+        Args:
+            val_dataloader: Validation dataloader
+            num_batches: Number of batches to evaluate (default 50 = ~819K tokens)
+
+        Returns:
+            Average validation loss
+        """
+        self.model.eval()
+        total_loss = 0.0
+        count = 0
+
+        for i, batch in enumerate(val_dataloader):
+            if i >= num_batches:
+                break
+            input_ids = batch['input_ids'].to(self.device, non_blocking=True)
+            labels = batch['labels'].to(self.device, non_blocking=True)
+
+            with autocast('cuda', dtype=self.dtype, enabled=self.train_config.use_amp):
+                outputs = self.model(input_ids, labels)
+                total_loss += outputs['loss'].item()
+                count += 1
+
+        self.model.train()
+        val_loss = total_loss / max(count, 1)
+        self.last_val_loss = val_loss
+        return val_loss
+
+    def _sanity_check(self, val_dataloader: Optional[InfiniteDataLoader]):
+        """Run sanity check at step 0 before training loop.
+
+        Verifies that initial loss is close to ln(vocab_size) ≈ 10.82.
+        Also runs an initial eval if val_dataloader is available.
+        """
+        self.logger.info("=" * 60)
+        self.logger.info("Running sanity check...")
+
+        # Single forward pass to check initial loss
+        self.model.eval()
+        with torch.no_grad():
+            # Create a dummy batch of random tokens
+            dummy_ids = torch.randint(
+                0, self.model_config.vocab_size,
+                (1, self.train_config.max_seq_len),
+                device=self.device
+            )
+            with autocast('cuda', dtype=self.dtype, enabled=self.train_config.use_amp):
+                outputs = self.model(dummy_ids, dummy_ids)
+                init_loss = outputs['loss'].item()
+
+        expected_loss = math.log(self.model_config.vocab_size)  # ~10.82
+        self.logger.info(f"Initial loss: {init_loss:.4f} (expected ~{expected_loss:.2f})")
+
+        if init_loss > 12.0 or init_loss < 9.0:
+            self.logger.warning(
+                f"Initial loss {init_loss:.4f} is outside expected range [9.0, 12.0]. "
+                f"Possible initialization problem!"
+            )
+        else:
+            self.logger.info("Initial loss is within expected range. Initialization OK.")
+
+        # Run initial validation
+        if val_dataloader is not None:
+            init_val_loss = self.evaluate(val_dataloader, num_batches=50)
+            self.logger.info(f"Initial val_loss: {init_val_loss:.4f}")
+            self.val_loss_history.append(init_val_loss)
+
+        self.model.train()
+        self.logger.info("Sanity check complete.")
+        self.logger.info("=" * 60)
+
+    def _check_plateau(self, val_loss: float) -> bool:
+        """Check if validation loss has plateaued.
+
+        Maintains a rolling window of the last 10 val_losses.
+        If the variation (max - min) is < 0.05 over 10 consecutive evals,
+        logs a WARNING.
+
+        Returns:
+            True if plateau detected
+        """
+        self.val_loss_history.append(val_loss)
+        window_size = 10  # 10 evals = 5000 steps at eval_interval=500
+        threshold = 0.05
+
+        if len(self.val_loss_history) < window_size:
+            return False
+
+        recent = self.val_loss_history[-window_size:]
+        variation = max(recent) - min(recent)
+
+        if variation < threshold:
+            self.logger.warning(
+                f"PLATEAU DETECTED: val_loss variation ({variation:.4f}) < {threshold} "
+                f"over last {window_size} evaluations "
+                f"(range: {min(recent):.4f} - {max(recent):.4f}). "
+                f"Consider adjusting learning rate or other hyperparameters."
+            )
+            if self.wandb_enabled and WANDB_AVAILABLE:
+                wandb.log({
+                    'alerts/plateau_detected': 1,
+                    'alerts/plateau_variation': variation,
+                }, step=self.global_step)
+            return True
+        return False
+
     def train(self, dataloader: InfiniteDataLoader):
         """
         Main training loop using efficient memory-mapped dataloader.
@@ -1335,6 +1445,13 @@ class Trainer:
         signal.signal(signal.SIGINT, _training_signal_handler)
         signal.signal(signal.SIGTERM, _training_signal_handler)
 
+        # Create validation dataloader
+        val_dataloader = self._create_val_dataloader()
+        if val_dataloader is not None:
+            self.logger.info("Validation dataloader created successfully")
+        else:
+            self.logger.warning("No validation dataloader - val_loss tracking disabled")
+
         self.model.train()
 
         self.logger.info("=" * 60)
@@ -1342,16 +1459,22 @@ class Trainer:
         self.logger.info(f"Model parameters: {self.model.get_num_params():,}")
         self.logger.info(f"Target tokens: {self.train_config.max_tokens:,}")
         self.logger.info(f"Max steps: {self.train_config.max_steps:,}")
-        self.logger.info(f"Effective batch size: {self.train_config.batch_size * self.train_config.gradient_accumulation_steps}")
+        eff_batch = self.train_config.batch_size * self.train_config.gradient_accumulation_steps
+        self.logger.info(f"Effective batch size: {eff_batch} ({eff_batch * self.train_config.max_seq_len:,} tokens/step)")
         self.logger.info(f"Device: {self.device}")
         self.logger.info(f"Dtype: {self.dtype}")
         bl_scale = self.train_config.bitlinear_lr_scale
         self.logger.info(f"BitLinear LR scale: {bl_scale:.1f}x (effective LR: {self.train_config.learning_rate * bl_scale:.2e})")
+        self.logger.info(f"Eval interval: {self.train_config.eval_interval} steps")
         self.logger.info(f"Num workers: {self.train_config.num_workers}")
         self.logger.info(f"Pin memory: {self.train_config.pin_memory}")
         self.logger.info("")
         self.logger.info("Press Ctrl+C to save checkpoint and stop training")
         self.logger.info("=" * 60)
+
+        # Run sanity check at step 0 (only for fresh training)
+        if self.global_step == 0:
+            self._sanity_check(val_dataloader)
 
         # Training metrics
         accumulated_loss = 0.0
@@ -1440,10 +1563,11 @@ class Trainer:
                         for warning in warnings:
                             self.logger.warning(warning)
 
-                        # Write to CSV
+                        # Write to CSV (val_loss is empty string if not yet evaluated)
                         self.csv_writer.writerow([
                             self.global_step,
                             avg_loss,
+                            self.last_val_loss if self.last_val_loss is not None else '',
                             current_lr,
                             self.total_tokens,
                             tokens_per_sec,
@@ -1466,17 +1590,37 @@ class Trainer:
                         }
                         self._log_to_wandb(wandb_metrics, step=self.global_step)
 
-                        # Track best loss
-                        if avg_loss < self.best_loss:
-                            self.best_loss = avg_loss
-                            self._log_to_wandb({'train/best_loss': self.best_loss}, step=self.global_step)
-
                         accumulated_loss = 0.0
                         step_start_time = datetime.now()
 
                     accumulated_tokens = 0
 
-                    # Checkpoint
+                    # Evaluation at eval_interval
+                    if self.global_step % self.train_config.eval_interval == 0 and val_dataloader is not None:
+                        val_loss = self.evaluate(val_dataloader, num_batches=50)
+                        self.logger.info(
+                            f"Step {self.global_step:>7} | val_loss: {val_loss:.4f} | "
+                            f"best_val_loss: {self.best_loss:.4f}"
+                        )
+
+                        # Log val_loss to wandb
+                        self._log_to_wandb({
+                            'val/loss': val_loss,
+                            'val/best_loss': self.best_loss,
+                        }, step=self.global_step)
+
+                        # Check plateau
+                        self._check_plateau(val_loss)
+
+                        # Track best model based on val_loss
+                        is_best = val_loss < self.best_loss
+                        if is_best:
+                            self.best_loss = val_loss
+                            self.logger.info(f"New best val_loss: {self.best_loss:.4f}")
+                            self._log_to_wandb({'val/best_loss': self.best_loss}, step=self.global_step)
+                            self._save_checkpoint(is_best=True)
+
+                    # Checkpoint at checkpoint_interval
                     if self.global_step % self.train_config.checkpoint_interval == 0:
                         self._save_checkpoint(is_best=False)
 
@@ -1510,7 +1654,13 @@ class Trainer:
             self._finish_wandb()
             return
 
-        # Normal completion - Final checkpoint and cleanup
+        # Normal completion - final eval and checkpoint
+        if val_dataloader is not None:
+            final_val_loss = self.evaluate(val_dataloader, num_batches=50)
+            self.logger.info(f"Final val_loss: {final_val_loss:.4f}")
+            if final_val_loss < self.best_loss:
+                self.best_loss = final_val_loss
+
         self._save_checkpoint(is_best=True)
         self.csv_file.close()
 
@@ -1518,7 +1668,7 @@ class Trainer:
         self._log_to_wandb({
             'final/total_steps': self.global_step,
             'final/total_tokens': self.total_tokens,
-            'final/best_loss': self.best_loss,
+            'final/best_val_loss': self.best_loss,
         }, step=self.global_step)
 
         # Finish wandb run
@@ -1528,7 +1678,7 @@ class Trainer:
         self.logger.info("Training Complete!")
         self.logger.info(f"Final step: {self.global_step}")
         self.logger.info(f"Total tokens: {self.total_tokens:,}")
-        self.logger.info(f"Best loss: {self.best_loss:.4f}")
+        self.logger.info(f"Best val_loss: {self.best_loss:.4f}")
         self.logger.info("=" * 60)
 
 
@@ -1548,28 +1698,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--d_state", type=int, default=16, help="SSM state dimension")
     parser.add_argument("--d_conv", type=int, default=4, help="Convolution kernel size")
     parser.add_argument("--expand", type=int, default=2, help="Block expansion factor")
-    parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate")
+    parser.add_argument("--dropout", type=float, default=0.0, help="Dropout rate (0.0 for pre-training <1B)")
     parser.add_argument("--gradient_checkpointing", action="store_true",
                         help="Enable gradient checkpointing to save memory (trades compute for memory)")
 
     # Training arguments
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
-    parser.add_argument("--grad_accum", type=int, default=4, help="Gradient accumulation steps")
+    parser.add_argument("--grad_accum", type=int, default=8, help="Gradient accumulation steps")
     parser.add_argument("--max_seq_len", type=int, default=2048, help="Maximum sequence length")
-    parser.add_argument("--max_tokens", type=int, default=4_000_000_000, help="Maximum tokens to train on")
-    parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
-    parser.add_argument("--min_lr", type=float, default=1e-6, help="Minimum learning rate")
+    parser.add_argument("--max_tokens", type=int, default=8_000_000_000, help="Maximum tokens to train on")
+    parser.add_argument("--lr", type=float, default=6e-4, help="Learning rate")
+    parser.add_argument("--min_lr", type=float, default=6e-5, help="Minimum learning rate (10% of peak)")
     parser.add_argument("--warmup_steps", type=int, default=2000, help="Warmup steps")
     parser.add_argument("--weight_decay", type=float, default=0.1, help="Weight decay")
-    parser.add_argument("--max_grad_norm", type=float, default=0.5, help="Maximum gradient norm for clipping")
-    parser.add_argument("--bitlinear_lr_scale", type=float, default=1.0,
+    parser.add_argument("--max_grad_norm", type=float, default=1.0, help="Maximum gradient norm for clipping")
+    parser.add_argument("--bitlinear_lr_scale", type=float, default=1.5,
                         help="LR multiplier for BitLinear params (STE needs higher LR to overcome gradient noise)")
 
     # Data arguments
     parser.add_argument("--data_dir", type=str, default="./data/tokenized",
                         help="Directory containing pre-tokenized data (run preprocess_datasets.py first)")
-    parser.add_argument("--en_ratio", type=float, default=0.5, help="English data ratio")
-    parser.add_argument("--pt_ratio", type=float, default=0.5, help="Portuguese data ratio")
+    parser.add_argument("--en_ratio", type=float, default=0.3, help="English data ratio")
+    parser.add_argument("--pt_ratio", type=float, default=0.7, help="Portuguese data ratio")
     parser.add_argument("--num_workers", type=int, default=4, help="Number of dataloader workers")
     parser.add_argument("--prefetch_factor", type=int, default=2, help="Dataloader prefetch factor")
     parser.add_argument("--no_pin_memory", action="store_true", help="Disable pinned memory for dataloader")
