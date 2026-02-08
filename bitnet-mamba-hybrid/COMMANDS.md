@@ -19,6 +19,9 @@ nohup python train_hybrid-mamba-bitnet.py \
     --output_dir model_204m \
     --data_dir data/tokenized \
     --weights_only \
+    --wandb \
+    --wandb_project "bitnet-mamba-hybrid" \
+    --wandb_run_name "recovery-phase4-bitlinear-$(date +%Y%m%d-%H%M%S)" \
     > model_204m/training_resume_phase4.log 2>&1 &
 ```
 
