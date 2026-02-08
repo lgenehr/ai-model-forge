@@ -245,7 +245,7 @@ class ModelConfig:
     bitnet_groups: int = 1  # Number of groups for BitLinear
 
     # Memory optimization
-    use_gradient_checkpointing: bool = False  # Trade compute for memory
+    use_gradient_checkpointing: bool = True  # Trade ~30% compute for ~60% less activation memory
 
     def __post_init__(self):
         self.d_inner = self.expand * self.d_model
@@ -1345,6 +1345,7 @@ class Trainer:
                 count += 1
 
         self.model.train()
+        torch.cuda.empty_cache()
         val_loss = total_loss / max(count, 1)
         self.last_val_loss = val_loss
         return val_loss
@@ -1389,6 +1390,7 @@ class Trainer:
             self.val_loss_history.append(init_val_loss)
 
         self.model.train()
+        torch.cuda.empty_cache()
         self.logger.info("Sanity check complete.")
         self.logger.info("=" * 60)
 
@@ -1699,8 +1701,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--d_conv", type=int, default=4, help="Convolution kernel size")
     parser.add_argument("--expand", type=int, default=2, help="Block expansion factor")
     parser.add_argument("--dropout", type=float, default=0.0, help="Dropout rate (0.0 for pre-training <1B)")
-    parser.add_argument("--gradient_checkpointing", action="store_true",
-                        help="Enable gradient checkpointing to save memory (trades compute for memory)")
+    parser.add_argument("--no_gradient_checkpointing", action="store_true",
+                        help="Disable gradient checkpointing (uses more memory but ~30%% faster)")
 
     # Training arguments
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
@@ -1802,8 +1804,8 @@ def main():
             print(f"  -> torch.compile: enabled (JIT optimization)")
 
         # Disable gradient checkpointing for speed (uses more memory but faster)
-        if args.gradient_checkpointing:
-            args.gradient_checkpointing = False
+        if not args.no_gradient_checkpointing:
+            args.no_gradient_checkpointing = True
             print(f"  -> gradient_checkpointing: disabled (speed over memory)")
 
         print("=" * 60)
@@ -1833,7 +1835,7 @@ def main():
         expand=args.expand,
         dropout=args.dropout,
         max_seq_len=args.max_seq_len,
-        use_gradient_checkpointing=args.gradient_checkpointing
+        use_gradient_checkpointing=not args.no_gradient_checkpointing
     )
 
     train_config = TrainingConfig(
