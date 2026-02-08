@@ -1,0 +1,11 @@
+# Requirements for preprocess_datasets.py
+
+# Core
+torch>=2.0.0
+numpy>=1.24.0
+
+# Tokenizer
+transformers>=4.30.0
+
+# Progress bar
+tqdm>=4.65.0

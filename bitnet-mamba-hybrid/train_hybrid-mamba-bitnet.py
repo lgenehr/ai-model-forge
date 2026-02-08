@@ -262,8 +262,8 @@ class TrainingConfig:
     - BitLinear LR scale 1.5x for STE gradient noise
     """
     # Data
-    batch_size: int = 8
-    gradient_accumulation_steps: int = 8  # Effective batch: 8*8*2048=131K tokens/step
+    batch_size: int = 4  # Smaller micro-batch for 16GB GPU
+    gradient_accumulation_steps: int = 16  # Effective batch: 4*16*2048=131K tokens/step
     max_seq_len: int = 2048
 
     # Training - based on Mamba/BitNet literature
@@ -1705,8 +1705,8 @@ def parse_args() -> argparse.Namespace:
                         help="Disable gradient checkpointing (uses more memory but ~30%% faster)")
 
     # Training arguments
-    parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
-    parser.add_argument("--grad_accum", type=int, default=8, help="Gradient accumulation steps")
+    parser.add_argument("--batch_size", type=int, default=4, help="Batch size per micro-batch")
+    parser.add_argument("--grad_accum", type=int, default=16, help="Gradient accumulation steps")
     parser.add_argument("--max_seq_len", type=int, default=2048, help="Maximum sequence length")
     parser.add_argument("--max_tokens", type=int, default=8_000_000_000, help="Maximum tokens to train on")
     parser.add_argument("--lr", type=float, default=6e-4, help="Learning rate")
