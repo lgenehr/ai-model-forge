@@ -1,0 +1,8 @@
+# Requirements for inference_hybrid.py
+
+# Core
+torch>=2.0.0
+
+# Optional: faster utilities + tokenizer
+einops>=0.7.0
+tiktoken>=0.5.0
