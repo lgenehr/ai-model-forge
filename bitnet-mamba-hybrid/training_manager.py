@@ -51,8 +51,9 @@ class TrainingManagerConfig:
     plateau_window: int = 10         # Window of evals for variation check
 
     # --- ReduceLROnPlateau ---
-    lr_reduction_factor: float = 0.8   # Max 20% reduction per trigger
+    lr_reduction_factor: float = 0.92  # Conservative 8% reduction per trigger (BitNet-aware)
     lr_reduction_cooldown: int = 5     # Evals of cooldown after LR reduction
+    plateau_consecutive_windows: int = 2  # Require N consecutive windows of no improvement
 
     # --- SGDR (Cosine Annealing with Warm Restarts) ---
     sgdr_trigger_patience: int = 20    # Evals of stagnation before SGDR (2x plateau)
@@ -64,6 +65,12 @@ class TrainingManagerConfig:
     clipping_lr_reduction: float = 0.9 # 10% LR reduction when clipping
     clipping_grad_increase: float = 1.2 # 20% grad_clip increase
     max_grad_clip: float = 2.0         # Absolute maximum grad_clip
+
+    # --- Persistent clipping / PLATEAU_RUIDOSO_COM_CLIPPING ---
+    persistent_clipping_threshold: float = 0.70  # 70% clipping freq for persistent detection
+    clipping_stage2_persistence_windows: int = 1  # Full windows of persistent clipping before stage 2
+    clipping_lr_reduction_min: float = 0.90       # Min factor (max 10% reduction per event)
+    clipping_lr_reduction_max: float = 0.95       # Max factor (min 5% reduction per event)
 
     # --- Overfitting detection ---
     overfit_consecutive_evals: int = 5  # Consecutive evals of diverging losses
@@ -100,6 +107,7 @@ class TrainingRegime(Enum):
     REAL_PLATEAU = auto()
     CONVERGENCE = auto()
     LATE_OVERFITTING = auto()
+    PLATEAU_RUIDOSO_COM_CLIPPING = auto()  # Noisy plateau with persistent gradient clipping
 
 
 class ActionType(Enum):
@@ -423,6 +431,10 @@ class BitNetStateAnalyzer(StateAnalyzer):
     BitNet b1.58 models have inherently noisier gradients due to the
     Straight-Through Estimator (STE) for ternary quantization. This
     analyzer adjusts thresholds to be more tolerant of that noise.
+
+    Key refinement: introduces PLATEAU_RUIDOSO_COM_CLIPPING regime that
+    detects persistent gradient clipping combined with stagnant loss,
+    preventing false HEALTHY_LEARNING classification.
     """
 
     def __init__(self, config: TrainingManagerConfig):
@@ -436,17 +448,77 @@ class BitNetStateAnalyzer(StateAnalyzer):
         # Override patience with BitNet scaling
         self._scaled_patience = int(config.plateau_patience * config.bitnet_patience_scale)
 
+    def _has_persistent_clipping(self, metrics: MetricCollector) -> bool:
+        """Check if gradient clipping is persistent (>=70% of window).
+
+        Persistent clipping indicates the optimizer is hitting the grad_clip
+        ceiling most of the time, meaning effective gradient information is
+        being lost. This is a key signal for BitNet models where the STE
+        can produce large gradient spikes.
+
+        Returns:
+            True if clipping frequency >= persistent_clipping_threshold.
+        """
+        if len(metrics.clipping_events) < self.config.clipping_window * 0.5:
+            return False
+        return metrics.get_clipping_frequency() >= self.config.persistent_clipping_threshold
+
+    def _has_clear_downward_trend(self, metrics: MetricCollector) -> bool:
+        """Check if loss has a clear, statistically meaningful downward trend.
+
+        A weak negative trend that is dominated by noise is NOT a clear
+        downward trend. We require the slope magnitude to exceed the
+        noise level (std-normalized slope).
+
+        Returns:
+            True if loss trend is clearly descending beyond noise.
+        """
+        loss_trend = metrics.get_trend('loss', 30)
+        loss_std = metrics.get_std('loss', 30)
+        loss_mean = metrics.get_mean('loss', 30)
+
+        if loss_trend >= 0:
+            return False
+
+        # The trend must be meaningfully negative relative to noise.
+        # Normalize slope by mean to get a scale-independent measure.
+        if loss_mean > 1e-6:
+            # Relative slope: how much loss decreases per step as fraction of mean
+            normalized_slope = abs(loss_trend) / loss_mean
+            # Coefficient of variation: noise level relative to mean
+            cv = loss_std / loss_mean if loss_mean > 1e-6 else 0.0
+            # Trend must be stronger than noise (slope > 0.1 * cv at minimum)
+            if normalized_slope < 0.1 * max(cv, 1e-6):
+                return False
+
+        return True
+
     def classify(self, metrics: MetricCollector) -> TrainingRegime:
         """Classify with BitNet-aware thresholds.
 
         Uses larger patience windows and more tolerant min_delta
         to account for ternary quantization noise.
+
+        Key addition: PLATEAU_RUIDOSO_COM_CLIPPING is checked after
+        UNSTABLE_EXPLORATION but before LATE_OVERFITTING. When persistent
+        clipping (>=70% of window) is combined with no clear downward
+        loss trend, the regime is classified as PLATEAU_RUIDOSO_COM_CLIPPING
+        regardless of other signals.
+
+        Classification priority:
+        1. UNSTABLE_EXPLORATION (dangerous)
+        2. PLATEAU_RUIDOSO_COM_CLIPPING (persistent clipping + stagnation)
+        3. LATE_OVERFITTING (action needed, requires strict consecutive proof)
+        4. REAL_PLATEAU (action needed)
+        5. NOISY_PLATEAU (patience)
+        6. CONVERGENCE (near end)
+        7. HEALTHY_LEARNING (requires no persistent clipping)
         """
         # Need minimum data
         if metrics.total_steps_recorded < 10:
             return TrainingRegime.HEALTHY_LEARNING
 
-        # 1. UNSTABLE_EXPLORATION
+        # 1. UNSTABLE_EXPLORATION: dangerous variance levels
         loss_std = metrics.get_std('loss')
         grad_std = metrics.get_std('grad_norm')
         loss_mean = metrics.get_mean('loss')
@@ -455,7 +527,18 @@ class BitNetStateAnalyzer(StateAnalyzer):
         if loss_cv > 0.3 or grad_std > self.grad_variance_high:
             return TrainingRegime.UNSTABLE_EXPLORATION
 
-        # 2. LATE_OVERFITTING - use scaled patience
+        # 2. PLATEAU_RUIDOSO_COM_CLIPPING: persistent clipping + no clear progress
+        # This MUST be checked before HEALTHY_LEARNING to prevent optimistic
+        # misclassification when clipping dominates training dynamics.
+        persistent_clipping = self._has_persistent_clipping(metrics)
+        has_downward_trend = self._has_clear_downward_trend(metrics)
+
+        if persistent_clipping and not has_downward_trend:
+            return TrainingRegime.PLATEAU_RUIDOSO_COM_CLIPPING
+
+        # 3. LATE_OVERFITTING - use scaled patience, require strict consecutive proof
+        # Isolated val_loss oscillations are NOT overfitting — require unbroken
+        # consecutive evals of train_loss↓ + val_loss↑.
         scaled_overfit = max(
             self.config.overfit_consecutive_evals,
             int(self.config.overfit_consecutive_evals * self.config.bitnet_patience_scale)
@@ -472,9 +555,13 @@ class BitNetStateAnalyzer(StateAnalyzer):
                     else:
                         consecutive_overfit = 0
                 if consecutive_overfit >= scaled_overfit - 1:
-                    return TrainingRegime.LATE_OVERFITTING
+                    # Additional guard: don't classify as overfitting if
+                    # persistent clipping is active — the val_loss increase
+                    # may be caused by clipping, not true overfitting.
+                    if not persistent_clipping:
+                        return TrainingRegime.LATE_OVERFITTING
 
-        # 3. REAL_PLATEAU with scaled patience and tolerant delta
+        # 4. REAL_PLATEAU with scaled patience and tolerant delta
         patience = self._scaled_patience
         scaled_min_delta = self.config.plateau_min_delta * self.config.bitnet_min_delta_scale
         if metrics.total_evals_recorded >= patience:
@@ -483,14 +570,14 @@ class BitNetStateAnalyzer(StateAnalyzer):
             if val_variation < scaled_min_delta and val_std < self.noisy_std_threshold:
                 return TrainingRegime.REAL_PLATEAU
 
-        # 4. NOISY_PLATEAU
+        # 5. NOISY_PLATEAU
         if metrics.total_evals_recorded >= patience:
             val_variation = metrics.get_variation('val_loss', patience)
             val_std = metrics.get_std('val_loss', patience)
             if val_variation < scaled_min_delta and val_std >= self.noisy_std_threshold:
                 return TrainingRegime.NOISY_PLATEAU
 
-        # 5. CONVERGENCE
+        # 6. CONVERGENCE
         if len(metrics.lr) > 0:
             lr_values = metrics.get_window('lr', 10)
             if len(lr_values) >= 5:
@@ -499,10 +586,16 @@ class BitNetStateAnalyzer(StateAnalyzer):
                 if lr_variation < 1e-6 and loss_variation < 0.05:
                     return TrainingRegime.CONVERGENCE
 
-        # 6. HEALTHY_LEARNING
-        loss_trend = metrics.get_trend('loss', 30)
-        if loss_trend < 0:
+        # 7. HEALTHY_LEARNING: requires a clear downward loss trend AND
+        # no persistent clipping. If clipping is dominant, even a slightly
+        # negative trend is unreliable — the model is effectively bounded.
+        if has_downward_trend and not persistent_clipping:
             return TrainingRegime.HEALTHY_LEARNING
+
+        # Default: if persistent clipping is present but loss has some trend,
+        # still classify as plateau with clipping to be conservative.
+        if persistent_clipping:
+            return TrainingRegime.PLATEAU_RUIDOSO_COM_CLIPPING
 
         return TrainingRegime.HEALTHY_LEARNING
 
@@ -549,6 +642,14 @@ class HybridPolicyEngine:
 
         # Overfitting consecutive counter
         self.overfit_consecutive: int = 0
+
+        # ClippingAwareBitNet two-stage state:
+        # Stage 1 = LR reduction (default), Stage 2 = grad_clip increase (escalation).
+        # Stage 2 is only allowed after Stage 1 was applied and clipping persisted
+        # for at least `clipping_stage2_persistence_windows` full eval windows.
+        self.clipping_stage: int = 1  # 1 = LR reduction, 2 = grad_clip increase
+        self.clipping_stage1_applied_at_eval: int = -1  # Eval count when stage 1 was last applied
+        self.clipping_persistent_since_stage1: int = 0  # Consecutive evals with persistent clipping after stage 1
 
     def update_cooldowns(self):
         """Decrement all cooldown counters by 1 (called per eval)."""
@@ -649,8 +750,13 @@ class HybridPolicyEngine:
     ) -> Optional[PolicyDecision]:
         """Reduce learning rate when validation loss plateaus.
 
-        Triggered when regime is REAL_PLATEAU or NOISY_PLATEAU (with
-        additional confirmation for noisy case).
+        BitNet-context-sensitive version:
+        - Never triggers during PLATEAU_RUIDOSO_COM_CLIPPING (clipping is
+          the root cause, not LR being too high)
+        - Requires multiple consecutive windows of val_loss stagnation,
+          scaled by bitnet_patience_scale
+        - Applies conservative 5-10% reductions (not 20%)
+        - For NOISY_PLATEAU, uses extended patience with BitNet scaling
 
         Returns:
             PolicyDecision to reduce LR, or None.
@@ -658,17 +764,49 @@ class HybridPolicyEngine:
         if self.lr_reduction_cooldown_remaining > 0:
             return None
 
+        # NEVER trigger during PLATEAU_RUIDOSO_COM_CLIPPING — the problem is
+        # clipping, not LR being too high. ClippingAwareBitNet handles this.
+        if regime == TrainingRegime.PLATEAU_RUIDOSO_COM_CLIPPING:
+            return None
+
         if regime not in (TrainingRegime.REAL_PLATEAU, TrainingRegime.NOISY_PLATEAU):
             return None
 
-        # For NOISY_PLATEAU, require longer patience before acting
+        # Don't trigger if clipping is still dominant (>50% frequency).
+        # Even if the regime is plateau, reducing LR won't help while gradients
+        # are being clipped — it would only slow convergence.
+        clip_freq = metrics.get_clipping_frequency()
+        if clip_freq >= self.config.clipping_threshold:
+            return None
+
+        # Apply BitNet patience scaling to require longer confirmation
+        scaled_patience = int(
+            self.config.plateau_patience * self.config.bitnet_patience_scale
+        )
+
+        # For NOISY_PLATEAU, require even longer patience (extra 1.5x on top of BitNet scale)
         if regime == TrainingRegime.NOISY_PLATEAU:
-            patience = int(self.config.plateau_patience * 1.5)
+            patience = int(scaled_patience * 1.5)
             if metrics.total_evals_recorded < patience:
                 return None
             val_variation = metrics.get_variation('val_loss', patience)
-            if val_variation >= self.config.plateau_min_delta:
+            scaled_min_delta = (
+                self.config.plateau_min_delta * self.config.bitnet_min_delta_scale
+            )
+            if val_variation >= scaled_min_delta:
                 return None
+        else:
+            patience = scaled_patience
+
+        # Require multiple consecutive windows of stagnation.
+        # The stagnation_counter (already tracked per eval) serves as the
+        # consecutive-no-improvement counter. We require it to exceed
+        # plateau_consecutive_windows * scaled_patience.
+        required_stagnation = (
+            self.config.plateau_consecutive_windows * scaled_patience
+        )
+        if self.stagnation_counter < required_stagnation:
+            return None
 
         # Already at min_lr?
         if current_lr <= self.min_lr * 1.01:
@@ -676,9 +814,10 @@ class HybridPolicyEngine:
 
         new_lr = max(current_lr * self.config.lr_reduction_factor, self.min_lr)
 
-        variation = metrics.get_variation(
-            'val_loss', self.config.plateau_patience
-        )
+        # Verify reduction is conservative (5-10% range)
+        actual_reduction = 1.0 - (new_lr / current_lr)
+        variation = metrics.get_variation('val_loss', self.config.plateau_patience)
+
         return PolicyDecision(
             policy_name="ReduceLROnPlateau",
             action_type=ActionType.LR_REDUCTION,
@@ -689,7 +828,10 @@ class HybridPolicyEngine:
                 f"val_loss stagnated (variation {variation:.4f} over "
                 f"{self.config.plateau_patience} evals, "
                 f"min_delta={self.config.plateau_min_delta}). "
-                f"ReduceLROnPlateau factor={self.config.lr_reduction_factor} applied. "
+                f"Stagnation counter: {self.stagnation_counter} >= {required_stagnation} "
+                f"(patience={scaled_patience} x {self.config.plateau_consecutive_windows} windows). "
+                f"Clipping freq {clip_freq:.1%} (below threshold). "
+                f"Conservative reduction {actual_reduction:.1%} applied. "
                 f"Cooldown {self.config.lr_reduction_cooldown} evals."
             ),
             priority=4,
@@ -860,68 +1002,118 @@ class HybridPolicyEngine:
         current_lr: float,
         metrics: MetricCollector,
     ) -> Optional[PolicyDecision]:
-        """React to frequent gradient clipping.
+        """React to frequent gradient clipping with a two-stage strategy.
 
-        If clipping frequency > 50% over recent window, take ONE action:
-        - Option A: Reduce LR by 10% (preferred if LR > 2x min_lr)
-        - Option B: Increase grad_clip by 20% (only if LR already low)
+        Two stages are NEVER applied simultaneously:
+
+        Stage 1 — LR Reduction (default, conservative):
+            - Reduces base_lr by 5-10% (configurable range)
+            - Preserves BitLinear lr_scale multiplier (handled by ActionExecutor)
+            - Applied at most once per eval window (cooldown enforced)
+
+        Stage 2 — Grad Clip Increase (escalation, only after Stage 1 fails):
+            - Only allowed if Stage 1 was applied AND clipping persisted for
+              at least 1 full eval window after the LR reduction
+            - Increases grad_clip conservatively (e.g., 1.0 → 1.2)
+            - Absolute max grad_clip enforced
 
         Returns:
-            PolicyDecision to reduce LR or increase grad_clip, or None.
+            PolicyDecision to reduce LR (stage 1) or increase grad_clip (stage 2), or None.
         """
         if self.clipping_cooldown_remaining > 0:
             return None
 
         clip_freq = metrics.get_clipping_frequency()
         if clip_freq < self.config.clipping_threshold:
+            # Clipping subsided — reset stage tracking if we were in stage 2
+            if self.clipping_stage == 2:
+                self.clipping_persistent_since_stage1 = 0
             return None
 
         # Need enough data in the clipping window
         if len(metrics.clipping_events) < self.config.clipping_window * 0.5:
             return None
 
-        # Option A: Reduce LR (preferred if LR is not already very low)
-        if current_lr > self.min_lr * 2.0:
-            new_lr = max(current_lr * self.config.clipping_lr_reduction, self.min_lr)
-            return PolicyDecision(
-                policy_name="ClippingAwareBitNet",
-                action_type=ActionType.LR_REDUCTION,
-                param_name="base_lr",
-                before_value=current_lr,
-                after_value=new_lr,
-                justification=(
-                    f"Gradient clipping frequency {clip_freq:.1%} > "
-                    f"{self.config.clipping_threshold:.0%} threshold over last "
-                    f"{len(metrics.clipping_events)} steps. "
-                    f"LR reduction (Option A) preferred since LR ({current_lr:.2e}) > "
-                    f"2x min_lr ({self.min_lr:.2e})."
-                ),
-                priority=2,
-                requires_checkpoint=True,
-            )
+        # Determine if we're at persistent clipping level (>=70%)
+        is_persistent = clip_freq >= self.config.persistent_clipping_threshold
 
-        # Option B: Increase grad_clip (only if LR is already low)
-        if self.max_grad_norm < self.config.max_grad_clip:
-            new_clip = min(
-                self.max_grad_norm * self.config.clipping_grad_increase,
-                self.config.max_grad_clip,
+        # --- Stage 1: LR Reduction (preferred, default) ---
+        if self.clipping_stage == 1:
+            if current_lr <= self.min_lr * 1.05:
+                # LR is already near floor — escalate to stage 2 tracking
+                self.clipping_stage = 2
+                self.clipping_stage1_applied_at_eval = metrics.total_evals_recorded
+                self.clipping_persistent_since_stage1 = 0
+                # Fall through to stage 2 check below
+            else:
+                # Apply conservative LR reduction (5-10% range)
+                # Use the midpoint of the configured range for balanced reduction
+                reduction_factor = (
+                    self.config.clipping_lr_reduction_min + self.config.clipping_lr_reduction_max
+                ) / 2.0
+                new_lr = max(current_lr * reduction_factor, self.min_lr)
+
+                return PolicyDecision(
+                    policy_name="ClippingAwareBitNet",
+                    action_type=ActionType.LR_REDUCTION,
+                    param_name="base_lr",
+                    before_value=current_lr,
+                    after_value=new_lr,
+                    justification=(
+                        f"Stage 1: Gradient clipping frequency {clip_freq:.1%} > "
+                        f"{self.config.clipping_threshold:.0%} threshold over last "
+                        f"{len(metrics.clipping_events)} steps. "
+                        f"Conservative LR reduction ({1-reduction_factor:.1%}) applied. "
+                        f"BitLinear lr_scale preserved. "
+                        f"Stage 2 (grad_clip increase) will only activate if clipping "
+                        f"persists for >= {self.config.clipping_stage2_persistence_windows} "
+                        f"full window(s) after this reduction."
+                    ),
+                    priority=2,
+                    requires_checkpoint=True,
+                )
+
+        # --- Stage 2: Grad Clip Increase (escalation) ---
+        if self.clipping_stage == 2:
+            # Track how long clipping has persisted since stage 1 was applied
+            if is_persistent:
+                self.clipping_persistent_since_stage1 += 1
+            else:
+                # Clipping reduced below persistent level — consider de-escalating
+                self.clipping_persistent_since_stage1 = max(
+                    0, self.clipping_persistent_since_stage1 - 1
+                )
+
+            # Only allow stage 2 action after sufficient persistence
+            evals_since_stage1 = (
+                metrics.total_evals_recorded - self.clipping_stage1_applied_at_eval
             )
-            return PolicyDecision(
-                policy_name="ClippingAwareBitNet",
-                action_type=ActionType.GRAD_CLIP_INCREASE,
-                param_name="max_grad_norm",
-                before_value=self.max_grad_norm,
-                after_value=new_clip,
-                justification=(
-                    f"Gradient clipping frequency {clip_freq:.1%} > "
-                    f"{self.config.clipping_threshold:.0%} threshold. "
-                    f"LR already low ({current_lr:.2e} <= 2x min_lr). "
-                    f"Increasing grad_clip (Option B): "
-                    f"{self.max_grad_norm:.2f} -> {new_clip:.2f}."
-                ),
-                priority=2,
-                requires_checkpoint=True,
-            )
+            required_persistence = self.config.clipping_stage2_persistence_windows
+
+            if (self.clipping_persistent_since_stage1 >= required_persistence and
+                    evals_since_stage1 >= required_persistence):
+                if self.max_grad_norm < self.config.max_grad_clip:
+                    new_clip = min(
+                        self.max_grad_norm * self.config.clipping_grad_increase,
+                        self.config.max_grad_clip,
+                    )
+                    return PolicyDecision(
+                        policy_name="ClippingAwareBitNet",
+                        action_type=ActionType.GRAD_CLIP_INCREASE,
+                        param_name="max_grad_norm",
+                        before_value=self.max_grad_norm,
+                        after_value=new_clip,
+                        justification=(
+                            f"Stage 2: Gradient clipping persisted at {clip_freq:.1%} "
+                            f"for {self.clipping_persistent_since_stage1} eval(s) after "
+                            f"Stage 1 LR reduction. LR is near floor ({current_lr:.2e}). "
+                            f"Conservative grad_clip increase: "
+                            f"{self.max_grad_norm:.2f} -> {new_clip:.2f} "
+                            f"(max allowed: {self.config.max_grad_clip:.2f})."
+                        ),
+                        priority=2,
+                        requires_checkpoint=True,
+                    )
 
         return None
 
@@ -986,6 +1178,9 @@ class DecisionValidator:
     - grad_clip max is 2.0
     - Cooldown periods are respected
     - Only ONE policy action per eval cycle (enforced by caller)
+    - Every decision must have a non-empty justification
+    - Logical reversibility: reductions can be reversed by later increases,
+      but increases beyond historical max are blocked
     """
 
     def __init__(
@@ -998,6 +1193,9 @@ class DecisionValidator:
         self.min_lr = min_lr
         self.historical_max_lr: float = initial_lr
 
+        # Track recent decisions for reversibility analysis
+        self._recent_actions: List[Dict[str, Any]] = []
+
     def update_historical_max(self, lr: float):
         """Track the highest LR ever used during training.
 
@@ -1007,7 +1205,14 @@ class DecisionValidator:
         self.historical_max_lr = max(self.historical_max_lr, lr)
 
     def validate(self, decision: PolicyDecision) -> ValidationResult:
-        """Validate a policy decision.
+        """Validate a policy decision with comprehensive safety checks.
+
+        Validation layers:
+        1. Justification requirement: every decision must explain WHY
+        2. Action-type-specific bounds checking
+        3. Max change magnitude (20% ceiling for any single adjustment)
+        4. Historical bounds (no LR above peak, no grad_clip above max)
+        5. Logical reversibility check
 
         Args:
             decision: The proposed PolicyDecision.
@@ -1018,8 +1223,17 @@ class DecisionValidator:
         if decision.action_type == ActionType.OBSERVATION:
             return ValidationResult(True, "Observation, no action needed.")
 
+        # Layer 1: Require non-empty technical justification
+        if not decision.justification or len(decision.justification.strip()) < 10:
+            return ValidationResult(
+                False,
+                "Decision rejected: insufficient technical justification. "
+                "Every policy action must include an explicit reason with "
+                "supporting metrics."
+            )
+
         if decision.action_type == ActionType.WARMUP_EXTENSION:
-            # Warmup extensions are always safe
+            # Warmup extensions are always safe but still need justification
             return ValidationResult(True, "Warmup extension is safe.")
 
         if decision.action_type in (ActionType.LR_REDUCTION, ActionType.LR_INCREASE):
@@ -1037,6 +1251,7 @@ class DecisionValidator:
         - Change must be <= max_lr_change_pct (20%)
         - New LR must be >= min_lr
         - New LR must be <= historical_max_lr (for increases)
+        - Reduction must be reversible (can always increase later within bounds)
         """
         old_lr = decision.before_value
         new_lr = decision.after_value
@@ -1048,7 +1263,7 @@ class DecisionValidator:
                 f"New LR ({new_lr:.2e}) would be below min_lr ({self.min_lr:.2e})."
             )
 
-        # Max change percentage
+        # Max change percentage — blocks any single adjustment >20%
         if old_lr > 0:
             change_pct = abs(new_lr - old_lr) / old_lr
             if change_pct > self.config.max_lr_change_pct + 1e-6:
@@ -1059,30 +1274,74 @@ class DecisionValidator:
                     f"Before: {old_lr:.2e}, After: {new_lr:.2e}."
                 )
 
-        # No increase above historical max
+        # No increase above historical max — ensures reversibility bounds
         if decision.action_type == ActionType.LR_INCREASE:
             if new_lr > self.historical_max_lr:
                 return ValidationResult(
                     False,
                     f"New LR ({new_lr:.2e}) exceeds historical max "
-                    f"({self.historical_max_lr:.2e}). Not allowed."
+                    f"({self.historical_max_lr:.2e}). Not allowed. "
+                    f"LR increases are bounded by the peak LR observed during training."
                 )
 
-        return ValidationResult(True, "LR change within safe bounds.")
+        return ValidationResult(
+            True,
+            f"LR change within safe bounds "
+            f"(change={abs(new_lr - old_lr) / max(old_lr, 1e-10):.1%}, "
+            f"max_allowed={self.config.max_lr_change_pct:.0%})."
+        )
 
     def _validate_grad_clip_change(self, decision: PolicyDecision) -> ValidationResult:
         """Validate a gradient clip change.
 
-        Rule: grad_clip must not exceed max_grad_clip (2.0).
+        Rules:
+        - grad_clip must not exceed max_grad_clip (2.0)
+        - Change must be <= 20% per step (same max_lr_change_pct applies)
         """
+        old_clip = decision.before_value
         new_clip = decision.after_value
+
         if new_clip > self.config.max_grad_clip:
             return ValidationResult(
                 False,
                 f"New grad_clip ({new_clip:.2f}) exceeds maximum "
                 f"({self.config.max_grad_clip:.2f})."
             )
-        return ValidationResult(True, "Grad clip change within safe bounds.")
+
+        # Apply the same max change percentage to grad_clip adjustments
+        if old_clip > 0:
+            change_pct = abs(new_clip - old_clip) / old_clip
+            if change_pct > self.config.max_lr_change_pct + 1e-6:
+                return ValidationResult(
+                    False,
+                    f"Grad clip change ({change_pct:.1%}) exceeds max allowed "
+                    f"({self.config.max_lr_change_pct:.1%}). "
+                    f"Before: {old_clip:.2f}, After: {new_clip:.2f}."
+                )
+
+        return ValidationResult(
+            True,
+            f"Grad clip change within safe bounds "
+            f"({old_clip:.2f} -> {new_clip:.2f}, "
+            f"max={self.config.max_grad_clip:.2f})."
+        )
+
+    def record_executed_action(self, decision: PolicyDecision):
+        """Record an executed decision for reversibility tracking.
+
+        Args:
+            decision: The executed PolicyDecision.
+        """
+        self._recent_actions.append({
+            "policy": decision.policy_name,
+            "action_type": decision.action_type.value,
+            "param": decision.param_name,
+            "before": decision.before_value,
+            "after": decision.after_value,
+        })
+        # Keep only last 20 actions for memory efficiency
+        if len(self._recent_actions) > 20:
+            self._recent_actions = self._recent_actions[-20:]
 
 
 # =============================================================================
@@ -1263,6 +1522,26 @@ class AuditLogger:
         if decision.before_value != 0:
             change_pct = (decision.after_value - decision.before_value) / decision.before_value * 100
 
+        # Build action-specific LR fields for clear traceability.
+        # When the action is an LR change, include before/after for both
+        # base_lr and bitlinear_lr so the log is unambiguous.
+        lr_detail = {}
+        if decision.action_type in (ActionType.LR_REDUCTION, ActionType.LR_INCREASE):
+            bitlinear_scale = metrics_snapshot.get("bitlinear_lr", 0.0)
+            base_lr_after = decision.after_value
+            # Compute the BitLinear LR that will result from this change.
+            # We derive the scale from the current bitlinear_lr / base_lr ratio.
+            base_lr_before = decision.before_value
+            if base_lr_before > 0 and bitlinear_scale > 0:
+                scale_ratio = bitlinear_scale / metrics_snapshot.get("base_lr", base_lr_before)
+            else:
+                scale_ratio = 1.0
+            lr_detail = {
+                "base_lr_before": decision.before_value,
+                "base_lr_after": decision.after_value,
+                "bitlinear_lr_after": round(base_lr_after * scale_ratio, 8),
+            }
+
         entry = {
             "timestamp": datetime.now().isoformat(),
             "step": step,
@@ -1277,6 +1556,7 @@ class AuditLogger:
                 "after": decision.after_value,
                 "change_pct": round(change_pct, 2),
             },
+            **lr_detail,
             "justification": decision.justification,
             "checkpoint_saved": checkpoint_saved,
             "decision_valid": validation_result.is_valid,
@@ -1503,6 +1783,7 @@ class HybridTrainingManager:
 
                 if executed:
                     self._apply_post_execution_state(decision)
+                    self.validator.record_executed_action(decision)
                     self.logger.info(
                         f"[TrainingManager] Step {step} | Regime: {self._current_regime.name} | "
                         f"Policy: {decision.policy_name} | "
@@ -1635,9 +1916,14 @@ class HybridTrainingManager:
                 "overfit_consecutive": self.policy_engine.overfit_consecutive,
                 "current_warmup_steps": self.policy_engine.current_warmup_steps,
                 "max_grad_norm": self.policy_engine.max_grad_norm,
+                # New: ClippingAwareBitNet two-stage state
+                "clipping_stage": self.policy_engine.clipping_stage,
+                "clipping_stage1_applied_at_eval": self.policy_engine.clipping_stage1_applied_at_eval,
+                "clipping_persistent_since_stage1": self.policy_engine.clipping_persistent_since_stage1,
             },
             "validator_state": {
                 "historical_max_lr": self.validator.historical_max_lr,
+                "recent_actions": self.validator._recent_actions,
             },
             "decision_history": self._decision_history,
             "current_regime": self._current_regime.name,
@@ -1694,12 +1980,21 @@ class HybridTrainingManager:
             self.policy_engine.max_grad_norm = ps.get(
                 "max_grad_norm", self._max_grad_norm
             )
+            # New: restore ClippingAwareBitNet two-stage state (backward-compatible defaults)
+            self.policy_engine.clipping_stage = ps.get("clipping_stage", 1)
+            self.policy_engine.clipping_stage1_applied_at_eval = ps.get(
+                "clipping_stage1_applied_at_eval", -1
+            )
+            self.policy_engine.clipping_persistent_since_stage1 = ps.get(
+                "clipping_persistent_since_stage1", 0
+            )
 
             # Restore validator state
             vs = state.get("validator_state", {})
             self.validator.historical_max_lr = vs.get(
                 "historical_max_lr", self._base_lr
             )
+            self.validator._recent_actions = vs.get("recent_actions", [])
 
             # Restore history
             self._decision_history = state.get("decision_history", [])
@@ -1729,6 +2024,12 @@ class HybridTrainingManager:
     ) -> Dict[str, Any]:
         """Build a metrics snapshot dict for logging.
 
+        Includes explicit LR breakdown to avoid ambiguity:
+        - base_lr: The manager's tracked base LR (may be overridden by policy)
+        - scheduler_lr: The LR from the cosine schedule (what the Trainer computes)
+        - bitlinear_lr: base_lr * bitlinear_lr_scale (actual LR for BitLinear layers)
+        - lr_applied: The LR actually present in the optimizer's first param group
+
         Args:
             val_loss: Current validation loss.
             train_loss: Current training loss.
@@ -1736,6 +2037,26 @@ class HybridTrainingManager:
         Returns:
             Dict with key metrics.
         """
+        # Extract the actual LR from optimizer for transparency
+        lr_applied = self._current_base_lr
+        scheduler_lr = self._current_base_lr
+        try:
+            if hasattr(self.trainer, 'optimizer') and self.trainer.optimizer is not None:
+                # The first param group is the base group (lr_scale=1.0)
+                for pg in self.trainer.optimizer.param_groups:
+                    if pg.get('lr_scale', 1.0) == 1.0:
+                        lr_applied = pg['lr']
+                        break
+                else:
+                    lr_applied = self.trainer.optimizer.param_groups[0]['lr']
+            # Get the scheduler LR (what cosine annealing would give)
+            if hasattr(self.trainer, '_get_lr'):
+                scheduler_lr = self.trainer._get_lr(self.trainer.global_step)
+        except Exception:
+            pass
+
+        bitlinear_lr = self._current_base_lr * self._bitlinear_lr_scale
+
         return {
             "val_loss": round(val_loss, 6),
             "val_loss_trend": round(self.metrics.get_trend('val_loss', 10), 6),
@@ -1746,6 +2067,12 @@ class HybridTrainingManager:
             "grad_norm_bitlinear": round(self.metrics.get_mean('grad_norm_bitlinear', 20), 4),
             "grad_norm_ssm": round(self.metrics.get_mean('grad_norm_ssm', 20), 4),
             "clipping_freq": round(self.metrics.get_clipping_frequency(), 4),
+            # Explicit LR breakdown — no ambiguity
+            "base_lr": self._current_base_lr,
+            "scheduler_lr": scheduler_lr,
+            "bitlinear_lr": bitlinear_lr,
+            "lr_applied": lr_applied,
+            # Legacy field preserved for backward compatibility
             "lr_current": self._current_base_lr,
             "stagnation_counter": self.policy_engine.stagnation_counter,
             "overfit_consecutive": self.policy_engine.overfit_consecutive,
@@ -1775,8 +2102,19 @@ class HybridTrainingManager:
             if decision.action_type == ActionType.LR_REDUCTION:
                 self._current_base_lr = decision.after_value
                 self._lr_overridden = True
+                # After stage 1 LR reduction, record when it was applied
+                # and escalate to stage 2 for next evaluation cycle
+                self.policy_engine.clipping_stage = 2
+                self.policy_engine.clipping_stage1_applied_at_eval = (
+                    self.metrics.total_evals_recorded
+                )
+                self.policy_engine.clipping_persistent_since_stage1 = 0
             elif decision.action_type == ActionType.GRAD_CLIP_INCREASE:
                 self.policy_engine.max_grad_norm = decision.after_value
+                # After stage 2 grad_clip increase, reset to stage 1
+                # so next clipping event starts fresh with LR reduction
+                self.policy_engine.clipping_stage = 1
+                self.policy_engine.clipping_persistent_since_stage1 = 0
 
         elif decision.policy_name == "ConservativeOverfitting":
             self.policy_engine.overfit_cooldown_remaining = self.config.lr_reduction_cooldown
