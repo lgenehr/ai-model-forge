@@ -137,7 +137,6 @@
         document.getElementById("stat-progress").textContent = data.progress_pct != null ? data.progress_pct.toFixed(1) : "--";
         document.getElementById("stat-lr").textContent = formatSci(data.lr_current);
         document.getElementById("stat-lr-bit").textContent = formatSci(data.lr_bitlinear);
-        document.getElementById("stat-loss").textContent = formatLoss(data.last_loss);
         document.getElementById("stat-val-loss").textContent = formatLoss(data.last_val_loss);
         document.getElementById("stat-prev-val-loss").textContent = formatLoss(data.previous_val_loss);
         document.getElementById("stat-last-step-time").textContent = formatTimestamp(data.last_step_time);
@@ -802,7 +801,7 @@
         if (decisions) {
             cachedDecisions = decisions;
             renderRegimeTimeline(decisions.regimes_timeline);
-            renderDecisions(decisions.decisions);
+            renderDecisions(decisions.events || decisions.decisions);
         }
 
         if (gradNorms) {
@@ -873,7 +872,7 @@
         const countEl = document.getElementById("decisions-count");
 
         if (!decisions || decisions.length === 0) {
-            container.innerHTML = '<div class="empty-state">No decisions recorded yet.</div>';
+            container.innerHTML = '<div class="empty-state">No training manager events recorded yet.</div>';
             countEl.textContent = "";
             return;
         }
@@ -901,8 +900,8 @@
         filtered = filtered.slice().reverse();
 
         if (filtered.length === 0) {
-            container.innerHTML = '<div class="empty-state">No decisions match the current filters.</div>';
-            countEl.textContent = `0 of ${decisions.length} decisions shown`;
+            container.innerHTML = '<div class="empty-state">No events match the current filters.</div>';
+            countEl.textContent = `0 of ${decisions.length} events shown`;
             return;
         }
 
@@ -949,7 +948,7 @@
         }
 
         container.innerHTML = html;
-        countEl.textContent = `Showing ${filtered.length} of ${decisions.length} decisions`;
+        countEl.textContent = `Showing ${filtered.length} of ${decisions.length} events`;
     }
 
     function formatActionVal(v) {
@@ -1084,7 +1083,7 @@
                 btn.classList.add("active");
                 currentPolicyFilter = btn.dataset.policy;
                 if (cachedDecisions) {
-                    renderDecisions(cachedDecisions.decisions);
+                    renderDecisions(cachedDecisions.events || cachedDecisions.decisions);
                 }
             });
         });
@@ -1095,7 +1094,7 @@
             clearTimeout(stepFilterTimeout);
             stepFilterTimeout = setTimeout(function () {
                 if (cachedDecisions) {
-                    renderDecisions(cachedDecisions.decisions);
+                    renderDecisions(cachedDecisions.events || cachedDecisions.decisions);
                 }
             }, 500);
         }

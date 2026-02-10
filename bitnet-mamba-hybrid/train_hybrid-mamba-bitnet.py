@@ -836,6 +836,8 @@ class Trainer:
 
         # Pre-initialize training_manager to None so _load_checkpoint can reference it
         self.training_manager = None
+        # Resume may happen before manager initialization; hold state temporarily.
+        self._pending_training_manager_state = None
 
         # Try to resume from checkpoint
         self._try_resume(weights_only=self.weights_only_resume)
@@ -846,6 +848,19 @@ class Trainer:
                 trainer=self,
                 config=TrainingManagerConfig(),
             )
+            if self._pending_training_manager_state is not None:
+                try:
+                    self.training_manager.load_state_dict(
+                        self._pending_training_manager_state
+                    )
+                    self.logger.info("Training manager state restored from checkpoint")
+                except Exception as e:
+                    self.logger.warning(
+                        f"Could not restore training manager state: {e}. "
+                        f"Continuing with fresh manager state."
+                    )
+                finally:
+                    self._pending_training_manager_state = None
             self.logger.info("HybridTrainingManager enabled")
         elif self.use_training_manager and not TRAINING_MANAGER_AVAILABLE:
             self.logger.warning(
@@ -1305,18 +1320,22 @@ class Trainer:
             self.best_loss = checkpoint.get('best_loss', float('inf'))
 
             # Restore training manager state if available
-            if (self.training_manager is not None
-                    and 'training_manager_state' in checkpoint):
-                try:
-                    self.training_manager.load_state_dict(
-                        checkpoint['training_manager_state']
-                    )
-                    self.logger.info("Training manager state restored from checkpoint")
-                except Exception as e:
-                    self.logger.warning(
-                        f"Could not restore training manager state: {e}. "
-                        f"Continuing with fresh manager state."
-                    )
+            if 'training_manager_state' in checkpoint:
+                if self.training_manager is not None:
+                    try:
+                        self.training_manager.load_state_dict(
+                            checkpoint['training_manager_state']
+                        )
+                        self.logger.info("Training manager state restored from checkpoint")
+                    except Exception as e:
+                        self.logger.warning(
+                            f"Could not restore training manager state: {e}. "
+                            f"Continuing with fresh manager state."
+                        )
+                else:
+                    # Manager is initialized after resume in __init__.
+                    # Persist state and restore once manager exists.
+                    self._pending_training_manager_state = checkpoint['training_manager_state']
 
             self.logger.info(f"Resumed from step {self.global_step}, tokens: {self.total_tokens:,}")
             return True

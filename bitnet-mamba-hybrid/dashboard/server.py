@@ -224,7 +224,6 @@ def get_status():
             "elapsed_time": "0s",
             "lr_current": 0,
             "lr_bitlinear": 0,
-            "last_loss": None,
             "last_val_loss": None,
             "previous_val_loss": None,
             "best_val_loss": None,
@@ -239,18 +238,22 @@ def get_status():
     last = _parse_csv_row(rows[-1])
     first = _parse_csv_row(rows[0])
 
-    # Find best val_loss and last known val_loss
+    # Find best val_loss and train loss history
     best_val = None
-    val_history: list[float] = []
+    loss_history: list[float] = []
     for r in rows:
         parsed = _parse_csv_row(r)
         vl = parsed.get("val_loss")
+        tl = parsed.get("loss")
         if vl is not None:
-            val_history.append(vl)
             if best_val is None or vl < best_val:
                 best_val = vl
-    last_val = val_history[-1] if val_history else None
-    previous_val = val_history[-2] if len(val_history) > 1 else None
+        if tl is not None:
+            loss_history.append(tl)
+
+    # Status cards use latest/previous train loss values.
+    last_loss = loss_history[-1] if loss_history else None
+    previous_loss = loss_history[-2] if len(loss_history) > 1 else None
 
     # Elapsed time
     elapsed_seconds = 0.0
@@ -285,9 +288,8 @@ def get_status():
         "elapsed_time": _format_elapsed(elapsed_seconds),
         "lr_current": lr_current,
         "lr_bitlinear": lr_bitlinear,
-        "last_loss": round(last.get("loss"), 6) if last.get("loss") is not None else None,
-        "last_val_loss": round(last_val, 6) if last_val is not None else None,
-        "previous_val_loss": round(previous_val, 6) if previous_val is not None else None,
+        "last_val_loss": round(last_loss, 6) if last_loss is not None else None,
+        "previous_val_loss": round(previous_loss, 6) if previous_loss is not None else None,
         "best_val_loss": round(best_val, 6) if best_val is not None else None,
         "last_step_time": last.get("timestamp"),
         "last_tokens_per_sec": round(last.get("tokens_per_sec"), 1) if last.get("tokens_per_sec") is not None else None,
@@ -340,7 +342,7 @@ def get_decisions(
     last_n: int = Query(default=50, ge=0),
     policy: str = Query(default="all"),
 ):
-    """Return training manager decisions from JSONL."""
+    """Return training manager events/decisions from JSONL."""
     entries = _read_jsonl_entries()
 
     # Build regimes timeline (transitions only)
@@ -368,14 +370,16 @@ def get_decisions(
 
     total = len(entries)
 
-    # Only entries that have an action (decisions, not mere observations)
+    # Entries that have an action (actual decisions), used by charts/markers.
     decisions = [e for e in entries if e.get("action") is not None]
     total_decisions = len(decisions)
 
     if last_n > 0:
+        entries = entries[-last_n:]
         decisions = decisions[-last_n:]
 
     return {
+        "events": entries,
         "decisions": decisions,
         "total": total,
         "total_decisions": total_decisions,
