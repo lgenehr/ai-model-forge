@@ -115,6 +115,15 @@ except ImportError:
     DATA_LOADER_AVAILABLE = False
     print("Warning: data_loader module not found, will use streaming fallback")
 
+# Optional: HybridTrainingManager for automated policy-based training management
+TRAINING_MANAGER_AVAILABLE = False
+try:
+    from training_manager import HybridTrainingManager, TrainingManagerConfig
+    TRAINING_MANAGER_AVAILABLE = True
+except ImportError:
+    HybridTrainingManager = None
+    TrainingManagerConfig = None
+
 # Optional: mamba-ssm for optimized CUDA kernels
 # pip install mamba-ssm (requires CUDA toolkit)
 MAMBA_SSM_AVAILABLE = False
@@ -786,11 +795,13 @@ class Trainer:
         model_config: ModelConfig,
         wandb_api_key: Optional[str] = None,
         weights_only_resume: bool = False,
+        use_training_manager: bool = False,
     ):
         self.model = model
         self.train_config = train_config
         self.model_config = model_config
         self.weights_only_resume = weights_only_resume
+        self.use_training_manager = use_training_manager
 
         # Setup device
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -823,6 +834,20 @@ class Trainer:
 
         # Try to resume from checkpoint
         self._try_resume(weights_only=self.weights_only_resume)
+
+        # Initialize HybridTrainingManager (after checkpoint resume)
+        self.training_manager = None
+        if self.use_training_manager and TRAINING_MANAGER_AVAILABLE:
+            self.training_manager = HybridTrainingManager(
+                trainer=self,
+                config=TrainingManagerConfig(),
+            )
+            self.logger.info("HybridTrainingManager enabled")
+        elif self.use_training_manager and not TRAINING_MANAGER_AVAILABLE:
+            self.logger.warning(
+                "Training manager requested but training_manager.py not found. "
+                "Continuing without it."
+            )
 
     def _create_optimizer(self) -> AdamW:
         """Create optimizer with per-group learning rates.
@@ -1173,6 +1198,13 @@ class Trainer:
             'train_config': asdict(self.train_config)
         }
 
+        # Save training manager state alongside checkpoint
+        if self.training_manager is not None:
+            try:
+                checkpoint['training_manager_state'] = self.training_manager.state_dict()
+            except Exception as e:
+                self.logger.warning(f"Failed to save training manager state: {e}")
+
         # Save regular checkpoint (atomic to prevent corruption)
         checkpoint_path = Path(self.train_config.checkpoint_dir) / f"checkpoint_{self.global_step:08d}.pt"
         self._save_checkpoint_atomic(checkpoint, checkpoint_path)
@@ -1244,6 +1276,20 @@ class Trainer:
             self.global_step = checkpoint['global_step']
             self.total_tokens = checkpoint['total_tokens']
             self.best_loss = checkpoint.get('best_loss', float('inf'))
+
+            # Restore training manager state if available
+            if (self.training_manager is not None
+                    and 'training_manager_state' in checkpoint):
+                try:
+                    self.training_manager.load_state_dict(
+                        checkpoint['training_manager_state']
+                    )
+                    self.logger.info("Training manager state restored from checkpoint")
+                except Exception as e:
+                    self.logger.warning(
+                        f"Could not restore training manager state: {e}. "
+                        f"Continuing with fresh manager state."
+                    )
 
             self.logger.info(f"Resumed from step {self.global_step}, tokens: {self.total_tokens:,}")
             return True
@@ -1543,6 +1589,23 @@ class Trainer:
                     self.global_step += 1
                     self.total_tokens += accumulated_tokens
 
+                    # Training Manager hook: on_step
+                    if self.training_manager is not None and self.global_step % self.train_config.log_interval == 0:
+                        try:
+                            step_time = (datetime.now() - step_start_time).total_seconds()
+                            _tps = accumulated_tokens / step_time if step_time > 0 else 0
+                            _avg = accumulated_loss / (self.train_config.log_interval * self.train_config.gradient_accumulation_steps)
+                            self.training_manager.on_step(
+                                step=self.global_step,
+                                loss=_avg,
+                                grad_norm=grad_stats['grad_norm_total'],
+                                grad_stats=grad_stats,
+                                lr=current_lr,
+                                tokens_per_sec=_tps,
+                            )
+                        except Exception as e:
+                            self.logger.warning(f"TrainingManager.on_step failed: {e}")
+
                     # Logging
                     if self.global_step % self.train_config.log_interval == 0:
                         step_time = (datetime.now() - step_start_time).total_seconds()
@@ -1613,6 +1676,19 @@ class Trainer:
 
                         # Check plateau
                         self._check_plateau(val_loss)
+
+                        # Training Manager hook: on_eval
+                        if self.training_manager is not None:
+                            try:
+                                _last_train = self.last_val_loss  # fallback
+                                # Use the most recent avg_loss from logging
+                                self.training_manager.on_eval(
+                                    step=self.global_step,
+                                    val_loss=val_loss,
+                                    train_loss=self.training_manager._last_train_loss,
+                                )
+                            except Exception as e:
+                                self.logger.warning(f"TrainingManager.on_eval failed: {e}")
 
                         # Track best model based on val_loss
                         is_best = val_loss < self.best_loss
@@ -1758,6 +1834,11 @@ def parse_args() -> argparse.Namespace:
                         help="Weights & Biases run name (auto-generated if not provided)")
     parser.add_argument("--wandb_entity", type=str, default=None,
                         help="Weights & Biases entity (username or team name)")
+
+    # Training Manager
+    parser.add_argument("--training_manager", action="store_true",
+                        help="Enable HybridTrainingManager for automated policy-based "
+                             "LR/grad_clip adjustments (ReduceLROnPlateau, SGDR, BitNet-aware)")
 
     return parser.parse_args()
 
@@ -1917,6 +1998,7 @@ def main():
         model, train_config, model_config,
         wandb_api_key=wandb_api_key,
         weights_only_resume=args.weights_only,
+        use_training_manager=args.training_manager,
     )
     trainer.train(dataloader)
 

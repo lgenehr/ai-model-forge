@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BitNet-Mamba 204M - Training Dashboard</title>
+
+    <!-- Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+    <!-- Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+    <!-- Hammer.js (required by chartjs-plugin-zoom) -->
+    <script src="https://cdn.jsdelivr.net/npm/hammerjs@2.0.8/hammer.min.js"></script>
+    <!-- chartjs-plugin-zoom -->
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.0.1/dist/chartjs-plugin-zoom.min.js"></script>
+    <!-- chartjs-adapter-date-fns for time axes -->
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <!-- Header -->
+    <header id="header">
+        <div class="header-left">
+            <h1 class="header-title">BitNet-Mamba 204M</h1>
+            <span class="header-sub">Training Dashboard</span>
+        </div>
+        <div class="header-right">
+            <div id="connection-status" class="conn-status conn-ok">
+                <span class="conn-dot"></span>
+                <span class="conn-text">Connected</span>
+            </div>
+            <div class="last-updated">
+                Updated <span id="last-updated-ago">--</span>s ago
+            </div>
+            <div class="refresh-controls">
+                <label for="refresh-interval">Interval:</label>
+                <select id="refresh-interval">
+                    <option value="5">5s</option>
+                    <option value="10" selected>10s</option>
+                    <option value="30">30s</option>
+                    <option value="60">60s</option>
+                </select>
+                <button id="btn-refresh" class="btn btn-sm" title="Refresh now">Refresh</button>
+            </div>
+        </div>
+    </header>
+
+    <!-- Disconnected banner -->
+    <div id="disconnect-banner" class="banner-warn" style="display:none;">
+        Server unreachable. Dashboard will retry automatically.
+    </div>
+
+    <!-- Status Cards -->
+    <section id="status-cards" class="card-grid">
+        <div class="card card-stat">
+            <div class="card-label">Step</div>
+            <div class="card-value"><span id="stat-step" class="mono">--</span></div>
+            <div class="card-sub">of <span id="stat-max-steps" class="mono">61,035</span></div>
+        </div>
+        <div class="card card-stat">
+            <div class="card-label">Tokens</div>
+            <div class="card-value"><span id="stat-tokens" class="mono">--</span></div>
+            <div class="card-sub">of <span id="stat-max-tokens" class="mono">8.0B</span></div>
+        </div>
+        <div class="card card-stat">
+            <div class="card-label">Tokens/sec</div>
+            <div class="card-value"><span id="stat-tps" class="mono">--</span></div>
+            <div class="card-sub">&nbsp;</div>
+        </div>
+        <div class="card card-stat">
+            <div class="card-label">Elapsed</div>
+            <div class="card-value"><span id="stat-elapsed" class="mono">--</span></div>
+            <div class="card-sub">&nbsp;</div>
+        </div>
+        <div class="card card-stat">
+            <div class="card-label">Progress</div>
+            <div class="card-value"><span id="stat-progress" class="mono">--</span>%</div>
+            <div class="progress-bar-outer"><div id="stat-progress-bar" class="progress-bar-inner"></div></div>
+        </div>
+        <div class="card card-stat">
+            <div class="card-label">Learning Rate</div>
+            <div class="card-value"><span id="stat-lr" class="mono">--</span></div>
+            <div class="card-sub">BitLinear: <span id="stat-lr-bit" class="mono">--</span></div>
+        </div>
+        <div class="card card-stat">
+            <div class="card-label">Train Loss</div>
+            <div class="card-value"><span id="stat-loss" class="mono">--</span></div>
+            <div class="card-sub">&nbsp;</div>
+        </div>
+        <div class="card card-stat">
+            <div class="card-label">Val Loss</div>
+            <div class="card-value"><span id="stat-val-loss" class="mono">--</span></div>
+            <div class="card-sub">Best: <span id="stat-best-val" class="mono">--</span></div>
+        </div>
+        <div class="card card-stat">
+            <div class="card-label">State</div>
+            <div class="card-value"><span id="stat-state" class="badge badge-state">--</span></div>
+            <div class="card-sub">Regime: <span id="stat-regime" class="badge badge-regime">--</span></div>
+        </div>
+    </section>
+
+    <!-- Regime Timeline Bar -->
+    <section id="regime-section" class="section">
+        <h2 class="section-title">Regime Timeline</h2>
+        <div id="regime-bar" class="regime-bar">
+            <div class="regime-empty">No regime data yet</div>
+        </div>
+        <div id="regime-legend" class="regime-legend"></div>
+    </section>
+
+    <!-- Charts -->
+    <section id="charts-section" class="section">
+        <div class="charts-toolbar">
+            <h2 class="section-title">Metrics</h2>
+            <div class="chart-controls">
+                <label>X-Axis:</label>
+                <select id="x-axis-mode">
+                    <option value="step" selected>Steps</option>
+                    <option value="time">Time</option>
+                </select>
+                <button id="btn-reset-zoom" class="btn btn-sm">Reset Zoom</button>
+            </div>
+        </div>
+        <div class="charts-grid">
+            <div class="chart-container">
+                <h3 class="chart-title">Loss</h3>
+                <canvas id="chart-loss"></canvas>
+            </div>
+            <div class="chart-container">
+                <h3 class="chart-title">Learning Rate</h3>
+                <canvas id="chart-lr"></canvas>
+            </div>
+            <div class="chart-container">
+                <h3 class="chart-title">Gradient Norm</h3>
+                <canvas id="chart-grad"></canvas>
+            </div>
+            <div class="chart-container">
+                <h3 class="chart-title">Token Progress</h3>
+                <canvas id="chart-tokens"></canvas>
+            </div>
+        </div>
+    </section>
+
+    <!-- Training Manager Decisions -->
+    <section id="decisions-section" class="section">
+        <div class="decisions-header">
+            <h2 class="section-title">Training Manager Decisions</h2>
+            <div class="decisions-controls">
+                <div class="filter-buttons" id="policy-filters">
+                    <button class="btn btn-filter active" data-policy="all">All</button>
+                    <button class="btn btn-filter" data-policy="ReduceLROnPlateau">ReduceLR</button>
+                    <button class="btn btn-filter" data-policy="SGDR">SGDR</button>
+                    <button class="btn btn-filter" data-policy="Clipping">Clipping</button>
+                    <button class="btn btn-filter" data-policy="Overfitting">Overfitting</button>
+                </div>
+                <div class="step-range-filter">
+                    <input type="number" id="filter-step-min" placeholder="Min step" class="input-sm">
+                    <span class="filter-sep">-</span>
+                    <input type="number" id="filter-step-max" placeholder="Max step" class="input-sm">
+                </div>
+            </div>
+        </div>
+        <div id="decisions-timeline" class="decisions-timeline">
+            <div class="empty-state">No decisions recorded yet.</div>
+        </div>
+        <div id="decisions-count" class="decisions-count"></div>
+    </section>
+
+    <!-- Checkpoints -->
+    <section id="checkpoints-section" class="section">
+        <h2 class="section-title">Checkpoints</h2>
+        <div class="table-wrap">
+            <table id="checkpoints-table" class="data-table">
+                <thead>
+                    <tr>
+                        <th>Filename</th>
+                        <th>Step</th>
+                        <th>Size (MB)</th>
+                        <th>Timestamp</th>
+                        <th>Reason</th>
+                    </tr>
+                </thead>
+                <tbody id="checkpoints-tbody">
+                    <tr><td colspan="5" class="empty-state">No checkpoints found.</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </section>
+
+    <footer>
+        <span>BitNet-Mamba Hybrid 204M &mdash; Read-only training monitor</span>
+    </footer>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>
