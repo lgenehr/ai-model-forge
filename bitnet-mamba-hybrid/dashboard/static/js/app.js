@@ -18,7 +18,8 @@
 
     let statusInterval = null;
     let metricsInterval = null;
-    let decisionsInterval = null;
+    let checkpointsInterval = null;
+    let hardwareInterval = null;
     let refreshRate = 10;  // seconds for status
     let lastUpdateTs = Date.now();
     let xAxisMode = "step";  // "step" or "time"
@@ -88,7 +89,13 @@
     // -----------------------------------------------------------------------
     async function apiFetch(endpoint) {
         try {
-            const resp = await fetch(API_BASE + endpoint);
+            const resp = await fetch(API_BASE + endpoint, {
+                cache: "no-store",
+                headers: {
+                    "Cache-Control": "no-cache",
+                    "Pragma": "no-cache",
+                },
+            });
             if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
             setConnected(true);
             return await resp.json();
@@ -147,6 +154,123 @@
         const regimeEl = document.getElementById("stat-regime");
         regimeEl.textContent = data.regime;
         regimeEl.className = "badge badge-regime regime-" + (data.regime || "UNKNOWN");
+    }
+
+    // -----------------------------------------------------------------------
+    // Hardware monitor
+    // -----------------------------------------------------------------------
+    function tempBarClass(tempC) {
+        if (tempC === null || tempC === undefined) return "";
+        if (tempC >= 80) return "hw-crit";
+        if (tempC >= 65) return "hw-warn";
+        return "";
+    }
+
+    function setBar(barId, pct, extraClass) {
+        const bar = document.getElementById(barId);
+        if (!bar) return;
+        bar.style.width = Math.min(Math.max(pct || 0, 0), 100) + "%";
+        if (extraClass !== undefined) {
+            bar.classList.remove("hw-warn", "hw-crit");
+            if (extraClass) bar.classList.add(extraClass);
+        }
+    }
+
+    async function fetchHardware() {
+        const data = await apiFetch("/api/hardware");
+        if (!data) return;
+
+        // --- GPU ---
+        const gpuCard = document.getElementById("hw-gpu-card");
+        if (data.gpus && data.gpus.length > 0) {
+            const g = data.gpus[0];  // primary GPU
+            gpuCard.style.display = "";
+
+            document.getElementById("hw-gpu-name").textContent = g.name || "--";
+
+            // Temperature
+            if (g.temperature_c !== null) {
+                document.getElementById("hw-gpu-temp").textContent = g.temperature_c + "\u00B0C";
+                setBar("hw-gpu-temp-bar", (g.temperature_c / 100) * 100, tempBarClass(g.temperature_c));
+            } else {
+                document.getElementById("hw-gpu-temp").textContent = "--";
+                setBar("hw-gpu-temp-bar", 0);
+            }
+
+            // VRAM
+            if (g.memory_used_mb !== null && g.memory_total_mb !== null) {
+                const usedGB = (g.memory_used_mb / 1024).toFixed(1);
+                const totalGB = (g.memory_total_mb / 1024).toFixed(1);
+                const pct = (g.memory_used_mb / g.memory_total_mb) * 100;
+                document.getElementById("hw-gpu-mem").textContent = usedGB + " / " + totalGB + " GB";
+                setBar("hw-gpu-mem-bar", pct);
+            } else {
+                document.getElementById("hw-gpu-mem").textContent = "--";
+                setBar("hw-gpu-mem-bar", 0);
+            }
+
+            // Utilization
+            if (g.utilization_pct !== null) {
+                document.getElementById("hw-gpu-util").textContent = g.utilization_pct.toFixed(0) + "%";
+                setBar("hw-gpu-util-bar", g.utilization_pct);
+            } else {
+                document.getElementById("hw-gpu-util").textContent = "--";
+                setBar("hw-gpu-util-bar", 0);
+            }
+
+            // Power
+            if (g.power_draw_w !== null && g.power_limit_w !== null) {
+                document.getElementById("hw-gpu-power").textContent =
+                    g.power_draw_w.toFixed(0) + " / " + g.power_limit_w.toFixed(0) + " W";
+                setBar("hw-gpu-power-bar", (g.power_draw_w / g.power_limit_w) * 100);
+            } else {
+                document.getElementById("hw-gpu-power").textContent = "--";
+                setBar("hw-gpu-power-bar", 0);
+            }
+
+            // Fan
+            const fanMetric = document.getElementById("hw-gpu-fan-metric");
+            if (g.fan_speed_pct !== null) {
+                fanMetric.style.display = "";
+                document.getElementById("hw-gpu-fan").textContent = g.fan_speed_pct.toFixed(0) + "%";
+                setBar("hw-gpu-fan-bar", g.fan_speed_pct);
+            } else {
+                fanMetric.style.display = "none";
+            }
+        } else {
+            gpuCard.innerHTML = '<div class="hw-card-header"><span class="hw-icon hw-icon-gpu">GPU</span><span class="hw-name">--</span></div><div class="hw-unavailable">No GPU detected</div>';
+        }
+
+        // --- CPU ---
+        const cpu = data.cpu;
+        if (cpu && cpu.available) {
+            var cpuLabel = cpu.cpu_count ? cpu.cpu_count + " cores" : "--";
+            document.getElementById("hw-cpu-name").textContent = cpuLabel;
+
+            // Usage
+            document.getElementById("hw-cpu-usage").textContent =
+                cpu.cpu_percent !== null ? cpu.cpu_percent.toFixed(1) + "%" : "--";
+            setBar("hw-cpu-usage-bar", cpu.cpu_percent);
+
+            // RAM
+            document.getElementById("hw-cpu-ram").textContent =
+                cpu.ram_used_gb + " / " + cpu.ram_total_gb + " GB (" + cpu.ram_percent + "%)";
+            setBar("hw-cpu-ram-bar", cpu.ram_percent);
+
+            // Temperature
+            var tempMetric = document.getElementById("hw-cpu-temp-metric");
+            if (cpu.cpu_temp_c !== undefined && cpu.cpu_temp_c !== null) {
+                tempMetric.style.display = "";
+                document.getElementById("hw-cpu-temp").textContent = cpu.cpu_temp_c + "\u00B0C";
+                setBar("hw-cpu-temp-bar", (cpu.cpu_temp_c / 100) * 100, tempBarClass(cpu.cpu_temp_c));
+            } else {
+                tempMetric.style.display = "none";
+            }
+        } else {
+            document.getElementById("hw-cpu-name").textContent = "--";
+            document.getElementById("hw-cpu-usage").textContent = "N/A";
+            document.getElementById("hw-cpu-ram").textContent = "psutil not installed";
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -832,6 +956,31 @@
         const data = await apiFetch("/api/checkpoints");
         if (!data) return;
 
+        const latest = data.latest_checkpoint || null;
+        const lastStep = data.latest_step_metrics || null;
+        const lagNoteEl = document.getElementById("ckpt-lag-note");
+
+        document.getElementById("ckpt-latest-name").textContent = latest && latest.filename ? latest.filename : "--";
+        document.getElementById("ckpt-latest-step").textContent = latest && latest.step != null ? formatNumber(latest.step) : "--";
+        document.getElementById("ckpt-last-step").textContent = lastStep && lastStep.step != null ? formatNumber(lastStep.step) : "--";
+        document.getElementById("ckpt-last-loss").textContent = lastStep ? formatLoss(lastStep.loss) : "--";
+        document.getElementById("ckpt-last-lr").textContent = lastStep ? formatSci(lastStep.lr) : "--";
+        document.getElementById("ckpt-last-tokens").textContent = lastStep && lastStep.tokens != null ? formatNumber(lastStep.tokens) : "--";
+        document.getElementById("ckpt-last-tps").textContent = lastStep && lastStep.tokens_per_sec != null ? formatNumber(lastStep.tokens_per_sec) : "--";
+        document.getElementById("ckpt-last-ts").textContent = lastStep && lastStep.timestamp ? formatTimestamp(lastStep.timestamp) : "--";
+        if (lagNoteEl) {
+            const latestStepVal = latest && latest.step != null ? Number(latest.step) : null;
+            const currentStepVal = lastStep && lastStep.step != null ? Number(lastStep.step) : null;
+            if (latestStepVal !== null && currentStepVal !== null && currentStepVal > latestStepVal) {
+                const lag = currentStepVal - latestStepVal;
+                lagNoteEl.textContent = `Checkpoint defasado em ${formatNumber(lag)} steps`;
+                lagNoteEl.classList.add("checkpoint-lag-warning");
+            } else {
+                lagNoteEl.textContent = "";
+                lagNoteEl.classList.remove("checkpoint-lag-warning");
+            }
+        }
+
         const tbody = document.getElementById("checkpoints-tbody");
         if (!data.checkpoints || data.checkpoints.length === 0) {
             tbody.innerHTML = '<tr><td colspan="5" class="empty-state">No checkpoints found.</td></tr>';
@@ -862,6 +1011,7 @@
         fetchStatus();
         fetchMetrics();
         fetchCheckpoints();
+        fetchHardware();
 
         // Status: fast interval
         statusInterval = setInterval(fetchStatus, refreshRate * 1000);
@@ -871,16 +1021,21 @@
         metricsInterval = setInterval(fetchMetrics, metricsRate);
 
         // Checkpoints: slower
-        decisionsInterval = setInterval(fetchCheckpoints, 60000);
+        checkpointsInterval = setInterval(fetchCheckpoints, refreshRate * 1000);
+
+        // Hardware: same as status interval
+        hardwareInterval = setInterval(fetchHardware, refreshRate * 1000);
     }
 
     function stopPolling() {
         if (statusInterval) clearInterval(statusInterval);
         if (metricsInterval) clearInterval(metricsInterval);
-        if (decisionsInterval) clearInterval(decisionsInterval);
+        if (checkpointsInterval) clearInterval(checkpointsInterval);
+        if (hardwareInterval) clearInterval(hardwareInterval);
         statusInterval = null;
         metricsInterval = null;
-        decisionsInterval = null;
+        checkpointsInterval = null;
+        hardwareInterval = null;
     }
 
     // -----------------------------------------------------------------------
@@ -900,6 +1055,7 @@
             fetchStatus();
             fetchMetrics();
             fetchCheckpoints();
+            fetchHardware();
         });
 
         // Refresh interval selector

@@ -103,6 +103,87 @@
         </div>
     </section>
 
+    <!-- Hardware Monitor -->
+    <section id="hardware-section" class="section">
+        <h2 class="section-title">Hardware Monitor</h2>
+        <div id="hardware-grid" class="hardware-grid">
+            <!-- GPU Card -->
+            <div class="hw-card" id="hw-gpu-card">
+                <div class="hw-card-header">
+                    <span class="hw-icon hw-icon-gpu">GPU</span>
+                    <span class="hw-name" id="hw-gpu-name">--</span>
+                </div>
+                <div class="hw-metrics">
+                    <div class="hw-metric">
+                        <div class="hw-metric-header">
+                            <span class="hw-metric-label">Temperature</span>
+                            <span class="hw-metric-value" id="hw-gpu-temp">--</span>
+                        </div>
+                        <div class="hw-bar-outer"><div class="hw-bar-inner hw-bar-temp" id="hw-gpu-temp-bar"></div></div>
+                    </div>
+                    <div class="hw-metric">
+                        <div class="hw-metric-header">
+                            <span class="hw-metric-label">VRAM</span>
+                            <span class="hw-metric-value" id="hw-gpu-mem">--</span>
+                        </div>
+                        <div class="hw-bar-outer"><div class="hw-bar-inner hw-bar-mem" id="hw-gpu-mem-bar"></div></div>
+                    </div>
+                    <div class="hw-metric">
+                        <div class="hw-metric-header">
+                            <span class="hw-metric-label">Utilization</span>
+                            <span class="hw-metric-value" id="hw-gpu-util">--</span>
+                        </div>
+                        <div class="hw-bar-outer"><div class="hw-bar-inner hw-bar-util" id="hw-gpu-util-bar"></div></div>
+                    </div>
+                    <div class="hw-metric">
+                        <div class="hw-metric-header">
+                            <span class="hw-metric-label">Power</span>
+                            <span class="hw-metric-value" id="hw-gpu-power">--</span>
+                        </div>
+                        <div class="hw-bar-outer"><div class="hw-bar-inner hw-bar-power" id="hw-gpu-power-bar"></div></div>
+                    </div>
+                    <div class="hw-metric" id="hw-gpu-fan-metric" style="display:none;">
+                        <div class="hw-metric-header">
+                            <span class="hw-metric-label">Fan</span>
+                            <span class="hw-metric-value" id="hw-gpu-fan">--</span>
+                        </div>
+                        <div class="hw-bar-outer"><div class="hw-bar-inner hw-bar-fan" id="hw-gpu-fan-bar"></div></div>
+                    </div>
+                </div>
+            </div>
+            <!-- CPU Card -->
+            <div class="hw-card" id="hw-cpu-card">
+                <div class="hw-card-header">
+                    <span class="hw-icon hw-icon-cpu">CPU</span>
+                    <span class="hw-name" id="hw-cpu-name">--</span>
+                </div>
+                <div class="hw-metrics">
+                    <div class="hw-metric">
+                        <div class="hw-metric-header">
+                            <span class="hw-metric-label">Usage</span>
+                            <span class="hw-metric-value" id="hw-cpu-usage">--</span>
+                        </div>
+                        <div class="hw-bar-outer"><div class="hw-bar-inner hw-bar-util" id="hw-cpu-usage-bar"></div></div>
+                    </div>
+                    <div class="hw-metric">
+                        <div class="hw-metric-header">
+                            <span class="hw-metric-label">RAM</span>
+                            <span class="hw-metric-value" id="hw-cpu-ram">--</span>
+                        </div>
+                        <div class="hw-bar-outer"><div class="hw-bar-inner hw-bar-mem" id="hw-cpu-ram-bar"></div></div>
+                    </div>
+                    <div class="hw-metric" id="hw-cpu-temp-metric" style="display:none;">
+                        <div class="hw-metric-header">
+                            <span class="hw-metric-label">Temperature</span>
+                            <span class="hw-metric-value" id="hw-cpu-temp">--</span>
+                        </div>
+                        <div class="hw-bar-outer"><div class="hw-bar-inner hw-bar-temp" id="hw-cpu-temp-bar"></div></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
     <!-- Regime Timeline Bar -->
     <section id="regime-section" class="section">
         <h2 class="section-title">Regime Timeline</h2>
@@ -173,6 +254,44 @@
     <!-- Checkpoints -->
     <section id="checkpoints-section" class="section">
         <h2 class="section-title">Checkpoints</h2>
+        <div class="card-grid checkpoint-summary">
+            <div class="card card-stat">
+                <div class="card-label">Latest Checkpoint</div>
+                <div class="card-value"><span id="ckpt-latest-name" class="mono">--</span></div>
+                <div class="card-sub">Step: <span id="ckpt-latest-step" class="mono">--</span></div>
+                <div class="card-sub checkpoint-lag-note" id="ckpt-lag-note"></div>
+            </div>
+            <div class="card card-stat">
+                <div class="card-label">Current Step</div>
+                <div class="card-value"><span id="ckpt-last-step" class="mono">--</span></div>
+                <div class="card-sub">Last executed step</div>
+            </div>
+            <div class="card card-stat">
+                <div class="card-label">Last Loss</div>
+                <div class="card-value"><span id="ckpt-last-loss" class="mono">--</span></div>
+                <div class="card-sub">From latest logged step</div>
+            </div>
+            <div class="card card-stat">
+                <div class="card-label">Last LR</div>
+                <div class="card-value"><span id="ckpt-last-lr" class="mono">--</span></div>
+                <div class="card-sub">From latest logged step</div>
+            </div>
+            <div class="card card-stat">
+                <div class="card-label">Tokens Processed</div>
+                <div class="card-value"><span id="ckpt-last-tokens" class="mono">--</span></div>
+                <div class="card-sub">Latest logged total</div>
+            </div>
+            <div class="card card-stat">
+                <div class="card-label">Last Tokens/sec</div>
+                <div class="card-value"><span id="ckpt-last-tps" class="mono">--</span></div>
+                <div class="card-sub">From latest logged step</div>
+            </div>
+            <div class="card card-stat">
+                <div class="card-label">Last Step Time</div>
+                <div class="card-value"><span id="ckpt-last-ts" class="mono">--</span></div>
+                <div class="card-sub">Timestamp of last log</div>
+            </div>
+        </div>
         <div class="table-wrap">
             <table id="checkpoints-table" class="data-table">
                 <thead>

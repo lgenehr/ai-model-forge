@@ -44,6 +44,19 @@ nohup python train_hybrid-mamba-bitnet.py \
     > model_204m/training.log 2>&1 &
 ```
 
+### Retomar treino com Training Manager (seed fixa)
+
+```bash
+python train_hybrid-mamba-bitnet.py \
+    --d_model 1280 \
+    --n_layers 14 \
+    --output_dir model_204m \
+    --wandb \
+    --wandb_run_name "from-scratch-v2-lr6e4-resume" \
+    --training_manager \
+    --seed 42
+```
+
 ### Monitorar treino
 
 ```bash

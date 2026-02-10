@@ -15,6 +15,9 @@ import csv
 import json
 import os
 import re
+import shutil
+import socket
+import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -23,6 +26,12 @@ from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -57,6 +66,16 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _get_lan_ip() -> str:
+    """Best-effort local network IP (non-loopback)."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+
 
 def _read_csv_rows() -> list[dict]:
     """Read all rows from the loss_history CSV. Returns list of dicts."""
@@ -333,6 +352,19 @@ def get_decisions(
 def get_checkpoints():
     """Return information about saved checkpoints."""
     checkpoints: list[dict] = []
+    latest_step_metrics = None
+
+    rows = _read_csv_rows()
+    if rows:
+        last = _parse_csv_row(rows[-1])
+        latest_step_metrics = {
+            "step": last.get("step"),
+            "loss": round(last.get("loss"), 6) if last.get("loss") is not None else None,
+            "lr": last.get("lr"),
+            "tokens": last.get("tokens"),
+            "tokens_per_sec": round(last.get("tokens_per_sec"), 1) if last.get("tokens_per_sec") is not None else None,
+            "timestamp": last.get("timestamp"),
+        }
 
     # Scan checkpoint directory
     if CHECKPOINT_DIR.exists():
@@ -368,6 +400,7 @@ def get_checkpoints():
                     "size_mb": size_mb,
                     "timestamp": ts,
                     "reason": reason,
+                    "_mtime_ns": stat.st_mtime_ns,
                 }
             )
 
@@ -382,13 +415,25 @@ def get_checkpoints():
                 "size_mb": round(stat.st_size / (1024 * 1024), 1),
                 "timestamp": datetime.fromtimestamp(stat.st_mtime).isoformat(),
                 "reason": "best_val_loss",
+                "_mtime_ns": stat.st_mtime_ns,
             }
         )
 
-    # Sort by timestamp descending (most recent first)
-    checkpoints.sort(key=lambda c: c["timestamp"], reverse=True)
+    # Sort by mtime descending (most recent first)
+    checkpoints.sort(key=lambda c: c.get("_mtime_ns", 0), reverse=True)
+    latest_checkpoint = checkpoints[0] if checkpoints else None
 
-    return {"checkpoints": checkpoints}
+    for c in checkpoints:
+        c.pop("_mtime_ns", None)
+    if latest_checkpoint is not None:
+        latest_checkpoint = dict(latest_checkpoint)
+        latest_checkpoint.pop("_mtime_ns", None)
+
+    return {
+        "checkpoints": checkpoints,
+        "latest_checkpoint": latest_checkpoint,
+        "latest_step_metrics": latest_step_metrics,
+    }
 
 
 @app.get("/api/grad_norms")
@@ -418,6 +463,99 @@ def get_grad_norms():
 
 
 # ---------------------------------------------------------------------------
+# Hardware monitoring helpers
+# ---------------------------------------------------------------------------
+
+def _safe_float(s: str) -> Optional[float]:
+    """Parse float from nvidia-smi output, handling '[Not Supported]' etc."""
+    try:
+        return float(s.strip())
+    except (ValueError, TypeError):
+        return None
+
+
+def _get_gpu_info() -> list[dict]:
+    """Get GPU info via nvidia-smi CLI."""
+    if not shutil.which("nvidia-smi"):
+        return []
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,name,temperature.gpu,memory.used,memory.total,"
+                "utilization.gpu,power.draw,power.limit,fan.speed",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            return []
+        gpus: list[dict] = []
+        for line in result.stdout.strip().split("\n"):
+            if not line.strip():
+                continue
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 8:
+                continue
+            gpus.append({
+                "index": int(parts[0]) if parts[0].strip().isdigit() else 0,
+                "name": parts[1],
+                "temperature_c": _safe_float(parts[2]),
+                "memory_used_mb": _safe_float(parts[3]),
+                "memory_total_mb": _safe_float(parts[4]),
+                "utilization_pct": _safe_float(parts[5]),
+                "power_draw_w": _safe_float(parts[6]),
+                "power_limit_w": _safe_float(parts[7]),
+                "fan_speed_pct": _safe_float(parts[8]) if len(parts) > 8 else None,
+            })
+        return gpus
+    except Exception:
+        return []
+
+
+def _get_cpu_info() -> dict:
+    """Get CPU and RAM info via psutil."""
+    if not HAS_PSUTIL:
+        return {"available": False}
+    mem = psutil.virtual_memory()
+    info: dict = {
+        "available": True,
+        "cpu_percent": psutil.cpu_percent(interval=0),
+        "cpu_count": psutil.cpu_count(),
+        "ram_used_gb": round(mem.used / (1024 ** 3), 2),
+        "ram_total_gb": round(mem.total / (1024 ** 3), 2),
+        "ram_percent": mem.percent,
+    }
+    # CPU temperature (best-effort)
+    try:
+        temps = psutil.sensors_temperatures()
+        if temps:
+            for key in ("coretemp", "k10temp", "cpu_thermal", "cpu-thermal", "acpitz"):
+                if key in temps and temps[key]:
+                    info["cpu_temp_c"] = temps[key][0].current
+                    break
+            if "cpu_temp_c" not in info:
+                for entries in temps.values():
+                    if entries:
+                        info["cpu_temp_c"] = entries[0].current
+                        break
+    except Exception:
+        pass
+    return info
+
+
+@app.get("/api/hardware")
+def get_hardware():
+    """Return current hardware metrics (GPU + CPU)."""
+    return {
+        "gpus": _get_gpu_info(),
+        "cpu": _get_cpu_info(),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Static files & SPA fallback
 # ---------------------------------------------------------------------------
 STATIC_DIR = DASHBOARD_DIR / "static"
@@ -441,10 +579,16 @@ def index():
 if __name__ == "__main__":
     import uvicorn
 
+    host = os.environ.get("DASHBOARD_HOST", "0.0.0.0")
+    port = int(os.environ.get("DASHBOARD_PORT", "8087"))
+    lan_ip = _get_lan_ip()
+
     print(f"[Dashboard] Output dir : {OUTPUT_DIR}")
     print(f"[Dashboard] CSV path   : {CSV_PATH}")
     print(f"[Dashboard] JSONL path : {JSONL_PATH}")
     print(f"[Dashboard] Checkpoints: {CHECKPOINT_DIR}")
     print(f"[Dashboard] Static dir : {STATIC_DIR}")
-    print(f"[Dashboard] Listening  : http://0.0.0.0:8087")
-    uvicorn.run(app, host="0.0.0.0", port=8087)
+    print(f"[Dashboard] Listening  : http://{host}:{port}")
+    if host == "0.0.0.0":
+        print(f"[Dashboard] LAN access : http://{lan_ip}:{port}")
+    uvicorn.run(app, host=host, port=port)

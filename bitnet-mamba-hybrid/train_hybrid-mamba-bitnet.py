@@ -29,6 +29,7 @@ import random
 import signal
 import logging
 import argparse
+import re
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass, field, asdict
@@ -1136,13 +1137,21 @@ class Trainer:
                 a second training phase.
         """
         checkpoint_dir = Path(self.train_config.checkpoint_dir)
-        checkpoints = sorted(checkpoint_dir.glob("checkpoint_*.pt"))
+        checkpoints: list[tuple[int, int, Path]] = []
+        for item in checkpoint_dir.glob("checkpoint*.pt"):
+            if not item.is_file():
+                continue
+            match = re.search(r"(\d{5,})", item.name)
+            if not match:
+                continue
+            checkpoints.append((int(match.group(1)), item.stat().st_mtime_ns, item))
+        checkpoints.sort(key=lambda t: (t[0], t[1]))
 
         if checkpoints:
             load_opt = not weights_only
 
             # Try checkpoints from newest to oldest
-            for checkpoint_path in reversed(checkpoints):
+            for _, _, checkpoint_path in reversed(checkpoints):
                 self.logger.info(f"Attempting to resume from checkpoint: {checkpoint_path}")
                 if weights_only:
                     self.logger.info("Weights-only resume: optimizer state will NOT be restored")
@@ -1218,9 +1227,21 @@ class Trainer:
             self._save_checkpoint_atomic(checkpoint, best_path)
             self.logger.info(f"Saved best model: {best_path}")
 
-        # Clean up old checkpoints (keep last 3)
-        checkpoints = sorted(Path(self.train_config.checkpoint_dir).glob("checkpoint_*.pt"))
-        for old_checkpoint in checkpoints[:-3]:
+        # Clean up old regular checkpoints (keep last 3). Do not delete
+        # interrupt checkpoints (checkpoint_interrupt_*.pt).
+        checkpoint_dir = Path(self.train_config.checkpoint_dir)
+        checkpoints: list[tuple[int, int, Path]] = []
+        for item in checkpoint_dir.glob("checkpoint_*.pt"):
+            if not item.is_file():
+                continue
+            if not re.fullmatch(r"checkpoint_\d+\.pt", item.name):
+                continue
+            match = re.search(r"(\d+)", item.name)
+            if not match:
+                continue
+            checkpoints.append((int(match.group(1)), item.stat().st_mtime_ns, item))
+        checkpoints.sort(key=lambda t: (t[0], t[1]))
+        for _, _, old_checkpoint in checkpoints[:-3]:
             old_checkpoint.unlink()
 
     def _load_checkpoint(

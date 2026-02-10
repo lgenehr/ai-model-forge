@@ -409,6 +409,18 @@ No dashboard você pode:
 - Analisar gradientes do modelo
 - Baixar checkpoints salvos como artefatos
 
+### Acesso do Dashboard na rede local (WSL2 + Windows)
+
+Se o dashboard roda no WSL2 e voce quer acessar de outro dispositivo da rede, atualize o `portproxy` do Windows como Administrador:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File \\wsl$\SEU_DISTRO\home\SEU_USUARIO\meu_modelo_temp\ai-model-forge\bitnet-mamba-hybrid\scripts\wsl_dashboard_portproxy.ps1 -Port 8087
+```
+
+Depois acesse: `http://IP_DO_WINDOWS:8087`
+
+Observacao: o IP interno do WSL2 muda ao reiniciar, entao execute o script novamente apos reboot/restart do WSL.
+
 ### Exemplo Completo com W&B
 
 ```bash
