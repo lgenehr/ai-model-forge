@@ -179,8 +179,8 @@ python train_hybrid-mamba-bitnet.py \
     \
     `# === DATA CONFIGURATION ===` \
     --data_dir "data/tokenized" \
-    --en_ratio 0.3 \
-    --pt_ratio 0.7 \
+    --en_ratio 0.5 \
+    --pt_ratio 0.5 \
     --num_workers 4 \
     --prefetch_factor 2 \
     \

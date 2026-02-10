@@ -295,9 +295,9 @@ class TrainingConfig:
     eval_interval: int = 500
     checkpoint_interval: int = 1000
 
-    # Data mixing (EN:PT ratio) - 70% Portuguese, 30% English
-    en_ratio: float = 0.3
-    pt_ratio: float = 0.7
+    # Data mixing (EN:PT ratio) - 50% English, 50% Portuguese
+    en_ratio: float = 0.5
+    pt_ratio: float = 0.5
 
     # Paths
     data_dir: str = "./data/tokenized"  # Pre-tokenized data directory
@@ -1842,8 +1842,8 @@ def parse_args() -> argparse.Namespace:
     # Data arguments
     parser.add_argument("--data_dir", type=str, default="./data/tokenized",
                         help="Directory containing pre-tokenized data (run preprocess_datasets.py first)")
-    parser.add_argument("--en_ratio", type=float, default=0.3, help="English data ratio")
-    parser.add_argument("--pt_ratio", type=float, default=0.7, help="Portuguese data ratio")
+    parser.add_argument("--en_ratio", type=float, default=0.5, help="English data ratio")
+    parser.add_argument("--pt_ratio", type=float, default=0.5, help="Portuguese data ratio")
     parser.add_argument("--num_workers", type=int, default=4, help="Number of dataloader workers")
     parser.add_argument("--prefetch_factor", type=int, default=2, help="Dataloader prefetch factor")
     parser.add_argument("--no_pin_memory", action="store_true", help="Disable pinned memory for dataloader")

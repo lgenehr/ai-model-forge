@@ -14,7 +14,7 @@ nohup python train_hybrid-mamba-bitnet.py \
     --max_grad_norm 0.5 \
     --max_tokens 8000000000 \
     --dropout 0.1 \
-    --en_ratio 0.3 --pt_ratio 0.7 \
+    --en_ratio 0.5 --pt_ratio 0.5 \
     --gradient_checkpointing \
     --output_dir model_204m \
     --data_dir data/tokenized \
@@ -37,7 +37,7 @@ nohup python train_hybrid-mamba-bitnet.py \
     --max_grad_norm 0.5 \
     --max_tokens 8000000000 \
     --dropout 0.1 \
-    --en_ratio 0.3 --pt_ratio 0.7 \
+    --en_ratio 0.5 --pt_ratio 0.5 \
     --gradient_checkpointing \
     --output_dir model_204m \
     --data_dir data/tokenized \
