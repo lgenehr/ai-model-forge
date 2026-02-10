@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
 import numpy as np
+import torch.nn as nn
 
 
 # =============================================================================
@@ -75,6 +76,11 @@ class TrainingManagerConfig:
     # --- Overfitting detection ---
     overfit_consecutive_evals: int = 5  # Consecutive evals of diverging losses
     overfit_lr_reduction: float = 0.9   # 10% LR reduction on overfit
+    enable_dropout_policy: bool = False  # Opt-in policy: increase dropout on persistent overfitting
+    dropout_start: float = 0.03          # Dropout value to jump to when currently at/near zero
+    dropout_step: float = 0.01           # Increment for subsequent dropout adjustments
+    dropout_max: float = 0.10            # Hard ceiling for dropout policy
+    dropout_cooldown: int = 5            # Evals of cooldown after a dropout increase
 
     # --- Adaptive warmup ---
     warmup_grad_norm_multiplier: float = 5.0  # Extend warmup if norm > 5x median
@@ -116,6 +122,7 @@ class ActionType(Enum):
     LR_INCREASE = "lr_increase"       # SGDR warm restart
     GRAD_CLIP_INCREASE = "grad_clip_increase"
     WARMUP_EXTENSION = "warmup_extension"
+    DROPOUT_INCREASE = "dropout_increase"
     OBSERVATION = "observation"        # No action, just logging
 
 
@@ -635,6 +642,7 @@ class HybridPolicyEngine:
         self.sgdr_cooldown_remaining: int = 0
         self.clipping_cooldown_remaining: int = 0
         self.overfit_cooldown_remaining: int = 0
+        self.dropout_cooldown_remaining: int = 0
 
         # SGDR stagnation counter (increments each eval with no val improvement)
         self.stagnation_counter: int = 0
@@ -657,6 +665,7 @@ class HybridPolicyEngine:
         self.sgdr_cooldown_remaining = max(0, self.sgdr_cooldown_remaining - 1)
         self.clipping_cooldown_remaining = max(0, self.clipping_cooldown_remaining - 1)
         self.overfit_cooldown_remaining = max(0, self.overfit_cooldown_remaining - 1)
+        self.dropout_cooldown_remaining = max(0, self.dropout_cooldown_remaining - 1)
 
     def update_stagnation(self, val_loss: float):
         """Track stagnation for SGDR trigger.
@@ -698,6 +707,7 @@ class HybridPolicyEngine:
         metrics: MetricCollector,
         regime: TrainingRegime,
         current_lr: float,
+        current_dropout: float,
         current_step: int,
         total_tokens: int,
     ) -> Optional[PolicyDecision]:
@@ -721,6 +731,7 @@ class HybridPolicyEngine:
         policies = [
             (1, self._policy_adaptive_warmup, current_step, total_tokens, current_lr, metrics),
             (2, self._policy_clipping_aware, current_lr, metrics),
+            (3, self._policy_dropout_on_overfitting, current_dropout, metrics, regime),
             (3, self._policy_conservative_overfitting, current_lr, metrics, regime),
             (4, self._policy_reduce_lr_on_plateau, current_lr, metrics, regime),
             (5, self._policy_sgdr_partial, current_lr, metrics, regime),
@@ -1163,6 +1174,62 @@ class HybridPolicyEngine:
             requires_checkpoint=True,
         )
 
+    def _policy_dropout_on_overfitting(
+        self,
+        current_dropout: float,
+        metrics: MetricCollector,
+        regime: TrainingRegime,
+    ) -> Optional[PolicyDecision]:
+        """Increase dropout conservatively under persistent overfitting.
+
+        Opt-in and disabled by default. This policy is intentionally
+        conservative because dropout can slow convergence if used in
+        non-overfitting regimes.
+        """
+        if not self.config.enable_dropout_policy:
+            return None
+
+        if self.dropout_cooldown_remaining > 0:
+            return None
+
+        if regime != TrainingRegime.LATE_OVERFITTING:
+            return None
+
+        if self.overfit_consecutive < self.config.overfit_consecutive_evals:
+            return None
+
+        if current_dropout >= self.config.dropout_max - 1e-9:
+            return None
+
+        if current_dropout < 1e-9:
+            new_dropout = min(self.config.dropout_start, self.config.dropout_max)
+        else:
+            new_dropout = min(current_dropout + self.config.dropout_step, self.config.dropout_max)
+
+        if new_dropout <= current_dropout + 1e-9:
+            return None
+
+        val_losses = metrics.get_window('val_loss', self.config.overfit_consecutive_evals)
+        train_losses = metrics.get_window('train_loss_at_eval', self.config.overfit_consecutive_evals)
+        val_delta = (val_losses[-1] - val_losses[0]) if len(val_losses) >= 2 else 0.0
+        train_delta = (train_losses[-1] - train_losses[0]) if len(train_losses) >= 2 else 0.0
+
+        return PolicyDecision(
+            policy_name="OverfitDropout",
+            action_type=ActionType.DROPOUT_INCREASE,
+            param_name="dropout",
+            before_value=current_dropout,
+            after_value=new_dropout,
+            justification=(
+                f"Persistent overfitting over {self.overfit_consecutive} evals "
+                f"(train_delta={train_delta:.4f}, val_delta={val_delta:.4f}). "
+                f"Dropout increase: {current_dropout:.3f} -> {new_dropout:.3f}. "
+                f"Cooldown {self.config.dropout_cooldown} evals."
+            ),
+            priority=3,
+            requires_checkpoint=True,
+        )
+
 
 # =============================================================================
 # DecisionValidator
@@ -1241,6 +1308,9 @@ class DecisionValidator:
 
         if decision.action_type == ActionType.GRAD_CLIP_INCREASE:
             return self._validate_grad_clip_change(decision)
+
+        if decision.action_type == ActionType.DROPOUT_INCREASE:
+            return self._validate_dropout_change(decision)
 
         return ValidationResult(False, f"Unknown action type: {decision.action_type}")
 
@@ -1326,6 +1396,39 @@ class DecisionValidator:
             f"max={self.config.max_grad_clip:.2f})."
         )
 
+    def _validate_dropout_change(self, decision: PolicyDecision) -> ValidationResult:
+        """Validate dropout increase decisions."""
+        old_dropout = decision.before_value
+        new_dropout = decision.after_value
+
+        if new_dropout < 0.0 or new_dropout > self.config.dropout_max:
+            return ValidationResult(
+                False,
+                f"New dropout ({new_dropout:.3f}) outside allowed range "
+                f"[0.000, {self.config.dropout_max:.3f}]."
+            )
+
+        if new_dropout < old_dropout - 1e-9:
+            return ValidationResult(
+                False,
+                f"Dropout decrease not allowed in this policy "
+                f"({old_dropout:.3f} -> {new_dropout:.3f})."
+            )
+
+        max_step = max(self.config.dropout_step * 2.0, 0.02)
+        if (new_dropout - old_dropout) > max_step + 1e-9:
+            return ValidationResult(
+                False,
+                f"Dropout change ({new_dropout - old_dropout:.3f}) exceeds "
+                f"safe step ({max_step:.3f})."
+            )
+
+        return ValidationResult(
+            True,
+            f"Dropout change within safe bounds "
+            f"({old_dropout:.3f} -> {new_dropout:.3f}, max={self.config.dropout_max:.3f})."
+        )
+
     def record_executed_action(self, decision: PolicyDecision):
         """Record an executed decision for reversibility tracking.
 
@@ -1388,6 +1491,10 @@ class ActionExecutor:
                 self.extend_warmup(trainer, int(decision.after_value))
                 return True
 
+            elif decision.action_type == ActionType.DROPOUT_INCREASE:
+                self.adjust_dropout(trainer, decision.after_value)
+                return True
+
             elif decision.action_type == ActionType.OBSERVATION:
                 return True
 
@@ -1445,6 +1552,20 @@ class ActionExecutor:
         trainer.train_config.warmup_steps = new_warmup_steps
         self.logger.info(
             f"[ActionExecutor] Warmup extended: {old_warmup} -> {new_warmup_steps} steps"
+        )
+
+    def adjust_dropout(self, trainer, new_dropout: float):
+        """Update all nn.Dropout modules in-place."""
+        old_dropout = getattr(trainer.model_config, "dropout", 0.0)
+        applied = 0
+        for module in trainer.model.modules():
+            if isinstance(module, nn.Dropout):
+                module.p = float(new_dropout)
+                applied += 1
+        trainer.model_config.dropout = float(new_dropout)
+        self.logger.info(
+            f"[ActionExecutor] dropout adjusted: {old_dropout:.3f} -> "
+            f"{new_dropout:.3f} (modules={applied})"
         )
 
     def force_checkpoint(self, trainer, reason: str = "policy_action"):
@@ -1765,6 +1886,7 @@ class HybridTrainingManager:
             metrics=self.metrics,
             regime=self._current_regime,
             current_lr=self._current_base_lr,
+            current_dropout=float(getattr(self.trainer.model_config, "dropout", 0.0)),
             current_step=step,
             total_tokens=self.trainer.total_tokens,
         )
@@ -1866,7 +1988,9 @@ class HybridTrainingManager:
                 "sgdr": self.policy_engine.sgdr_cooldown_remaining,
                 "clipping": self.policy_engine.clipping_cooldown_remaining,
                 "overfitting": self.policy_engine.overfit_cooldown_remaining,
+                "dropout": self.policy_engine.dropout_cooldown_remaining,
             },
+            "current_dropout": float(getattr(self.trainer.model_config, "dropout", 0.0)),
             "recent_val_losses": self.metrics.get_window('val_loss', 5),
             "loss_trend": self.metrics.get_trend('loss', 30),
             "val_loss_trend": self.metrics.get_trend('val_loss', 10),
@@ -1911,6 +2035,7 @@ class HybridTrainingManager:
                 "sgdr_cooldown_remaining": self.policy_engine.sgdr_cooldown_remaining,
                 "clipping_cooldown_remaining": self.policy_engine.clipping_cooldown_remaining,
                 "overfit_cooldown_remaining": self.policy_engine.overfit_cooldown_remaining,
+                "dropout_cooldown_remaining": self.policy_engine.dropout_cooldown_remaining,
                 "stagnation_counter": self.policy_engine.stagnation_counter,
                 "best_val_loss_for_stagnation": self.policy_engine.best_val_loss_for_stagnation,
                 "overfit_consecutive": self.policy_engine.overfit_consecutive,
@@ -1968,6 +2093,9 @@ class HybridTrainingManager:
             )
             self.policy_engine.overfit_cooldown_remaining = ps.get(
                 "overfit_cooldown_remaining", 0
+            )
+            self.policy_engine.dropout_cooldown_remaining = ps.get(
+                "dropout_cooldown_remaining", 0
             )
             self.policy_engine.stagnation_counter = ps.get("stagnation_counter", 0)
             self.policy_engine.best_val_loss_for_stagnation = ps.get(
@@ -2074,6 +2202,7 @@ class HybridTrainingManager:
             "lr_applied": lr_applied,
             # Legacy field preserved for backward compatibility
             "lr_current": self._current_base_lr,
+            "dropout": float(getattr(self.trainer.model_config, "dropout", 0.0)),
             "stagnation_counter": self.policy_engine.stagnation_counter,
             "overfit_consecutive": self.policy_engine.overfit_consecutive,
         }
@@ -2121,6 +2250,10 @@ class HybridTrainingManager:
             self.policy_engine.overfit_consecutive = 0  # Reset counter
             self._current_base_lr = decision.after_value
             self._lr_overridden = True
+
+        elif decision.policy_name == "OverfitDropout":
+            self.policy_engine.dropout_cooldown_remaining = self.config.dropout_cooldown
+            self.policy_engine.overfit_consecutive = 0
 
         elif decision.policy_name == "AdaptiveWarmup":
             self.policy_engine.current_warmup_steps = int(decision.after_value)

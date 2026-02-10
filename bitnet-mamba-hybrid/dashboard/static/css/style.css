@@ -241,6 +241,20 @@ header {
     font-family: var(--font-mono);
 }
 
+/* Prevent long checkpoint filenames from overflowing status card */
+.card-checkpoint .card-value {
+    font-size: 1rem;
+    line-height: 1.25;
+}
+
+#stat-last-checkpoint {
+    display: block;
+    max-width: 100%;
+    overflow-wrap: anywhere;
+    word-break: break-all;
+    white-space: normal;
+}
+
 /* Progress bar */
 .progress-bar-outer {
     height: 6px;

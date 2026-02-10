@@ -798,12 +798,14 @@ class Trainer:
         wandb_api_key: Optional[str] = None,
         weights_only_resume: bool = False,
         use_training_manager: bool = False,
+        training_manager_config: Optional[Any] = None,
     ):
         self.model = model
         self.train_config = train_config
         self.model_config = model_config
         self.weights_only_resume = weights_only_resume
         self.use_training_manager = use_training_manager
+        self.training_manager_config = training_manager_config
 
         # Setup device
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -846,7 +848,7 @@ class Trainer:
         if self.use_training_manager and TRAINING_MANAGER_AVAILABLE:
             self.training_manager = HybridTrainingManager(
                 trainer=self,
-                config=TrainingManagerConfig(),
+                config=self.training_manager_config or TrainingManagerConfig(),
             )
             if self._pending_training_manager_state is not None:
                 try:
@@ -1573,6 +1575,7 @@ class Trainer:
         # Training metrics
         accumulated_loss = 0.0
         accumulated_tokens = 0
+        optimizer_steps_since_log = 0
         step_start_time = datetime.now()
         batch_idx = 0
         interrupted = False
@@ -1634,16 +1637,22 @@ class Trainer:
 
                     self.global_step += 1
                     self.total_tokens += accumulated_tokens
+                    optimizer_steps_since_log += 1
+
+                    # Use the actual number of accumulated optimizer steps in the
+                    # current logging window (important right after resume).
+                    window_steps = max(optimizer_steps_since_log, 1)
+                    window_denom = window_steps * self.train_config.gradient_accumulation_steps
+                    avg_loss = accumulated_loss / window_denom
 
                     # Training Manager hook: on_step
                     if self.training_manager is not None and self.global_step % self.train_config.log_interval == 0:
                         try:
                             step_time = (datetime.now() - step_start_time).total_seconds()
                             _tps = accumulated_tokens / step_time if step_time > 0 else 0
-                            _avg = accumulated_loss / (self.train_config.log_interval * self.train_config.gradient_accumulation_steps)
                             self.training_manager.on_step(
                                 step=self.global_step,
-                                loss=_avg,
+                                loss=avg_loss,
                                 grad_norm=grad_stats['grad_norm_total'],
                                 grad_stats=grad_stats,
                                 lr=current_lr,
@@ -1656,9 +1665,6 @@ class Trainer:
                     if self.global_step % self.train_config.log_interval == 0:
                         step_time = (datetime.now() - step_start_time).total_seconds()
                         tokens_per_sec = accumulated_tokens / step_time if step_time > 0 else 0
-
-                        # FIX: Divide by total number of batches, not just optimizer steps
-                        avg_loss = accumulated_loss / (self.train_config.log_interval * self.train_config.gradient_accumulation_steps)
 
                         self.logger.info(
                             f"Step {self.global_step:>7} | "
@@ -1702,6 +1708,7 @@ class Trainer:
                         self._log_to_wandb(wandb_metrics, step=self.global_step)
 
                         accumulated_loss = 0.0
+                        optimizer_steps_since_log = 0
                         step_start_time = datetime.now()
 
                     accumulated_tokens = 0
@@ -1887,6 +1894,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--training_manager", action="store_true",
                         help="Enable HybridTrainingManager for automated policy-based "
                              "LR/grad_clip adjustments (ReduceLROnPlateau, SGDR, BitNet-aware)")
+    parser.add_argument("--tm_enable_dropout_policy", action="store_true",
+                        help="Opt-in: allow TrainingManager to increase dropout under persistent overfitting")
+    parser.add_argument("--tm_dropout_start", type=float, default=0.03,
+                        help="Initial dropout value when enabling dropout policy from near-zero")
+    parser.add_argument("--tm_dropout_step", type=float, default=0.01,
+                        help="Dropout increment per policy action")
+    parser.add_argument("--tm_dropout_max", type=float, default=0.10,
+                        help="Maximum dropout allowed for TrainingManager policy")
+    parser.add_argument("--tm_dropout_cooldown", type=int, default=5,
+                        help="Cooldown in eval cycles after dropout increase")
 
     return parser.parse_args()
 
@@ -2043,11 +2060,31 @@ def main():
     wandb_api_key = args.wandb_api_key or os.environ.get('WANDB_API_KEY')
 
     # Create trainer and start training
+    training_manager_config = None
+    if args.training_manager and TRAINING_MANAGER_AVAILABLE:
+        if args.tm_dropout_start < 0 or args.tm_dropout_max < 0 or args.tm_dropout_step < 0:
+            raise ValueError("TrainingManager dropout parameters must be non-negative.")
+        if args.tm_dropout_start > args.tm_dropout_max:
+            raise ValueError("--tm_dropout_start cannot be greater than --tm_dropout_max.")
+        if args.tm_dropout_max > 0.5:
+            raise ValueError("--tm_dropout_max is too high (max supported: 0.5).")
+        if args.tm_dropout_cooldown < 0:
+            raise ValueError("--tm_dropout_cooldown must be >= 0.")
+
+        training_manager_config = TrainingManagerConfig(
+            enable_dropout_policy=args.tm_enable_dropout_policy,
+            dropout_start=args.tm_dropout_start,
+            dropout_step=args.tm_dropout_step,
+            dropout_max=args.tm_dropout_max,
+            dropout_cooldown=args.tm_dropout_cooldown,
+        )
+
     trainer = Trainer(
         model, train_config, model_config,
         wandb_api_key=wandb_api_key,
         weights_only_resume=args.weights_only,
         use_training_manager=args.training_manager,
+        training_manager_config=training_manager_config,
     )
     trainer.train(dataloader)
 

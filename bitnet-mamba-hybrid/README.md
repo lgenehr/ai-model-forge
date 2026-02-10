@@ -248,6 +248,12 @@ python train_hybrid-mamba-bitnet.py \
 | `--output_dir` | ./ai-model-forge/bitnet-mamba-hybrid | Diretório de saída |
 | `--seed` | 42 | Seed aleatória |
 | `--no_amp` | False | Desabilitar mixed precision |
+| `--training_manager` | False | Habilita o HybridTrainingManager |
+| `--tm_enable_dropout_policy` | False | Opt-in para política de aumento de dropout em overfitting persistente |
+| `--tm_dropout_start` | 0.03 | Valor inicial de dropout quando a política sair de ~0 |
+| `--tm_dropout_step` | 0.01 | Incremento de dropout por ação |
+| `--tm_dropout_max` | 0.10 | Teto máximo de dropout da política |
+| `--tm_dropout_cooldown` | 5 | Cooldown em ciclos de eval após aumento de dropout |
 
 ### Exemplos de Configuração
 
@@ -327,6 +333,41 @@ python train_hybrid-mamba-bitnet.py
 python train_hybrid-mamba-bitnet.py
 # Output: "Resuming from checkpoint: checkpoints/checkpoint_00005000.pt"
 ```
+
+### Training Manager: Policy de Dropout (Opt-in)
+
+Por padrão, a policy de dropout do Training Manager fica **desabilitada**.
+
+```bash
+# Mantem comportamento atual (dropout policy OFF)
+python train_hybrid-mamba-bitnet.py --training_manager
+```
+
+```bash
+# Ativa policy de dropout (opt-in)
+python train_hybrid-mamba-bitnet.py \
+    --training_manager \
+    --tm_enable_dropout_policy \
+    --tm_dropout_start 0.03 \
+    --tm_dropout_step 0.01 \
+    --tm_dropout_max 0.08 \
+    --tm_dropout_cooldown 5
+```
+
+#### Boas práticas (quando ativar)
+
+- Ative quando houver **overfitting persistente**:
+  train_loss caindo por várias evals enquanto val_loss sobe de forma consistente.
+- Prefira começar com valores conservadores:
+  `--tm_dropout_start 0.03`, `--tm_dropout_step 0.01`, `--tm_dropout_max 0.08`.
+- Mantenha cooldown para evitar mudanças frequentes:
+  `--tm_dropout_cooldown 5` (ou maior em treinos mais ruidosos).
+
+#### Quando não ativar
+
+- Em **plateau ruidoso com clipping** (sem evidência clara de overfitting).
+- Quando treino e validação estão próximos (gap pequeno).
+- Em fase inicial de aquecimento/estabilização do treino.
 
 ---
 

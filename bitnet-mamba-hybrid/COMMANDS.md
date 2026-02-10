@@ -57,6 +57,31 @@ python train_hybrid-mamba-bitnet.py \
     --seed 42
 ```
 
+### Training Manager com policy de dropout (opt-in)
+
+```bash
+python train_hybrid-mamba-bitnet.py \
+    --d_model 1280 \
+    --n_layers 14 \
+    --output_dir model_204m \
+    --wandb \
+    --wandb_run_name "tm-dropout-optin-$(date +%Y%m%d-%H%M%S)" \
+    --training_manager \
+    --tm_enable_dropout_policy \
+    --tm_dropout_start 0.03 \
+    --tm_dropout_step 0.01 \
+    --tm_dropout_max 0.08 \
+    --tm_dropout_cooldown 5 \
+    --seed 42
+```
+
+#### Boas praticas (dropout policy)
+
+- Ativar quando houver overfitting persistente (train_loss cai por varias evals e val_loss sobe).
+- Comecar conservador: `--tm_dropout_start 0.03 --tm_dropout_step 0.01 --tm_dropout_max 0.08`.
+- Usar cooldown para evitar ajustes frequentes: `--tm_dropout_cooldown 5`.
+- Nao ativar em plateau ruidoso com clipping sem sinal claro de overfitting.
+
 ### Monitorar treino
 
 ```bash
@@ -138,6 +163,12 @@ python inference_hybrid.py \
 | `--weights_only` | off | Resume apenas pesos (ignora estado do optimizer) |
 | `--output_dir` | . | Diretorio de saida |
 | `--data_dir` | ./data/tokenized | Diretorio dos dados tokenizados |
+| `--training_manager` | off | Ativa o HybridTrainingManager |
+| `--tm_enable_dropout_policy` | off | Opt-in para policy de aumento de dropout em overfitting persistente |
+| `--tm_dropout_start` | 0.03 | Valor inicial de dropout ao sair de ~0 |
+| `--tm_dropout_step` | 0.01 | Incremento de dropout por acao |
+| `--tm_dropout_max` | 0.10 | Teto maximo de dropout da policy |
+| `--tm_dropout_cooldown` | 5 | Cooldown em ciclos de eval apos aumento |
 
 ### Inferencia
 
