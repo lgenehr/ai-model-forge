@@ -832,11 +832,13 @@ class Trainer:
         # Setup Weights & Biases
         self._setup_wandb(wandb_api_key)
 
+        # Pre-initialize training_manager to None so _load_checkpoint can reference it
+        self.training_manager = None
+
         # Try to resume from checkpoint
         self._try_resume(weights_only=self.weights_only_resume)
 
         # Initialize HybridTrainingManager (after checkpoint resume)
-        self.training_manager = None
         if self.use_training_manager and TRAINING_MANAGER_AVAILABLE:
             self.training_manager = HybridTrainingManager(
                 trainer=self,
