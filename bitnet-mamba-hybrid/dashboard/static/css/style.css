@@ -612,32 +612,6 @@ header {
 }
 
 /* --- Checkpoints Table --- */
-.checkpoint-summary {
-    padding: 0 24px 12px;
-}
-
-.checkpoint-summary .card-value {
-    font-size: 1rem;
-    line-height: 1.35;
-}
-
-.checkpoint-summary #ckpt-latest-name {
-    display: block;
-    white-space: normal;
-    overflow-wrap: anywhere;
-    word-break: break-word;
-    line-height: 1.35;
-}
-
-.checkpoint-lag-note {
-    min-height: 1.2em;
-    margin-top: 2px;
-}
-
-.checkpoint-lag-warning {
-    color: var(--accent-yellow);
-    font-weight: 600;
-}
 
 .table-wrap {
     padding: 0 24px;

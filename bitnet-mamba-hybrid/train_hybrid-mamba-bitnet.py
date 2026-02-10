@@ -316,6 +316,7 @@ class TrainingConfig:
     wandb_project: str = "bitnet-mamba-hybrid"
     wandb_run_name: Optional[str] = None
     wandb_entity: Optional[str] = None
+    upload_best_model_to_wandb: bool = False
 
     def __post_init__(self):
         # Compute max steps from token budget
@@ -1013,22 +1014,25 @@ class Trainer:
             wandb.log(metrics, step=step)
 
     def _finish_wandb(self):
-        """Finish wandb run and upload final artifacts"""
+        """Finish wandb run and optionally upload final artifacts"""
         if self.wandb_enabled and WANDB_AVAILABLE:
-            # Log final model as artifact
-            try:
-                best_model_path = Path(self.train_config.output_dir) / "best_model.pt"
-                if best_model_path.exists():
-                    artifact = wandb.Artifact(
-                        name=f"model-{wandb.run.id}",
-                        type="model",
-                        description="Best BitNet-Mamba model checkpoint"
-                    )
-                    artifact.add_file(str(best_model_path))
-                    wandb.log_artifact(artifact)
-                    self.logger.info("Uploaded best model to Weights & Biases")
-            except Exception as e:
-                self.logger.warning(f"Failed to upload model artifact: {e}")
+            if self.train_config.upload_best_model_to_wandb:
+                # Log final model as artifact when explicitly requested
+                try:
+                    best_model_path = Path(self.train_config.output_dir) / "best_model.pt"
+                    if best_model_path.exists():
+                        artifact = wandb.Artifact(
+                            name=f"model-{wandb.run.id}",
+                            type="model",
+                            description="Best BitNet-Mamba model checkpoint"
+                        )
+                        artifact.add_file(str(best_model_path))
+                        wandb.log_artifact(artifact)
+                        self.logger.info("Uploaded best model to Weights & Biases")
+                except Exception as e:
+                    self.logger.warning(f"Failed to upload model artifact: {e}")
+            else:
+                self.logger.info("Skipping best model upload to Weights & Biases")
 
             wandb.finish()
             self.logger.info("Weights & Biases run finished")
@@ -1857,6 +1861,8 @@ def parse_args() -> argparse.Namespace:
                         help="Weights & Biases run name (auto-generated if not provided)")
     parser.add_argument("--wandb_entity", type=str, default=None,
                         help="Weights & Biases entity (username or team name)")
+    parser.add_argument("--wandb_upload_best_model", action="store_true",
+                        help="Upload best_model.pt as a W&B artifact at the end of training")
 
     # Training Manager
     parser.add_argument("--training_manager", action="store_true",
@@ -1970,7 +1976,8 @@ def main():
         use_wandb=args.wandb,
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run_name,
-        wandb_entity=args.wandb_entity
+        wandb_entity=args.wandb_entity,
+        upload_best_model_to_wandb=args.wandb_upload_best_model
     )
 
     # Print configuration

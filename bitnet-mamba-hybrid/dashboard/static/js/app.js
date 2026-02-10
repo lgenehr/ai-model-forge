@@ -139,6 +139,10 @@
         document.getElementById("stat-lr-bit").textContent = formatSci(data.lr_bitlinear);
         document.getElementById("stat-loss").textContent = formatLoss(data.last_loss);
         document.getElementById("stat-val-loss").textContent = formatLoss(data.last_val_loss);
+        document.getElementById("stat-prev-val-loss").textContent = formatLoss(data.previous_val_loss);
+        document.getElementById("stat-last-step-time").textContent = formatTimestamp(data.last_step_time);
+        document.getElementById("stat-last-tps").textContent = formatNumber(data.last_tokens_per_sec);
+        document.getElementById("stat-last-checkpoint").textContent = data.latest_checkpoint_name || "--";
         document.getElementById("stat-best-val").textContent = formatLoss(data.best_val_loss);
 
         // Progress bar
@@ -300,10 +304,18 @@
                 pan: {
                     enabled: true,
                     mode: "x",
+                    modifierKey: "shift",
                 },
                 zoom: {
-                    wheel: { enabled: true },
-                    pinch: { enabled: true },
+                    wheel: { enabled: false },
+                    pinch: { enabled: false },
+                    drag: {
+                        enabled: true,
+                        backgroundColor: "rgba(88,166,255,0.15)",
+                        borderColor: "rgba(88,166,255,0.45)",
+                        borderWidth: 1,
+                    },
+                    modifierKey: "shift",
                     mode: "x",
                 },
             },
@@ -957,28 +969,9 @@
         if (!data) return;
 
         const latest = data.latest_checkpoint || null;
-        const lastStep = data.latest_step_metrics || null;
-        const lagNoteEl = document.getElementById("ckpt-lag-note");
-
-        document.getElementById("ckpt-latest-name").textContent = latest && latest.filename ? latest.filename : "--";
-        document.getElementById("ckpt-latest-step").textContent = latest && latest.step != null ? formatNumber(latest.step) : "--";
-        document.getElementById("ckpt-last-step").textContent = lastStep && lastStep.step != null ? formatNumber(lastStep.step) : "--";
-        document.getElementById("ckpt-last-loss").textContent = lastStep ? formatLoss(lastStep.loss) : "--";
-        document.getElementById("ckpt-last-lr").textContent = lastStep ? formatSci(lastStep.lr) : "--";
-        document.getElementById("ckpt-last-tokens").textContent = lastStep && lastStep.tokens != null ? formatNumber(lastStep.tokens) : "--";
-        document.getElementById("ckpt-last-tps").textContent = lastStep && lastStep.tokens_per_sec != null ? formatNumber(lastStep.tokens_per_sec) : "--";
-        document.getElementById("ckpt-last-ts").textContent = lastStep && lastStep.timestamp ? formatTimestamp(lastStep.timestamp) : "--";
-        if (lagNoteEl) {
-            const latestStepVal = latest && latest.step != null ? Number(latest.step) : null;
-            const currentStepVal = lastStep && lastStep.step != null ? Number(lastStep.step) : null;
-            if (latestStepVal !== null && currentStepVal !== null && currentStepVal > latestStepVal) {
-                const lag = currentStepVal - latestStepVal;
-                lagNoteEl.textContent = `Checkpoint defasado em ${formatNumber(lag)} steps`;
-                lagNoteEl.classList.add("checkpoint-lag-warning");
-            } else {
-                lagNoteEl.textContent = "";
-                lagNoteEl.classList.remove("checkpoint-lag-warning");
-            }
+        const latestCkptEl = document.getElementById("stat-last-checkpoint");
+        if (latestCkptEl) {
+            latestCkptEl.textContent = latest && latest.filename ? latest.filename : "--";
         }
 
         const tbody = document.getElementById("checkpoints-tbody");

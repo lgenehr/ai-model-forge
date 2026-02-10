@@ -380,6 +380,7 @@ python train_hybrid-mamba-bitnet.py --wandb
 | `--wandb_project` | bitnet-mamba-hybrid | Nome do projeto no W&B |
 | `--wandb_run_name` | None | Nome da run (auto-gerado se não fornecido) |
 | `--wandb_entity` | None | Entidade (username ou nome do time) |
+| `--wandb_upload_best_model` | False | Faz upload do `best_model.pt` como artefato ao finalizar treino |
 
 ### Métricas Rastreadas
 

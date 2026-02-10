@@ -181,6 +181,31 @@ def _detect_training_state(rows: list[dict]) -> str:
         return "unknown"
 
 
+def _get_latest_checkpoint_name() -> Optional[str]:
+    """Return filename of most recently modified checkpoint artifact."""
+    candidates: list[Path] = []
+    if CHECKPOINT_DIR.exists():
+        try:
+            candidates.extend(
+                [
+                    p for p in CHECKPOINT_DIR.iterdir()
+                    if p.is_file() and p.suffix == ".pt"
+                ]
+            )
+        except Exception:
+            pass
+
+    best = OUTPUT_DIR / "best_model.pt"
+    if best.exists():
+        candidates.append(best)
+
+    if not candidates:
+        return None
+
+    latest = max(candidates, key=lambda p: p.stat().st_mtime_ns)
+    return latest.name
+
+
 # ---------------------------------------------------------------------------
 # API Endpoints
 # ---------------------------------------------------------------------------
@@ -201,7 +226,11 @@ def get_status():
             "lr_bitlinear": 0,
             "last_loss": None,
             "last_val_loss": None,
+            "previous_val_loss": None,
             "best_val_loss": None,
+            "last_step_time": None,
+            "last_tokens_per_sec": None,
+            "latest_checkpoint_name": None,
             "regime": "UNKNOWN",
             "state": "idle",
             "progress_pct": 0.0,
@@ -212,14 +241,16 @@ def get_status():
 
     # Find best val_loss and last known val_loss
     best_val = None
-    last_val = None
+    val_history: list[float] = []
     for r in rows:
         parsed = _parse_csv_row(r)
         vl = parsed.get("val_loss")
         if vl is not None:
-            last_val = vl
+            val_history.append(vl)
             if best_val is None or vl < best_val:
                 best_val = vl
+    last_val = val_history[-1] if val_history else None
+    previous_val = val_history[-2] if len(val_history) > 1 else None
 
     # Elapsed time
     elapsed_seconds = 0.0
@@ -256,7 +287,11 @@ def get_status():
         "lr_bitlinear": lr_bitlinear,
         "last_loss": round(last.get("loss"), 6) if last.get("loss") is not None else None,
         "last_val_loss": round(last_val, 6) if last_val is not None else None,
+        "previous_val_loss": round(previous_val, 6) if previous_val is not None else None,
         "best_val_loss": round(best_val, 6) if best_val is not None else None,
+        "last_step_time": last.get("timestamp"),
+        "last_tokens_per_sec": round(last.get("tokens_per_sec"), 1) if last.get("tokens_per_sec") is not None else None,
+        "latest_checkpoint_name": _get_latest_checkpoint_name(),
         "regime": regime,
         "state": state,
         "progress_pct": round(progress, 2),
