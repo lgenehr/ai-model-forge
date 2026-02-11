@@ -45,11 +45,15 @@ OUTPUT_DIR = Path(
 CSV_PATH = OUTPUT_DIR / "loss_history.csv"
 JSONL_PATH = OUTPUT_DIR / "training_manager.log.jsonl"
 CHECKPOINT_DIR = OUTPUT_DIR / "checkpoints"
+CHECKPOINT_CONFIG_PATH = PROJECT_DIR / "checkpoint_config.json"
 
 # Training constants (from project memory)
 MAX_STEPS = 61_035
 MAX_TOKENS = 8_000_000_000
 BITLINEAR_LR_SCALE = 1.5
+GRAD_NORM_BASELINE = 1.0
+GRAD_NORM_YLIM = (0.99, 1.001)
+CLIP_FREQ_YLIM = (0.0, 100.0)
 
 # ---------------------------------------------------------------------------
 # App
@@ -136,6 +140,68 @@ def _read_jsonl_entries() -> list[dict]:
     except Exception:
         pass
     return entries
+
+
+def _get_grad_clip_threshold() -> float:
+    """Best-effort current max_grad_norm value for dashboard reference line."""
+    # Allow manual override for dashboards attached to remote training processes.
+    env_value = os.environ.get("TRAINING_MAX_GRAD_NORM")
+    if env_value:
+        try:
+            return float(env_value)
+        except ValueError:
+            pass
+
+    # Prefer latest runtime value if a policy decision changed clipping.
+    entries = _read_jsonl_entries()
+    for e in reversed(entries):
+        action = e.get("action") or {}
+        if action.get("param") == "max_grad_norm" and action.get("after") is not None:
+            try:
+                return float(action["after"])
+            except (ValueError, TypeError):
+                pass
+
+    # Fallback to latest W&B run config.
+    wandb_dir = OUTPUT_DIR / "wandb"
+    if wandb_dir.exists():
+        configs = sorted(
+            (
+                p for p in wandb_dir.glob("run-*/files/config.yaml")
+                if p.is_file()
+            ),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for cfg in configs[:20]:
+            try:
+                text = cfg.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            m = re.search(
+                r"(?m)^max_grad_norm:\s*\n\s*value:\s*([0-9eE.+-]+)\s*$",
+                text,
+            )
+            if not m:
+                m = re.search(r"(?m)^max_grad_norm:\s*([0-9eE.+-]+)\s*$", text)
+            if m:
+                try:
+                    return float(m.group(1))
+                except ValueError:
+                    continue
+
+    # Fallback to checkpoint config if available.
+    if CHECKPOINT_CONFIG_PATH.exists():
+        try:
+            with open(CHECKPOINT_CONFIG_PATH, "r") as f:
+                data = json.load(f)
+            value = data.get("train_config", {}).get("max_grad_norm")
+            if value is not None:
+                return float(value)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+
+    return 1.0
 
 
 def _format_elapsed(seconds: float) -> str:
@@ -482,22 +548,46 @@ def get_grad_norms():
 
     steps: list[int] = []
     grad_norm: list[float] = []
+    grad_norm_delta: list[float] = []
+    grad_norm_bitlinear: list[float] = []
+    grad_norm_ssm: list[float] = []
+    grad_norm_embedding: list[float] = []
     clipping_freq: list[float] = []
+    clipping_freq_pct: list[float] = []
+    timestamps: list[str] = []
 
     for e in entries:
         metrics = e.get("metrics", {})
         gn = metrics.get("grad_norm")
         s = e.get("step")
         if s is not None and gn is not None:
+            gn_value = float(gn)
             steps.append(s)
-            grad_norm.append(gn)
+            grad_norm.append(gn_value)
+            grad_norm_delta.append(gn_value - GRAD_NORM_BASELINE)
+            grad_norm_bitlinear.append(metrics.get("grad_norm_bitlinear") or 0.0)
+            grad_norm_ssm.append(metrics.get("grad_norm_ssm") or 0.0)
+            grad_norm_embedding.append(metrics.get("grad_norm_embedding") or 0.0)
             cf = metrics.get("clipping_freq")
-            clipping_freq.append(cf if cf is not None else 0.0)
+            cf_value = float(cf) if cf is not None else 0.0
+            clipping_freq.append(cf_value)
+            clipping_freq_pct.append(cf_value * 100.0 if cf_value <= 1.0 else cf_value)
+            timestamps.append(e.get("timestamp", ""))
 
     return {
         "steps": steps,
         "grad_norm": grad_norm,
+        "grad_norm_delta": grad_norm_delta,
+        "grad_norm_baseline": GRAD_NORM_BASELINE,
+        "grad_norm_bitlinear": grad_norm_bitlinear,
+        "grad_norm_ssm": grad_norm_ssm,
+        "grad_norm_embedding": grad_norm_embedding,
         "clipping_freq": clipping_freq,
+        "clipping_freq_pct": clipping_freq_pct,
+        "timestamps": timestamps,
+        "grad_clip_threshold": _get_grad_clip_threshold(),
+        "grad_norm_ylim": list(GRAD_NORM_YLIM),
+        "clip_freq_ylim": list(CLIP_FREQ_YLIM),
     }
 
 

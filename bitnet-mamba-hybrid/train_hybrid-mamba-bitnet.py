@@ -1588,6 +1588,15 @@ class Trainer:
                     self.logger.info("Shutdown requested, finishing current step...")
                     interrupted = True
                     break
+
+                # Check for emergency stop from TrainingManager
+                if self.training_manager is not None and self.training_manager.emergency_stop:
+                    self.logger.critical(
+                        "[EMERGENCY] Emergency stop flag detected. "
+                        "Exiting training loop safely."
+                    )
+                    interrupted = True
+                    break
                 # Get input_ids and labels from batch dict
                 input_ids = batch['input_ids'].to(self.device, non_blocking=True)
                 labels = batch['labels'].to(self.device, non_blocking=True)
@@ -1742,6 +1751,16 @@ class Trainer:
                                 )
                             except Exception as e:
                                 self.logger.warning(f"TrainingManager.on_eval failed: {e}")
+
+                            # CRITICAL: Check emergency stop immediately after on_eval
+                            # This is where ValLossDivergence sets the flag
+                            if self.training_manager.emergency_stop:
+                                self.logger.critical(
+                                    "[EMERGENCY] Emergency stop flag detected after eval. "
+                                    "Exiting training loop safely."
+                                )
+                                interrupted = True
+                                break
 
                         # Track best model based on val_loss
                         is_best = val_loss < self.best_loss

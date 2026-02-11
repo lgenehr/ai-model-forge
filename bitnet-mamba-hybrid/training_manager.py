@@ -47,14 +47,14 @@ class TrainingManagerConfig:
     clipping_window: int = 100       # Steps to track clipping frequency
 
     # --- Plateau detection ---
-    plateau_patience: int = 10       # Evals without improvement before plateau
+    plateau_patience: int = 3        # Evals without improvement before plateau (was 10)
     plateau_min_delta: float = 0.02  # Min improvement to count as progress
     plateau_window: int = 10         # Window of evals for variation check
 
     # --- ReduceLROnPlateau ---
-    lr_reduction_factor: float = 0.92  # Conservative 8% reduction per trigger (BitNet-aware)
-    lr_reduction_cooldown: int = 5     # Evals of cooldown after LR reduction
-    plateau_consecutive_windows: int = 2  # Require N consecutive windows of no improvement
+    lr_reduction_factor: float = 0.5   # Aggressive 50% reduction per trigger (was 0.92)
+    lr_reduction_cooldown: int = 3     # Evals of cooldown after LR reduction (was 5)
+    plateau_consecutive_windows: int = 1  # Require N consecutive windows (was 2)
 
     # --- SGDR (Cosine Annealing with Warm Restarts) ---
     sgdr_trigger_patience: int = 20    # Evals of stagnation before SGDR (2x plateau)
@@ -72,6 +72,27 @@ class TrainingManagerConfig:
     clipping_stage2_persistence_windows: int = 1  # Full windows of persistent clipping before stage 2
     clipping_lr_reduction_min: float = 0.90       # Min factor (max 10% reduction per event)
     clipping_lr_reduction_max: float = 0.95       # Max factor (min 5% reduction per event)
+
+    # --- Clipping Dominant Intervention (NEW — Policy A) ---
+    clipping_dominant_threshold: float = 0.80   # 80% clipping freq triggers intervention
+    clipping_dominant_window: int = 50          # Steps to evaluate dominance
+    clipping_dominant_lr_factor: float = 0.50   # 50% LR cut (immediate)
+    clipping_dominant_reset_bitlinear: bool = True  # Force BitLinear scale to 1.0
+    clipping_dominant_grad_clip: float = 2.0    # Set grad_clip to this value
+    clipping_dominant_cooldown: int = 2         # Evals of cooldown after intervention
+
+    # --- Plateau Escape (NEW — Policy B) ---
+    plateau_escape_var_threshold: float = 0.05  # Max val_loss variation to consider flat
+    plateau_escape_evals: int = 5               # Consecutive flat evals before escape
+    plateau_escape_lr_factor: float = 0.30      # LR *= 0.3 (aggressive escape)
+    plateau_escape_cooldown: int = 3            # Evals of cooldown after escape
+
+    # --- Val Loss Divergence (NEW — Policy C) ---
+    val_divergence_patience: int = 2            # Consecutive worsening evals
+
+    # --- Emergency ---
+    emergency_clipping_steps: int = 200         # Plateau+clipping steps before emergency stop
+    max_critical_lr_change_pct: float = 0.70    # Max LR change for critical policies (was 0.20)
 
     # --- Overfitting detection ---
     overfit_consecutive_evals: int = 5  # Consecutive evals of diverging losses
@@ -93,8 +114,8 @@ class TrainingManagerConfig:
     min_evals_before_action: int = 3   # Require at least 3 evals before any policy
 
     # --- BitNet-specific ---
-    bitnet_patience_scale: float = 1.5  # Patience multiplied by this for BitNet
-    bitnet_min_delta_scale: float = 1.3 # Min delta multiplied for BitNet tolerance
+    bitnet_patience_scale: float = 1.0  # Patience multiplied by this for BitNet (was 1.5)
+    bitnet_min_delta_scale: float = 1.0 # Min delta multiplied for BitNet tolerance (was 1.3)
 
     # --- Logging ---
     log_file: str = "training_manager.log.jsonl"
@@ -123,6 +144,7 @@ class ActionType(Enum):
     GRAD_CLIP_INCREASE = "grad_clip_increase"
     WARMUP_EXTENSION = "warmup_extension"
     DROPOUT_INCREASE = "dropout_increase"
+    EMERGENCY_STOP = "emergency_stop"  # Save checkpoint + signal stop
     OBSERVATION = "observation"        # No action, just logging
 
 
@@ -137,6 +159,7 @@ class PolicyDecision:
     justification: str
     priority: int = 0             # Lower = higher priority
     requires_checkpoint: bool = True
+    is_critical: bool = False     # Critical policies bypass 20% LR change limit
 
 
 @dataclass
@@ -283,6 +306,21 @@ class MetricCollector:
         if len(self.clipping_events) == 0:
             return 0.0
         return sum(self.clipping_events) / len(self.clipping_events)
+
+    def get_clipping_frequency_window(self, window: int) -> float:
+        """Get clipping frequency over the last `window` steps.
+
+        Args:
+            window: Number of recent steps to evaluate.
+
+        Returns:
+            Float between 0.0 and 1.0.
+        """
+        events = list(self.clipping_events)
+        if len(events) == 0:
+            return 0.0
+        recent = events[-min(window, len(events)):]
+        return sum(recent) / len(recent) if recent else 0.0
 
     def get_std(self, metric_name: str, size: Optional[int] = None) -> float:
         """Get standard deviation of a metric over a window.
@@ -659,6 +697,21 @@ class HybridPolicyEngine:
         self.clipping_stage1_applied_at_eval: int = -1  # Eval count when stage 1 was last applied
         self.clipping_persistent_since_stage1: int = 0  # Consecutive evals with persistent clipping after stage 1
 
+        # NEW: Clipping Dominant intervention state
+        self.clipping_dominant_cooldown_remaining: int = 0
+        self.clipping_dominant_fired: bool = False
+
+        # NEW: Plateau Escape state
+        self.plateau_escape_counter: int = 0  # Consecutive evals with flat val_loss
+        self.plateau_escape_cooldown_remaining: int = 0
+
+        # NEW: Val Loss Divergence state
+        self.val_divergence_counter: int = 0  # Consecutive evals where val_loss worsened
+        self.best_val_loss: float = float('inf')  # Overall best val_loss
+
+        # NEW: Emergency clipping counter (steps in plateau+clipping)
+        self.emergency_clipping_counter: int = 0
+
     def update_cooldowns(self):
         """Decrement all cooldown counters by 1 (called per eval)."""
         self.lr_reduction_cooldown_remaining = max(0, self.lr_reduction_cooldown_remaining - 1)
@@ -666,6 +719,8 @@ class HybridPolicyEngine:
         self.clipping_cooldown_remaining = max(0, self.clipping_cooldown_remaining - 1)
         self.overfit_cooldown_remaining = max(0, self.overfit_cooldown_remaining - 1)
         self.dropout_cooldown_remaining = max(0, self.dropout_cooldown_remaining - 1)
+        self.clipping_dominant_cooldown_remaining = max(0, self.clipping_dominant_cooldown_remaining - 1)
+        self.plateau_escape_cooldown_remaining = max(0, self.plateau_escape_cooldown_remaining - 1)
 
     def update_stagnation(self, val_loss: float):
         """Track stagnation for SGDR trigger.
@@ -678,6 +733,40 @@ class HybridPolicyEngine:
             self.stagnation_counter = 0
         else:
             self.stagnation_counter += 1
+
+    def update_val_divergence(self, val_loss: float):
+        """Track consecutive val_loss worsening for Policy C.
+
+        Args:
+            val_loss: Current validation loss.
+        """
+        if val_loss < self.best_val_loss:
+            self.best_val_loss = val_loss
+        if val_loss > self.best_val_loss + 0.001:
+            self.val_divergence_counter += 1
+        else:
+            self.val_divergence_counter = 0
+
+    def update_plateau_escape(self, metrics: MetricCollector):
+        """Track consecutive flat val_loss evals for Policy B.
+
+        Args:
+            metrics: MetricCollector with recent eval history.
+        """
+        if metrics.total_evals_recorded < 3:
+            self.plateau_escape_counter = 0
+            return
+
+        window = min(self.config.plateau_escape_evals, len(metrics.val_loss))
+        if window < 2:
+            self.plateau_escape_counter = 0
+            return
+
+        val_variation = metrics.get_variation('val_loss', window)
+        if val_variation < self.config.plateau_escape_var_threshold:
+            self.plateau_escape_counter += 1
+        else:
+            self.plateau_escape_counter = 0
 
     def update_overfitting_counter(self, metrics: MetricCollector):
         """Update consecutive overfitting counter.
@@ -728,14 +817,18 @@ class HybridPolicyEngine:
             return None
 
         # Policies in priority order (lower number = higher priority)
+        # NEW: Critical policies (A, B, C) have highest priority
         policies = [
-            (1, self._policy_adaptive_warmup, current_step, total_tokens, current_lr, metrics),
-            (2, self._policy_clipping_aware, current_lr, metrics),
-            (3, self._policy_dropout_on_overfitting, current_dropout, metrics, regime),
-            (3, self._policy_conservative_overfitting, current_lr, metrics, regime),
-            (4, self._policy_reduce_lr_on_plateau, current_lr, metrics, regime),
-            (5, self._policy_sgdr_partial, current_lr, metrics, regime),
-            (6, self._policy_cosine_observation, current_lr, current_step, metrics),
+            (0, self._policy_val_divergence, current_lr, metrics),
+            (0, self._policy_clipping_dominant, current_lr, metrics, regime),
+            (1, self._policy_plateau_escape, current_lr, metrics, regime),
+            (2, self._policy_adaptive_warmup, current_step, total_tokens, current_lr, metrics),
+            (3, self._policy_clipping_aware, current_lr, metrics),
+            (4, self._policy_dropout_on_overfitting, current_dropout, metrics, regime),
+            (4, self._policy_conservative_overfitting, current_lr, metrics, regime),
+            (5, self._policy_reduce_lr_on_plateau, current_lr, metrics, regime),
+            (6, self._policy_sgdr_partial, current_lr, metrics, regime),
+            (7, self._policy_cosine_observation, current_lr, current_step, metrics),
         ]
 
         for priority, policy_fn, *args in policies:
@@ -747,6 +840,30 @@ class HybridPolicyEngine:
             except Exception as e:
                 logging.getLogger(__name__).warning(
                     f"Policy {policy_fn.__name__} raised exception: {e}"
+                )
+
+        # GUARANTEE: PLATEAU_RUIDOSO_COM_CLIPPING NEVER ends in "No policy triggered"
+        # If we reach here and the regime is PLATEAU_RUIDOSO_COM_CLIPPING, force action.
+        if regime == TrainingRegime.PLATEAU_RUIDOSO_COM_CLIPPING:
+            if current_lr > self.min_lr * 1.05:
+                # Force a conservative LR reduction as last resort
+                new_lr = max(current_lr * 0.8, self.min_lr)
+                return PolicyDecision(
+                    policy_name="PlateauClippingFallback",
+                    action_type=ActionType.LR_REDUCTION,
+                    param_name="base_lr",
+                    before_value=current_lr,
+                    after_value=new_lr,
+                    justification=(
+                        f"[FALLBACK] PLATEAU_RUIDOSO_COM_CLIPPING guarantee: "
+                        f"No specific policy triggered, but regime is "
+                        f"PLATEAU_RUIDOSO_COM_CLIPPING. Forcing 20% LR reduction "
+                        f"as safety measure. Clipping freq: "
+                        f"{metrics.get_clipping_frequency():.1%}."
+                    ),
+                    priority=10,
+                    requires_checkpoint=True,
+                    is_critical=False,
                 )
 
         return None
@@ -999,6 +1116,180 @@ class HybridPolicyEngine:
             ),
             priority=1,
             requires_checkpoint=False,
+        )
+
+    # =========================================================================
+    # NEW CRITICAL POLICIES (A, B, C) — Prevent silent compute waste
+    # =========================================================================
+
+    # --- Policy A: Clipping Dominant Intervention (CRITICAL) ---
+
+    def _policy_clipping_dominant(
+        self,
+        current_lr: float,
+        metrics: MetricCollector,
+        regime: TrainingRegime,
+    ) -> Optional[PolicyDecision]:
+        """Aggressive intervention when gradient clipping dominates training.
+
+        Fires when clipping >= 80% of the last 50 steps. This indicates
+        the optimizer is fundamentally bounded and LR must be cut sharply.
+
+        Actions:
+        - LR *= 0.5 (immediate, via decision)
+        - BitLinear scale reset to 1.0 (via _apply_post_execution_state)
+        - grad_clip raised to 2.0 (via _apply_post_execution_state)
+
+        Returns:
+            PolicyDecision for aggressive LR reduction, or None.
+        """
+        if self.clipping_dominant_cooldown_remaining > 0:
+            return None
+
+        # Need enough clipping data
+        window = self.config.clipping_dominant_window
+        if len(metrics.clipping_events) < window * 0.5:
+            return None
+
+        clip_freq = metrics.get_clipping_frequency_window(window)
+        if clip_freq < self.config.clipping_dominant_threshold:
+            # Reset emergency counter when clipping subsides
+            self.emergency_clipping_counter = 0
+            return None
+
+        # Already at min_lr?
+        if current_lr <= self.min_lr * 1.05:
+            return None
+
+        new_lr = max(current_lr * self.config.clipping_dominant_lr_factor, self.min_lr)
+
+        return PolicyDecision(
+            policy_name="ClippingDominant",
+            action_type=ActionType.LR_REDUCTION,
+            param_name="base_lr",
+            before_value=current_lr,
+            after_value=new_lr,
+            justification=(
+                f"[CRITICAL] CLIPPING_DOMINANT_INTERVENTION: "
+                f"Gradient clipping at {clip_freq:.1%} over last {window} steps "
+                f"(threshold: {self.config.clipping_dominant_threshold:.0%}). "
+                f"Aggressive LR cut: {current_lr:.2e} -> {new_lr:.2e} "
+                f"({1-self.config.clipping_dominant_lr_factor:.0%} reduction). "
+                f"BitLinear scale will be reset to 1.0x. "
+                f"grad_clip will be raised to {self.config.clipping_dominant_grad_clip:.1f}."
+            ),
+            priority=0,
+            requires_checkpoint=True,
+            is_critical=True,
+        )
+
+    # --- Policy B: Forced Plateau Escape (AGGRESSIVE) ---
+
+    def _policy_plateau_escape(
+        self,
+        current_lr: float,
+        metrics: MetricCollector,
+        regime: TrainingRegime,
+    ) -> Optional[PolicyDecision]:
+        """Force escape from loss plateau via aggressive LR reduction.
+
+        Fires when val_loss variation < 0.05 for >= 5 consecutive evals,
+        indicating the model is stuck in a local minimum.
+
+        Returns:
+            PolicyDecision for aggressive LR reduction, or None.
+        """
+        if self.plateau_escape_cooldown_remaining > 0:
+            return None
+
+        if self.plateau_escape_counter < self.config.plateau_escape_evals:
+            return None
+
+        # Only fire in plateau regimes
+        if regime not in (
+            TrainingRegime.REAL_PLATEAU,
+            TrainingRegime.NOISY_PLATEAU,
+            TrainingRegime.PLATEAU_RUIDOSO_COM_CLIPPING,
+        ):
+            return None
+
+        if current_lr <= self.min_lr * 1.05:
+            return None
+
+        new_lr = max(current_lr * self.config.plateau_escape_lr_factor, self.min_lr)
+
+        val_variation = metrics.get_variation(
+            'val_loss', self.config.plateau_escape_evals
+        )
+
+        return PolicyDecision(
+            policy_name="ForcedPlateauEscape",
+            action_type=ActionType.LR_REDUCTION,
+            param_name="base_lr",
+            before_value=current_lr,
+            after_value=new_lr,
+            justification=(
+                f"FORCED_ESCAPE_PLATEAU: val_loss variation {val_variation:.4f} "
+                f"< {self.config.plateau_escape_var_threshold} for "
+                f"{self.plateau_escape_counter} consecutive evals. "
+                f"Aggressive LR reduction: {current_lr:.2e} -> {new_lr:.2e} "
+                f"({1-self.config.plateau_escape_lr_factor:.0%} cut). "
+                f"Regime: {regime.name}."
+            ),
+            priority=1,
+            requires_checkpoint=True,
+            is_critical=True,
+        )
+
+    # --- Policy C: Val Loss Divergence (SAFETY) ---
+
+    def _policy_val_divergence(
+        self,
+        current_lr: float,
+        metrics: MetricCollector,
+    ) -> Optional[PolicyDecision]:
+        """Emergency stop when validation loss diverges.
+
+        Fires when val_loss worsens for N consecutive evaluations,
+        indicating the model is moving away from generalization.
+
+        Actions:
+        - Save emergency checkpoint
+        - Signal training to pause
+
+        Returns:
+            PolicyDecision for emergency stop, or None.
+        """
+        if self.val_divergence_counter < self.config.val_divergence_patience:
+            return None
+
+        if metrics.total_evals_recorded < self.config.val_divergence_patience + 1:
+            return None
+
+        val_losses = metrics.get_window(
+            'val_loss', self.config.val_divergence_patience + 1
+        )
+        if len(val_losses) < 2:
+            return None
+
+        val_delta = val_losses[-1] - val_losses[0]
+
+        return PolicyDecision(
+            policy_name="ValLossDivergence",
+            action_type=ActionType.EMERGENCY_STOP,
+            param_name="training_state",
+            before_value=val_losses[0],
+            after_value=val_losses[-1],
+            justification=(
+                f"[EMERGENCY] VAL_LOSS_DIVERGENCE — TRAINING PAUSED: "
+                f"val_loss worsened for {self.val_divergence_counter} consecutive "
+                f"evaluations ({val_losses[0]:.4f} -> {val_losses[-1]:.4f}, "
+                f"delta={val_delta:+.4f}). Best val_loss: {self.best_val_loss:.4f}. "
+                f"Emergency checkpoint saved. Training should be reviewed."
+            ),
+            priority=0,
+            requires_checkpoint=True,
+            is_critical=True,
         )
 
     # --- Policy 5: BitNet Differential LR (passive) ---
@@ -1303,6 +1594,10 @@ class DecisionValidator:
             # Warmup extensions are always safe but still need justification
             return ValidationResult(True, "Warmup extension is safe.")
 
+        if decision.action_type == ActionType.EMERGENCY_STOP:
+            # Emergency stops are always valid — safety first
+            return ValidationResult(True, "Emergency stop is always valid.")
+
         if decision.action_type in (ActionType.LR_REDUCTION, ActionType.LR_INCREASE):
             return self._validate_lr_change(decision)
 
@@ -1333,14 +1628,19 @@ class DecisionValidator:
                 f"New LR ({new_lr:.2e}) would be below min_lr ({self.min_lr:.2e})."
             )
 
-        # Max change percentage — blocks any single adjustment >20%
+        # Max change percentage — use higher limit for critical policies
+        max_change = (
+            self.config.max_critical_lr_change_pct
+            if decision.is_critical
+            else self.config.max_lr_change_pct
+        )
         if old_lr > 0:
             change_pct = abs(new_lr - old_lr) / old_lr
-            if change_pct > self.config.max_lr_change_pct + 1e-6:
+            if change_pct > max_change + 1e-6:
                 return ValidationResult(
                     False,
                     f"LR change ({change_pct:.1%}) exceeds max allowed "
-                    f"({self.config.max_lr_change_pct:.1%}). "
+                    f"({max_change:.1%}{' [critical]' if decision.is_critical else ''}). "
                     f"Before: {old_lr:.2e}, After: {new_lr:.2e}."
                 )
 
@@ -1358,7 +1658,7 @@ class DecisionValidator:
             True,
             f"LR change within safe bounds "
             f"(change={abs(new_lr - old_lr) / max(old_lr, 1e-10):.1%}, "
-            f"max_allowed={self.config.max_lr_change_pct:.0%})."
+            f"max_allowed={max_change:.0%}{' [critical]' if decision.is_critical else ''})."
         )
 
     def _validate_grad_clip_change(self, decision: PolicyDecision) -> ValidationResult:
@@ -1495,6 +1795,14 @@ class ActionExecutor:
                 self.adjust_dropout(trainer, decision.after_value)
                 return True
 
+            elif decision.action_type == ActionType.EMERGENCY_STOP:
+                self.force_checkpoint(trainer, reason="EMERGENCY_STOP")
+                self.logger.critical(
+                    "[EMERGENCY] Training pause requested by ValLossDivergence policy. "
+                    "Emergency checkpoint saved."
+                )
+                return True
+
             elif decision.action_type == ActionType.OBSERVATION:
                 return True
 
@@ -1566,6 +1874,25 @@ class ActionExecutor:
         self.logger.info(
             f"[ActionExecutor] dropout adjusted: {old_dropout:.3f} -> "
             f"{new_dropout:.3f} (modules={applied})"
+        )
+
+    def adjust_bitlinear_scale(self, trainer, new_scale: float):
+        """Update BitLinear lr_scale in all relevant param groups.
+
+        Args:
+            trainer: Trainer instance.
+            new_scale: New BitLinear LR scale factor.
+        """
+        old_scale = trainer.train_config.bitlinear_lr_scale
+        trainer.train_config.bitlinear_lr_scale = new_scale
+
+        # Update param groups that have lr_scale > 1.0 (BitLinear groups)
+        for param_group in trainer.optimizer.param_groups:
+            if param_group.get('lr_scale', 1.0) > 1.0:
+                param_group['lr_scale'] = new_scale
+
+        self.logger.info(
+            f"[ActionExecutor] BitLinear lr_scale adjusted: {old_scale:.2f} -> {new_scale:.2f}"
         )
 
     def force_checkpoint(self, trainer, reason: str = "policy_action"):
@@ -1795,11 +2122,16 @@ class HybridTrainingManager:
         # Track the last train loss for on_eval
         self._last_train_loss: float = 0.0
 
+        # NEW: Emergency stop flag — training loop should check this
+        self.emergency_stop: bool = False
+
         self.logger.info(
             f"[TrainingManager] Initialized with config: "
             f"plateau_patience={self.config.plateau_patience}, "
             f"lr_reduction_factor={self.config.lr_reduction_factor}, "
-            f"bitnet_patience_scale={self.config.bitnet_patience_scale}"
+            f"bitnet_patience_scale={self.config.bitnet_patience_scale}, "
+            f"clipping_dominant_threshold={self.config.clipping_dominant_threshold}, "
+            f"val_divergence_patience={self.config.val_divergence_patience}"
         )
 
     # ----- Hook: on_step -----
@@ -1874,12 +2206,38 @@ class HybridTrainingManager:
         self.policy_engine.update_cooldowns()
         self.policy_engine.update_stagnation(val_loss)
         self.policy_engine.update_overfitting_counter(self.metrics)
+        self.policy_engine.update_val_divergence(val_loss)
+        self.policy_engine.update_plateau_escape(self.metrics)
+
+        # Track emergency clipping counter (step-level, updated here per eval)
+        clip_freq = self.metrics.get_clipping_frequency()
+        if clip_freq >= self.config.clipping_dominant_threshold:
+            self.policy_engine.emergency_clipping_counter += 1
+        else:
+            self.policy_engine.emergency_clipping_counter = 0
 
         # 2. Classify regime
         self._current_regime = self.analyzer.classify(self.metrics)
 
         # 3. Build metrics snapshot for logging
         metrics_snapshot = self._build_metrics_snapshot(val_loss, train_loss)
+
+        # Enhanced diagnostic logging (TASK 5)
+        best_val = self.policy_engine.best_val_loss
+        val_delta = val_loss - best_val if best_val < float('inf') else 0.0
+        policy_triggered = "None"
+
+        self.logger.info(
+            f"[TrainingManager] Step {step} | "
+            f"Regime: {self._current_regime.name} | "
+            f"Clipping Ratio: {clip_freq:.1%} | "
+            f"LR efetivo: {self._current_base_lr:.2e} | "
+            f"BitLinear Scale: {self._bitlinear_lr_scale}x | "
+            f"Plateau Steps: {self.policy_engine.stagnation_counter} | "
+            f"Best Val Loss: {best_val:.4f} (Δ {val_delta:+.3f}) | "
+            f"Val Divergence: {self.policy_engine.val_divergence_counter} | "
+            f"Emergency Counter: {self.policy_engine.emergency_clipping_counter}"
+        )
 
         # 4. Evaluate policies
         decision = self.policy_engine.evaluate_all(
@@ -1892,6 +2250,8 @@ class HybridTrainingManager:
         )
 
         if decision is not None and decision.action_type != ActionType.OBSERVATION:
+            policy_triggered = decision.policy_name
+
             # 5. Validate
             validation = self.validator.validate(decision)
 
@@ -1906,6 +2266,11 @@ class HybridTrainingManager:
                 if executed:
                     self._apply_post_execution_state(decision)
                     self.validator.record_executed_action(decision)
+
+                    # Set emergency_stop if policy requests it
+                    if decision.action_type == ActionType.EMERGENCY_STOP:
+                        self.emergency_stop = True
+
                     self.logger.info(
                         f"[TrainingManager] Step {step} | Regime: {self._current_regime.name} | "
                         f"Policy: {decision.policy_name} | "
@@ -1954,6 +2319,11 @@ class HybridTrainingManager:
                 f"No policy triggered."
             )
 
+        # Final diagnostic line with policy result
+        self.logger.info(
+            f"[TrainingManager] Policy Triggered: {policy_triggered}"
+        )
+
     # ----- Hook: on_checkpoint -----
 
     def on_checkpoint(self, step: int, reason: str = "scheduled"):
@@ -1989,11 +2359,18 @@ class HybridTrainingManager:
                 "clipping": self.policy_engine.clipping_cooldown_remaining,
                 "overfitting": self.policy_engine.overfit_cooldown_remaining,
                 "dropout": self.policy_engine.dropout_cooldown_remaining,
+                "clipping_dominant": self.policy_engine.clipping_dominant_cooldown_remaining,
+                "plateau_escape": self.policy_engine.plateau_escape_cooldown_remaining,
             },
             "current_dropout": float(getattr(self.trainer.model_config, "dropout", 0.0)),
             "recent_val_losses": self.metrics.get_window('val_loss', 5),
             "loss_trend": self.metrics.get_trend('loss', 30),
             "val_loss_trend": self.metrics.get_trend('val_loss', 10),
+            "val_divergence_counter": self.policy_engine.val_divergence_counter,
+            "best_val_loss": self.policy_engine.best_val_loss,
+            "plateau_escape_counter": self.policy_engine.plateau_escape_counter,
+            "emergency_clipping_counter": self.policy_engine.emergency_clipping_counter,
+            "emergency_stop": self.emergency_stop,
             "last_decisions": self._decision_history[-5:] if self._decision_history else [],
         }
 
@@ -2041,10 +2418,18 @@ class HybridTrainingManager:
                 "overfit_consecutive": self.policy_engine.overfit_consecutive,
                 "current_warmup_steps": self.policy_engine.current_warmup_steps,
                 "max_grad_norm": self.policy_engine.max_grad_norm,
-                # New: ClippingAwareBitNet two-stage state
+                # ClippingAwareBitNet two-stage state
                 "clipping_stage": self.policy_engine.clipping_stage,
                 "clipping_stage1_applied_at_eval": self.policy_engine.clipping_stage1_applied_at_eval,
                 "clipping_persistent_since_stage1": self.policy_engine.clipping_persistent_since_stage1,
+                # NEW: Critical policy state
+                "clipping_dominant_cooldown_remaining": self.policy_engine.clipping_dominant_cooldown_remaining,
+                "clipping_dominant_fired": self.policy_engine.clipping_dominant_fired,
+                "plateau_escape_counter": self.policy_engine.plateau_escape_counter,
+                "plateau_escape_cooldown_remaining": self.policy_engine.plateau_escape_cooldown_remaining,
+                "val_divergence_counter": self.policy_engine.val_divergence_counter,
+                "best_val_loss": self.policy_engine.best_val_loss,
+                "emergency_clipping_counter": self.policy_engine.emergency_clipping_counter,
             },
             "validator_state": {
                 "historical_max_lr": self.validator.historical_max_lr,
@@ -2108,13 +2493,36 @@ class HybridTrainingManager:
             self.policy_engine.max_grad_norm = ps.get(
                 "max_grad_norm", self._max_grad_norm
             )
-            # New: restore ClippingAwareBitNet two-stage state (backward-compatible defaults)
+            # Restore ClippingAwareBitNet two-stage state (backward-compatible defaults)
             self.policy_engine.clipping_stage = ps.get("clipping_stage", 1)
             self.policy_engine.clipping_stage1_applied_at_eval = ps.get(
                 "clipping_stage1_applied_at_eval", -1
             )
             self.policy_engine.clipping_persistent_since_stage1 = ps.get(
                 "clipping_persistent_since_stage1", 0
+            )
+
+            # Restore NEW critical policy state (backward-compatible defaults)
+            self.policy_engine.clipping_dominant_cooldown_remaining = ps.get(
+                "clipping_dominant_cooldown_remaining", 0
+            )
+            self.policy_engine.clipping_dominant_fired = ps.get(
+                "clipping_dominant_fired", False
+            )
+            self.policy_engine.plateau_escape_counter = ps.get(
+                "plateau_escape_counter", 0
+            )
+            self.policy_engine.plateau_escape_cooldown_remaining = ps.get(
+                "plateau_escape_cooldown_remaining", 0
+            )
+            self.policy_engine.val_divergence_counter = ps.get(
+                "val_divergence_counter", 0
+            )
+            self.policy_engine.best_val_loss = ps.get(
+                "best_val_loss", float('inf')
+            )
+            self.policy_engine.emergency_clipping_counter = ps.get(
+                "emergency_clipping_counter", 0
             )
 
             # Restore validator state
@@ -2254,6 +2662,53 @@ class HybridTrainingManager:
         elif decision.policy_name == "OverfitDropout":
             self.policy_engine.dropout_cooldown_remaining = self.config.dropout_cooldown
             self.policy_engine.overfit_consecutive = 0
+
+        elif decision.policy_name == "ClippingDominant":
+            self.policy_engine.clipping_dominant_cooldown_remaining = (
+                self.config.clipping_dominant_cooldown
+            )
+            self._current_base_lr = decision.after_value
+            self._lr_overridden = True
+            self.policy_engine.clipping_dominant_fired = True
+            # Also increase grad_clip and reset bitlinear scale
+            if self.config.clipping_dominant_reset_bitlinear:
+                self.executor.adjust_bitlinear_scale(
+                    self.trainer, 1.0
+                )
+                self._bitlinear_lr_scale = 1.0
+                self.policy_engine.bitlinear_lr_scale = 1.0
+            new_clip = self.config.clipping_dominant_grad_clip
+            if self.trainer.train_config.max_grad_norm < new_clip:
+                self.executor.adjust_grad_clip(self.trainer, new_clip)
+                self.policy_engine.max_grad_norm = new_clip
+            self.logger.critical(
+                f"[CRITICAL] CLIPPING_DOMINANT_INTERVENTION: "
+                f"LR={decision.after_value:.2e}, BitLinear=1.0x, "
+                f"grad_clip={new_clip:.1f}"
+            )
+
+        elif decision.policy_name == "ForcedPlateauEscape":
+            self.policy_engine.plateau_escape_cooldown_remaining = (
+                self.config.plateau_escape_cooldown
+            )
+            self.policy_engine.plateau_escape_counter = 0
+            self._current_base_lr = decision.after_value
+            self._lr_overridden = True
+            self.logger.warning(
+                f"FORCED_ESCAPE_PLATEAU: LR reduced to {decision.after_value:.2e}"
+            )
+
+        elif decision.policy_name == "ValLossDivergence":
+            # Emergency stop — just log, the flag is set in on_eval
+            self.logger.critical(
+                f"[EMERGENCY] VAL_LOSS_DIVERGENCE — TRAINING PAUSED. "
+                f"Val loss: {decision.before_value:.4f} -> {decision.after_value:.4f}"
+            )
+
+        elif decision.policy_name == "PlateauClippingFallback":
+            self.policy_engine.lr_reduction_cooldown_remaining = self.config.lr_reduction_cooldown
+            self._current_base_lr = decision.after_value
+            self._lr_overridden = True
 
         elif decision.policy_name == "AdaptiveWarmup":
             self.policy_engine.current_warmup_steps = int(decision.after_value)

@@ -14,7 +14,6 @@
     const API_BASE = "";  // same origin
     const MAX_STEPS = 61035;
     const MAX_TOKENS = 8e9;
-    const GRAD_CLIP_THRESHOLD = 1.0;
 
     let statusInterval = null;
     let metricsInterval = null;
@@ -552,13 +551,40 @@
         }
 
         const gnData = gradData.steps.map((s, i) => ({
-            x: s,
+            x: xAxisMode === "time" && gradData.timestamps ? new Date(gradData.timestamps[i]) : s,
             y: gradData.grad_norm[i],
         }));
-        const cfData = gradData.steps.map((s, i) => ({
-            x: s,
-            y: gradData.clipping_freq[i],
+        const gnDeltaData = gradData.steps.map((s, i) => ({
+            x: xAxisMode === "time" && gradData.timestamps ? new Date(gradData.timestamps[i]) : s,
+            y: gradData.grad_norm_delta ? gradData.grad_norm_delta[i] : null,
         }));
+        const gnBitlinearData = gradData.steps.map((s, i) => ({
+            x: xAxisMode === "time" && gradData.timestamps ? new Date(gradData.timestamps[i]) : s,
+            y: gradData.grad_norm_bitlinear ? gradData.grad_norm_bitlinear[i] : null,
+        }));
+        const gnSsmData = gradData.steps.map((s, i) => ({
+            x: xAxisMode === "time" && gradData.timestamps ? new Date(gradData.timestamps[i]) : s,
+            y: gradData.grad_norm_ssm ? gradData.grad_norm_ssm[i] : null,
+        }));
+        const gnEmbeddingData = gradData.steps.map((s, i) => ({
+            x: xAxisMode === "time" && gradData.timestamps ? new Date(gradData.timestamps[i]) : s,
+            y: gradData.grad_norm_embedding ? gradData.grad_norm_embedding[i] : null,
+        }));
+        const cfPctData = gradData.steps.map((s, i) => ({
+            x: xAxisMode === "time" && gradData.timestamps ? new Date(gradData.timestamps[i]) : s,
+            y: gradData.clipping_freq_pct
+                ? gradData.clipping_freq_pct[i]
+                : ((gradData.clipping_freq[i] || 0) <= 1.0
+                    ? (gradData.clipping_freq[i] || 0) * 100.0
+                    : (gradData.clipping_freq[i] || 0)),
+        }));
+        const gradClipThreshold = Number.isFinite(gradData.grad_clip_threshold)
+            ? gradData.grad_clip_threshold
+            : 1.0;
+        const gradNormYMin = Array.isArray(gradData.grad_norm_ylim) ? gradData.grad_norm_ylim[0] : 0.99;
+        const gradNormYMax = Array.isArray(gradData.grad_norm_ylim) ? gradData.grad_norm_ylim[1] : 1.001;
+        const clipFreqYMin = Array.isArray(gradData.clip_freq_ylim) ? gradData.clip_freq_ylim[0] : 0.0;
+        const clipFreqYMax = Array.isArray(gradData.clip_freq_ylim) ? gradData.clip_freq_ylim[1] : 100.0;
 
         const config = {
             type: "line",
@@ -570,16 +596,57 @@
                         borderColor: "#3fb950",
                         backgroundColor: "rgba(63, 185, 80, 0.05)",
                         fill: false,
-                        tension: 0.2,
+                        tension: 0,
                         yAxisID: "y",
                     },
                     {
-                        label: "Clipping Freq",
-                        data: cfData,
+                        label: "Grad Delta",
+                        data: gnDeltaData,
+                        borderColor: "rgba(139, 148, 158, 0.9)",
+                        backgroundColor: "rgba(139, 148, 158, 0.1)",
+                        borderDash: [1, 3],
+                        fill: false,
+                        tension: 0,
+                        yAxisID: "y",
+                        hidden: true,
+                    },
+                    {
+                        label: "BitLinear",
+                        data: gnBitlinearData,
+                        borderColor: "rgba(88, 166, 255, 0.9)",
+                        backgroundColor: "rgba(88, 166, 255, 0.1)",
+                        borderDash: [6, 3],
+                        fill: false,
+                        tension: 0,
+                        yAxisID: "y",
+                    },
+                    {
+                        label: "SSM",
+                        data: gnSsmData,
+                        borderColor: "rgba(210, 153, 34, 0.95)",
+                        backgroundColor: "rgba(210, 153, 34, 0.1)",
+                        borderDash: [4, 3],
+                        fill: false,
+                        tension: 0,
+                        yAxisID: "y",
+                    },
+                    {
+                        label: "Embedding",
+                        data: gnEmbeddingData,
+                        borderColor: "rgba(247, 120, 186, 0.9)",
+                        backgroundColor: "rgba(247, 120, 186, 0.1)",
+                        borderDash: [2, 2],
+                        fill: false,
+                        tension: 0,
+                        yAxisID: "y",
+                    },
+                    {
+                        label: "Clipping Freq (%)",
+                        data: cfPctData,
                         borderColor: "rgba(248, 81, 73, 0.6)",
                         backgroundColor: "rgba(248, 81, 73, 0.1)",
                         fill: true,
-                        tension: 0.2,
+                        tension: 0,
                         yAxisID: "y1",
                     },
                 ],
@@ -590,22 +657,28 @@
                 interaction: { mode: "index", intersect: false },
                 scales: {
                     x: {
-                        title: { display: true, text: "Step" },
-                        grid: { color: "rgba(48,54,61,0.5)" },
+                        ...xAxisConfig(),
                     },
                     y: {
                         type: "linear",
                         position: "left",
                         title: { display: true, text: "Grad Norm" },
                         grid: { color: "rgba(48,54,61,0.5)" },
+                        min: gradNormYMin,
+                        max: gradNormYMax,
                     },
                     y1: {
                         type: "linear",
                         position: "right",
-                        title: { display: true, text: "Clip Freq" },
+                        title: { display: true, text: "Clip Freq (%)" },
                         grid: { drawOnChartArea: false },
-                        min: 0,
-                        max: 1,
+                        min: clipFreqYMin,
+                        max: clipFreqYMax,
+                        ticks: {
+                            callback: function (v) {
+                                return v.toFixed(0) + "%";
+                            },
+                        },
                     },
                 },
                 plugins: {
@@ -614,15 +687,15 @@
                         annotations: {
                             clipLine: {
                                 type: "line",
-                                yMin: GRAD_CLIP_THRESHOLD,
-                                yMax: GRAD_CLIP_THRESHOLD,
+                                yMin: gradClipThreshold,
+                                yMax: gradClipThreshold,
                                 yScaleID: "y",
                                 borderColor: "rgba(248, 81, 73, 0.5)",
                                 borderWidth: 1,
                                 borderDash: [8, 4],
                                 label: {
                                     display: true,
-                                    content: "grad_clip=" + GRAD_CLIP_THRESHOLD,
+                                    content: "grad_clip=" + gradClipThreshold.toFixed(3),
                                     position: "end",
                                     font: { size: 9, family: "'JetBrains Mono'" },
                                     backgroundColor: "rgba(248,81,73,0.7)",
@@ -635,8 +708,8 @@
                     tooltip: {
                         callbacks: {
                             label: function (ctx) {
-                                if (ctx.datasetIndex === 0) return "Grad Norm: " + ctx.parsed.y.toFixed(4);
-                                return "Clip Freq: " + (ctx.parsed.y * 100).toFixed(1) + "%";
+                                if (ctx.dataset.yAxisID === "y1") return "Clip Freq: " + ctx.parsed.y.toFixed(1) + "%";
+                                return ctx.dataset.label + ": " + ctx.parsed.y.toFixed(4);
                             },
                         },
                     },
@@ -1064,6 +1137,9 @@
                 buildLossChart(cachedMetrics, cachedDecisions);
                 buildLRChart(cachedMetrics, cachedDecisions);
                 buildTokensChart(cachedMetrics);
+            }
+            if (cachedGradNorms) {
+                buildGradChart(cachedGradNorms);
             }
         });
 
