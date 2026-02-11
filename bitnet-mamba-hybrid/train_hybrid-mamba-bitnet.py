@@ -1654,8 +1654,10 @@ class Trainer:
                     window_denom = window_steps * self.train_config.gradient_accumulation_steps
                     avg_loss = accumulated_loss / window_denom
 
-                    # Training Manager hook: on_step
-                    if self.training_manager is not None and self.global_step % self.train_config.log_interval == 0:
+                    # Training Manager hook: on_step — called EVERY optimizer step
+                    # (not just at log_interval) so clipping_events and runtime
+                    # flags reflect real training dynamics, not sampled data.
+                    if self.training_manager is not None:
                         try:
                             step_time = (datetime.now() - step_start_time).total_seconds()
                             _tps = accumulated_tokens / step_time if step_time > 0 else 0

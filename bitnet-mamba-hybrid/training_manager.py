@@ -80,6 +80,7 @@ class TrainingManagerConfig:
     clipping_dominant_reset_bitlinear: bool = True  # Force BitLinear scale to 1.0
     clipping_dominant_grad_clip: float = 2.0    # Set grad_clip to this value
     clipping_dominant_cooldown: int = 2         # Evals of cooldown after intervention
+    clipping_dominant_consecutive: int = 5     # Consecutive clipped on_step calls to flag runtime dominant
 
     # --- Plateau Escape (NEW — Policy B) ---
     plateau_escape_var_threshold: float = 0.05  # Max val_loss variation to consider flat
@@ -203,6 +204,9 @@ class MetricCollector:
         # Monotonic counters
         self.total_steps_recorded: int = 0
         self.total_evals_recorded: int = 0
+
+        # Runtime flags (set by TrainingManager, read by StateAnalyzer)
+        self.flags: Dict[str, bool] = {}
 
     def record_step(
         self,
@@ -541,29 +545,52 @@ class BitNetStateAnalyzer(StateAnalyzer):
     def classify(self, metrics: MetricCollector) -> TrainingRegime:
         """Classify with BitNet-aware thresholds.
 
-        Uses larger patience windows and more tolerant min_delta
-        to account for ternary quantization noise.
-
-        Key addition: PLATEAU_RUIDOSO_COM_CLIPPING is checked after
-        UNSTABLE_EXPLORATION but before LATE_OVERFITTING. When persistent
-        clipping (>=70% of window) is combined with no clear downward
-        loss trend, the regime is classified as PLATEAU_RUIDOSO_COM_CLIPPING
-        regardless of other signals.
+        CRITICAL: Clipping dominance (>=80%) has ABSOLUTE precedence.
+        If the optimizer is clipping nearly all gradients, no amount of
+        loss trend can indicate healthy learning — the model is bounded.
 
         Classification priority:
-        1. UNSTABLE_EXPLORATION (dangerous)
-        2. PLATEAU_RUIDOSO_COM_CLIPPING (persistent clipping + stagnation)
-        3. LATE_OVERFITTING (action needed, requires strict consecutive proof)
-        4. REAL_PLATEAU (action needed)
-        5. NOISY_PLATEAU (patience)
-        6. CONVERGENCE (near end)
-        7. HEALTHY_LEARNING (requires no persistent clipping)
+        1. PLATEAU_RUIDOSO_COM_CLIPPING (clipping >= 80%, UNCONDITIONAL)
+        2. UNSTABLE_EXPLORATION (dangerous variance)
+        3. PLATEAU_RUIDOSO_COM_CLIPPING (clipping >= 70% + no clear trend)
+        4. LATE_OVERFITTING (strict consecutive proof)
+        5. REAL_PLATEAU (val_loss stagnant, low noise)
+        6. NOISY_PLATEAU (val_loss stagnant, noisy)
+        7. CONVERGENCE (near end)
+        8. HEALTHY_LEARNING (requires no persistent clipping)
         """
         # Need minimum data
         if metrics.total_steps_recorded < 10:
             return TrainingRegime.HEALTHY_LEARNING
 
-        # 1. UNSTABLE_EXPLORATION: dangerous variance levels
+        # =====================================================================
+        # RULE 0 — RUNTIME FLAG: Immediate detection from consecutive clipping
+        # =====================================================================
+        # Set by TrainingManager.on_step() every optimizer step (not sampled).
+        # Fires when >= N consecutive on_step calls had grad_norm at clip ceiling.
+        # This bypasses has_enough_data — works even with sparse clipping_events.
+        if metrics.flags.get('clipping_dominant_runtime', False):
+            return TrainingRegime.PLATEAU_RUIDOSO_COM_CLIPPING
+
+        # =====================================================================
+        # RULE 1 — ABSOLUTE PRECEDENCE: Clipping dominant overrides everything
+        # =====================================================================
+        # If >= 80% of recent steps are clipped, the optimizer is saturated.
+        # No loss trend, no noise analysis, no heuristic can override this.
+        # Uses the dominant window (50 steps) for faster detection, plus
+        # the full clipping window as fallback.
+        clip_freq_dominant = metrics.get_clipping_frequency_window(
+            self.config.clipping_dominant_window
+        )
+        clip_freq_full = metrics.get_clipping_frequency()
+        has_enough_data = (
+            len(metrics.clipping_events) >= self.config.clipping_dominant_window * 0.5
+        )
+
+        if has_enough_data and clip_freq_dominant >= self.config.clipping_dominant_threshold:
+            return TrainingRegime.PLATEAU_RUIDOSO_COM_CLIPPING
+
+        # 2. UNSTABLE_EXPLORATION: dangerous variance levels
         loss_std = metrics.get_std('loss')
         grad_std = metrics.get_std('grad_norm')
         loss_mean = metrics.get_mean('loss')
@@ -572,16 +599,14 @@ class BitNetStateAnalyzer(StateAnalyzer):
         if loss_cv > 0.3 or grad_std > self.grad_variance_high:
             return TrainingRegime.UNSTABLE_EXPLORATION
 
-        # 2. PLATEAU_RUIDOSO_COM_CLIPPING: persistent clipping + no clear progress
-        # This MUST be checked before HEALTHY_LEARNING to prevent optimistic
-        # misclassification when clipping dominates training dynamics.
+        # 3. PLATEAU_RUIDOSO_COM_CLIPPING: persistent clipping (>=70%) + no clear progress
         persistent_clipping = self._has_persistent_clipping(metrics)
         has_downward_trend = self._has_clear_downward_trend(metrics)
 
         if persistent_clipping and not has_downward_trend:
             return TrainingRegime.PLATEAU_RUIDOSO_COM_CLIPPING
 
-        # 3. LATE_OVERFITTING - use scaled patience, require strict consecutive proof
+        # 4. LATE_OVERFITTING - use scaled patience, require strict consecutive proof
         # Isolated val_loss oscillations are NOT overfitting — require unbroken
         # consecutive evals of train_loss↓ + val_loss↑.
         scaled_overfit = max(
@@ -2125,6 +2150,9 @@ class HybridTrainingManager:
         # NEW: Emergency stop flag — training loop should check this
         self.emergency_stop: bool = False
 
+        # Runtime clipping counter — updated every on_step, independent of log_interval
+        self._consecutive_clipped_steps: int = 0
+
         self.logger.info(
             f"[TrainingManager] Initialized with config: "
             f"plateau_patience={self.config.plateau_patience}, "
@@ -2174,6 +2202,20 @@ class HybridTrainingManager:
         self.validator.update_historical_max(lr)
         self.policy_engine.historical_peak_lr = max(
             self.policy_engine.historical_peak_lr, lr
+        )
+
+        # Runtime clipping counter — independent of log_interval sampling
+        grad_clip_value = self.trainer.train_config.max_grad_norm
+        is_clipped = grad_norm >= 0.95 * grad_clip_value
+        if is_clipped:
+            self._consecutive_clipped_steps += 1
+        else:
+            self._consecutive_clipped_steps = 0
+
+        # Set runtime flag when consecutive clipping exceeds threshold
+        threshold = self.config.clipping_dominant_consecutive
+        self.metrics.flags['clipping_dominant_runtime'] = (
+            self._consecutive_clipped_steps >= threshold
         )
 
     # ----- Hook: on_eval -----
@@ -2438,6 +2480,7 @@ class HybridTrainingManager:
             "decision_history": self._decision_history,
             "current_regime": self._current_regime.name,
             "current_base_lr": self._current_base_lr,
+            "consecutive_clipped_steps": self._consecutive_clipped_steps,
         }
 
     def load_state_dict(self, state: Dict[str, Any]):
@@ -2537,6 +2580,10 @@ class HybridTrainingManager:
             regime_name = state.get("current_regime", "HEALTHY_LEARNING")
             self._current_regime = TrainingRegime[regime_name]
             self._current_base_lr = state.get("current_base_lr", self._base_lr)
+            self._consecutive_clipped_steps = state.get("consecutive_clipped_steps", 0)
+            # Restore runtime flag from counter
+            if self._consecutive_clipped_steps >= self.config.clipping_dominant_consecutive:
+                self.metrics.flags['clipping_dominant_runtime'] = True
 
             self.logger.info(
                 f"[TrainingManager] State restored: "
