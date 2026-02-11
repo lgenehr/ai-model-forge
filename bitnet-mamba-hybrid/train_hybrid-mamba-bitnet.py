@@ -325,6 +325,25 @@ class TrainingConfig:
         self.tokens_per_step = tokens_per_step
 
 
+# Dynamic hyperparameters that MUST be restored from checkpoint during full
+# resume to guarantee mathematical identity with continuous training.
+# These fields directly affect the LR schedule, optimizer behavior, and
+# gradient clipping — overwriting them from CLI would silently alter the
+# training trajectory.
+_RESUME_PROTECTED_PARAMS = (
+    'learning_rate', 'min_lr', 'warmup_steps', 'max_grad_norm',
+    'bitlinear_lr_scale', 'weight_decay',
+    'max_tokens', 'max_steps', 'tokens_per_step',
+    'batch_size', 'gradient_accumulation_steps',
+)
+
+# Architecture fields validated on resume.  A mismatch means the checkpoint
+# was produced by an incompatible model and MUST NOT be loaded silently.
+_ARCH_VALIDATION_FIELDS = (
+    'vocab_size', 'd_model', 'n_layers', 'd_state', 'd_conv', 'expand',
+)
+
+
 # =============================================================================
 # BitNet Components
 # =============================================================================
@@ -796,6 +815,7 @@ class Trainer:
         train_config: TrainingConfig,
         model_config: ModelConfig,
         wandb_api_key: Optional[str] = None,
+        resume_path: Optional[str] = None,
         weights_only_resume: bool = False,
         use_training_manager: bool = False,
         training_manager_config: Optional[Any] = None,
@@ -803,6 +823,7 @@ class Trainer:
         self.model = model
         self.train_config = train_config
         self.model_config = model_config
+        self.resume_path = resume_path
         self.weights_only_resume = weights_only_resume
         self.use_training_manager = use_training_manager
         self.training_manager_config = training_manager_config
@@ -841,8 +862,17 @@ class Trainer:
         # Resume may happen before manager initialization; hold state temporarily.
         self._pending_training_manager_state = None
 
-        # Try to resume from checkpoint
-        self._try_resume(weights_only=self.weights_only_resume)
+        # Try to resume from checkpoint (only when --resume is specified)
+        if self.resume_path is not None:
+            self._try_resume(weights_only=self.weights_only_resume)
+        else:
+            # Fresh start — warn if checkpoints already exist
+            checkpoint_dir = Path(self.train_config.checkpoint_dir)
+            existing = list(checkpoint_dir.glob("checkpoint*.pt")) if checkpoint_dir.exists() else []
+            if existing:
+                print(f"WARNING: Found {len(existing)} existing checkpoint(s) in "
+                      f"{checkpoint_dir} but --resume was NOT specified.")
+                print("Starting fresh training. Use --resume to continue from a checkpoint.")
 
         # Initialize HybridTrainingManager (after checkpoint resume)
         if self.use_training_manager and TRAINING_MANAGER_AVAILABLE:
@@ -1148,42 +1178,80 @@ class Trainer:
             param_group['lr'] = lr * param_group.get('lr_scale', 1.0)
 
     def _try_resume(self, weights_only: bool = False):
-        """Try to resume from the latest checkpoint.
+        """Resume from checkpoint.  Called only when --resume was specified.
 
         Args:
             weights_only: When True, restore model weights and training
                 counters (global_step, total_tokens, best_loss) but skip
-                optimizer state. This allows new hyperparameters
-                (LR, warmup, weight decay, grad clipping) to take effect for
-                a second training phase.
+                optimizer/scaler state and do NOT protect dynamic
+                hyperparameters.  CLI values take effect for a new phase.
         """
-        checkpoint_dir = Path(self.train_config.checkpoint_dir)
-        checkpoints: list[tuple[int, int, Path]] = []
-        for item in checkpoint_dir.glob("checkpoint*.pt"):
-            if not item.is_file():
-                continue
-            match = re.search(r"(\d{5,})", item.name)
-            if not match:
-                continue
-            checkpoints.append((int(match.group(1)), item.stat().st_mtime_ns, item))
-        checkpoints.sort(key=lambda t: (t[0], t[1]))
+        # Resolve checkpoint path -------------------------------------------
+        if self.resume_path and self.resume_path != 'auto':
+            # Explicit path provided by user
+            explicit = Path(self.resume_path)
+            if not explicit.is_file():
+                raise FileNotFoundError(
+                    f"Resume checkpoint not found: {explicit}"
+                )
+            candidates = [explicit]
+        else:
+            # Auto-detect latest checkpoint in checkpoint_dir
+            checkpoint_dir = Path(self.train_config.checkpoint_dir)
+            found: list[tuple[int, int, Path]] = []
+            if checkpoint_dir.exists():
+                for item in checkpoint_dir.glob("checkpoint*.pt"):
+                    if not item.is_file():
+                        continue
+                    match = re.search(r"(\d{5,})", item.name)
+                    if not match:
+                        continue
+                    found.append(
+                        (int(match.group(1)), item.stat().st_mtime_ns, item)
+                    )
+            found.sort(key=lambda t: (t[0], t[1]))
+            if not found:
+                raise FileNotFoundError(
+                    f"--resume specified but no checkpoints found in "
+                    f"{checkpoint_dir}"
+                )
+            candidates = [p for _, _, p in reversed(found)]
 
-        if checkpoints:
-            load_opt = not weights_only
+        # Attempt to load ----------------------------------------------------
+        load_opt = not weights_only
+        protect = not weights_only  # full resume → protect dynamic hyperparams
 
-            # Try checkpoints from newest to oldest
-            for _, _, checkpoint_path in reversed(checkpoints):
-                self.logger.info(f"Attempting to resume from checkpoint: {checkpoint_path}")
+        for checkpoint_path in candidates:
+            self.logger.info(
+                f"Attempting to resume from checkpoint: {checkpoint_path}"
+            )
+            if weights_only:
+                self.logger.info(
+                    "Weights-only resume: optimizer/scaler state will NOT be "
+                    "restored. CLI hyperparameters take effect."
+                )
+            else:
+                self.logger.info(
+                    "Full resume: all states (optimizer, scaler, schedule "
+                    "params) will be restored from checkpoint."
+                )
+
+            if self._load_checkpoint(
+                checkpoint_path,
+                load_opt=load_opt,
+                protect_hyperparams=protect,
+            ):
                 if weights_only:
-                    self.logger.info("Weights-only resume: optimizer state will NOT be restored")
-                if self._load_checkpoint(checkpoint_path, load_opt=load_opt):
-                    if weights_only:
-                        self._reinit_scheduler_after_resume()
-                    return  # Successfully loaded
-                else:
-                    self.logger.warning(f"Failed to load checkpoint: {checkpoint_path}")
+                    self._reinit_scheduler_after_resume()
+                return  # success
+            else:
+                self.logger.warning(
+                    f"Failed to load checkpoint: {checkpoint_path}"
+                )
 
-            self.logger.warning("All checkpoints failed to load. Starting from scratch.")
+        raise RuntimeError(
+            "All candidate checkpoints failed to load.  Cannot resume."
+        )
 
     def _reinit_scheduler_after_resume(self):
         """Apply correct LR after a weights-only resume.
@@ -1218,16 +1286,20 @@ class Trainer:
             raise
 
     def _save_checkpoint(self, is_best: bool = False):
-        """Save training checkpoint"""
+        """Save training checkpoint with all state for exact resume."""
         checkpoint = {
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
+            'scaler_state_dict': self.scaler.state_dict(),
+            'optimizer_lr_per_group': [
+                pg['lr'] for pg in self.optimizer.param_groups
+            ],
             'global_step': self.global_step,
             'total_tokens': self.total_tokens,
             'best_loss': self.best_loss,
             'val_loss': getattr(self, 'last_val_loss', None),
             'model_config': asdict(self.model_config),
-            'train_config': asdict(self.train_config)
+            'train_config': asdict(self.train_config),
         }
 
         # Save training manager state alongside checkpoint
@@ -1269,66 +1341,186 @@ class Trainer:
         self,
         checkpoint_path: Path,
         load_opt: bool = True,
-        load_sched: bool = True,
+        protect_hyperparams: bool = True,
     ) -> bool:
-        """Load training checkpoint
+        """Load training checkpoint with full state validation.
 
-        Handles both regular and torch.compile() models by remapping state_dict keys.
+        Handles both regular and torch.compile() models by remapping
+        state_dict keys.  When *protect_hyperparams* is True (full resume),
+        dynamic training hyperparameters stored in the checkpoint override the
+        current ``train_config`` values so the LR schedule, gradient clipping,
+        and optimizer behavior are mathematically identical to continuous
+        training.
 
         Args:
-            checkpoint_path: Path to the checkpoint file
-            load_opt: Whether to restore optimizer state. When False, optimizer
-                keeps its freshly-initialized state so new hyperparameters
-                (LR, weight decay) take effect immediately.
-            load_sched: Kept for API compatibility, ignored (no scheduler).
+            checkpoint_path: Path to the checkpoint file.
+            load_opt: Restore optimizer & scaler state.  When False the
+                optimizer keeps its freshly-initialized state.
+            protect_hyperparams: Restore dynamic hyperparameters from the
+                checkpoint's ``train_config`` (full resume).  When False,
+                CLI values are kept (weights-only resume).
 
         Returns:
-            True if checkpoint was loaded successfully, False otherwise
+            True if checkpoint was loaded successfully, False otherwise.
         """
         try:
             checkpoint = torch.load(checkpoint_path, map_location=self.device)
-            model_state = checkpoint['model_state_dict']
 
-            # Check if model is compiled (has _orig_mod prefix in keys)
+            # ── 1. Architecture validation ──────────────────────────────────
+            saved_model_config = checkpoint.get('model_config', {})
+            for field in _ARCH_VALIDATION_FIELDS:
+                saved_val = saved_model_config.get(field)
+                current_val = getattr(self.model_config, field, None)
+                if saved_val is not None and current_val is not None and saved_val != current_val:
+                    raise RuntimeError(
+                        f"Architecture mismatch on '{field}': "
+                        f"current={current_val}, checkpoint={saved_val}.  "
+                        f"Cannot load weights from an incompatible model."
+                    )
+            self.logger.info("Architecture validation passed")
+
+            # ── 2. Model state ──────────────────────────────────────────────
+            model_state = checkpoint['model_state_dict']
             model_keys = list(self.model.state_dict().keys())
             checkpoint_keys = list(model_state.keys())
 
-            model_is_compiled = any(k.startswith('_orig_mod.') for k in model_keys)
-            checkpoint_is_compiled = any(k.startswith('_orig_mod.') for k in checkpoint_keys)
+            model_is_compiled = any(
+                k.startswith('_orig_mod.') for k in model_keys
+            )
+            checkpoint_is_compiled = any(
+                k.startswith('_orig_mod.') for k in checkpoint_keys
+            )
 
-            # Remap keys if there's a mismatch
             if model_is_compiled and not checkpoint_is_compiled:
-                self.logger.info("Remapping checkpoint keys for compiled model...")
-                model_state = {'_orig_mod.' + k: v for k, v in model_state.items()}
+                self.logger.info(
+                    "Remapping checkpoint keys for compiled model..."
+                )
+                model_state = {
+                    '_orig_mod.' + k: v for k, v in model_state.items()
+                }
             elif not model_is_compiled and checkpoint_is_compiled:
-                self.logger.info("Remapping checkpoint keys for non-compiled model...")
-                model_state = {k.replace('_orig_mod.', ''): v for k, v in model_state.items()}
+                self.logger.info(
+                    "Remapping checkpoint keys for non-compiled model..."
+                )
+                model_state = {
+                    k.replace('_orig_mod.', ''): v
+                    for k, v in model_state.items()
+                }
 
             self.model.load_state_dict(model_state)
+            self.logger.info("Model state restored")
 
+            # ── 3. Optimizer state ──────────────────────────────────────────
             if load_opt:
                 try:
-                    self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                    self.optimizer.load_state_dict(
+                        checkpoint['optimizer_state_dict']
+                    )
+                    self.logger.info("Optimizer state restored")
                 except (ValueError, KeyError) as e:
                     self.logger.warning(
-                        f"Could not restore optimizer state (param group mismatch): {e}. "
+                        f"Could not restore optimizer state "
+                        f"(param group mismatch): {e}. "
                         f"Continuing with fresh optimizer state."
                     )
             else:
-                self.logger.info("Skipping optimizer state restore (weights-only resume)")
+                self.logger.info(
+                    "Skipping optimizer state restore (weights-only resume)"
+                )
 
+            # ── 4. Scaler state (AMP fp16) ──────────────────────────────────
+            if load_opt and 'scaler_state_dict' in checkpoint:
+                try:
+                    self.scaler.load_state_dict(
+                        checkpoint['scaler_state_dict']
+                    )
+                    self.logger.info("Scaler state restored")
+                except Exception as e:
+                    self.logger.warning(
+                        f"Could not restore scaler state: {e}. "
+                        f"Continuing with fresh scaler."
+                    )
+
+            # ── 5. Training counters ────────────────────────────────────────
             self.global_step = checkpoint['global_step']
             self.total_tokens = checkpoint['total_tokens']
             self.best_loss = checkpoint.get('best_loss', float('inf'))
 
-            # Restore training manager state if available
+            # ── 6. Protect dynamic hyperparameters ──────────────────────────
+            if protect_hyperparams:
+                saved_train_config = checkpoint.get('train_config', {})
+                overridden: list[tuple[str, object, object]] = []
+                for field in _RESUME_PROTECTED_PARAMS:
+                    saved_val = saved_train_config.get(field)
+                    if saved_val is None:
+                        continue
+                    current_val = getattr(self.train_config, field, None)
+                    if current_val != saved_val:
+                        overridden.append((field, current_val, saved_val))
+                    setattr(self.train_config, field, saved_val)
+
+                if overridden:
+                    self.logger.warning(
+                        "Dynamic hyperparameters overridden by checkpoint "
+                        "(CLI values ignored for full resume):"
+                    )
+                    for fname, cli_v, ckpt_v in overridden:
+                        self.logger.warning(
+                            f"  {fname}: CLI={cli_v} → checkpoint={ckpt_v}"
+                        )
+                else:
+                    self.logger.info(
+                        "All dynamic hyperparameters match checkpoint "
+                        "(no override needed)"
+                    )
+
+            # ── 7. LR verification ──────────────────────────────────────────
+            if load_opt:
+                saved_lrs = checkpoint.get('optimizer_lr_per_group')
+                if saved_lrs is not None:
+                    for i, (pg, saved_lr) in enumerate(
+                        zip(self.optimizer.param_groups, saved_lrs)
+                    ):
+                        actual_lr = pg['lr']
+                        rel_err = (
+                            abs(actual_lr - saved_lr)
+                            / max(abs(saved_lr), 1e-15)
+                        )
+                        if rel_err > 1e-6:
+                            raise RuntimeError(
+                                f"LR mismatch after restore in param group "
+                                f"{i} ({pg.get('group_name', '?')}): "
+                                f"optimizer_lr={actual_lr:.6e}, "
+                                f"saved_lr={saved_lr:.6e}. "
+                                f"Resume is NOT mathematically identical."
+                            )
+                    self.logger.info(
+                        "LR verification passed — optimizer LRs match "
+                        "checkpoint exactly"
+                    )
+                else:
+                    self.logger.warning(
+                        "Checkpoint does not contain 'optimizer_lr_per_group' "
+                        "(older format). LR verification skipped."
+                    )
+
+                # Log per-group LRs for transparency
+                for i, pg in enumerate(self.optimizer.param_groups):
+                    gname = pg.get('group_name', f'group_{i}')
+                    self.logger.info(
+                        f"LR after restore: {gname} = {pg['lr']:.6e}"
+                    )
+
+            # ── 8. Training manager state ───────────────────────────────────
             if 'training_manager_state' in checkpoint:
                 if self.training_manager is not None:
                     try:
                         self.training_manager.load_state_dict(
                             checkpoint['training_manager_state']
                         )
-                        self.logger.info("Training manager state restored from checkpoint")
+                        self.logger.info(
+                            "Training manager state restored from checkpoint"
+                        )
                     except Exception as e:
                         self.logger.warning(
                             f"Could not restore training manager state: {e}. "
@@ -1336,25 +1528,51 @@ class Trainer:
                         )
                 else:
                     # Manager is initialized after resume in __init__.
-                    # Persist state and restore once manager exists.
-                    self._pending_training_manager_state = checkpoint['training_manager_state']
+                    self._pending_training_manager_state = (
+                        checkpoint['training_manager_state']
+                    )
 
-            self.logger.info(f"Resumed from step {self.global_step}, tokens: {self.total_tokens:,}")
+            self.logger.info(
+                f"Resumed from step {self.global_step}, "
+                f"tokens: {self.total_tokens:,}"
+            )
             return True
+
         except (EOFError, pickle.UnpicklingError) as e:
-            # Only rename truly corrupted files (file format issues)
-            self.logger.error(f"Checkpoint file corrupted {checkpoint_path}: {e}")
+            self.logger.error(
+                f"Checkpoint file corrupted {checkpoint_path}: {e}"
+            )
             corrupted_path = checkpoint_path.with_suffix('.pt.corrupted')
             try:
                 checkpoint_path.rename(corrupted_path)
-                self.logger.info(f"Renamed corrupted checkpoint to: {corrupted_path}")
+                self.logger.info(
+                    f"Renamed corrupted checkpoint to: {corrupted_path}"
+                )
             except OSError as rename_error:
-                self.logger.warning(f"Could not rename corrupted checkpoint: {rename_error}")
+                self.logger.warning(
+                    f"Could not rename corrupted checkpoint: {rename_error}"
+                )
             return False
-        except (RuntimeError, KeyError) as e:
-            # Key mismatches or missing keys - don't rename, just skip
-            self.logger.error(f"Failed to load checkpoint {checkpoint_path}: {e}")
-            self.logger.warning("Checkpoint may have incompatible architecture. Trying next...")
+
+        except RuntimeError as e:
+            # Architecture mismatch or LR mismatch → raise, don't try next
+            if "Architecture mismatch" in str(e) or "LR mismatch" in str(e):
+                raise
+            self.logger.error(
+                f"Failed to load checkpoint {checkpoint_path}: {e}"
+            )
+            self.logger.warning(
+                "Checkpoint may have incompatible architecture. Trying next..."
+            )
+            return False
+
+        except KeyError as e:
+            self.logger.error(
+                f"Failed to load checkpoint {checkpoint_path}: {e}"
+            )
+            self.logger.warning(
+                "Checkpoint may have incompatible architecture. Trying next..."
+            )
             return False
 
     def _save_interrupt_checkpoint(self):
@@ -1365,6 +1583,10 @@ class Trainer:
         checkpoint = {
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
+            'scaler_state_dict': self.scaler.state_dict(),
+            'optimizer_lr_per_group': [
+                pg['lr'] for pg in self.optimizer.param_groups
+            ],
             'global_step': self.global_step,
             'total_tokens': self.total_tokens,
             'best_loss': self.best_loss,
@@ -1373,6 +1595,13 @@ class Trainer:
             'train_config': asdict(self.train_config),
             'interrupted': True,
         }
+
+        # Save training manager state alongside interrupt checkpoint
+        if self.training_manager is not None:
+            try:
+                checkpoint['training_manager_state'] = self.training_manager.state_dict()
+            except Exception as e:
+                self.logger.warning(f"Failed to save training manager state: {e}")
 
         # Save interrupt checkpoint with special naming (atomic to prevent corruption)
         checkpoint_path = Path(self.train_config.checkpoint_dir) / f"checkpoint_interrupt_{self.global_step:08d}.pt"
@@ -1386,7 +1615,7 @@ class Trainer:
             self.logger.info(f"Saved checkpoint: {latest_path}")
 
         self.logger.info("=" * 60)
-        self.logger.info("Training interrupted safely. To resume, run the same command.")
+        self.logger.info("Training interrupted safely. To resume, add --resume to the same command.")
         self.logger.info(f"Progress: Step {self.global_step:,}, Tokens {self.total_tokens:,}")
         self.logger.info("=" * 60)
 
@@ -1884,10 +2113,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--no_amp", action="store_true", help="Disable automatic mixed precision")
     parser.add_argument("--skip_mamba_check", action="store_true", help="Skip Mamba optimization verification")
+    parser.add_argument("--resume", nargs='?', const='auto', default=None,
+                        metavar='CHECKPOINT_PATH',
+                        help="Resume training from checkpoint. If no path is given, auto-detects "
+                             "the latest checkpoint in the output directory. Dynamic hyperparameters "
+                             "(lr, min_lr, warmup, grad_clip, bitlinear_lr_scale, weight_decay, "
+                             "max_tokens) are restored from the checkpoint and CLI values are "
+                             "IGNORED. Architecture is validated against the saved config.")
     parser.add_argument("--weights_only", action="store_true",
-                        help="Resume only model weights and training counters from checkpoint, "
-                             "skipping optimizer and scheduler state. Use this for second-phase "
-                             "training with new hyperparameters (LR, warmup, weight decay).")
+                        help="Requires --resume. Resume only model weights and training counters "
+                             "from checkpoint, skipping optimizer state. CLI hyperparameters "
+                             "take effect for a new training phase (LR, warmup, weight decay).")
 
     # High throughput optimization arguments
     parser.add_argument("--compile", action="store_true",
@@ -1931,6 +2167,12 @@ def parse_args() -> argparse.Namespace:
 
 def main():
     args = parse_args()
+
+    # Validate --weights_only requires --resume
+    if args.weights_only and args.resume is None:
+        print("ERROR: --weights_only requires --resume to be specified.")
+        print("  Use: --resume --weights_only")
+        sys.exit(1)
 
     # Setup basic logging early
     logging.basicConfig(
@@ -2103,6 +2345,7 @@ def main():
     trainer = Trainer(
         model, train_config, model_config,
         wandb_api_key=wandb_api_key,
+        resume_path=args.resume,
         weights_only_resume=args.weights_only,
         use_training_manager=args.training_manager,
         training_manager_config=training_manager_config,
