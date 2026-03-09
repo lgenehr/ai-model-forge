@@ -25,6 +25,7 @@ import json
 import logging
 import math
 import os
+import signal
 import sys
 import time
 from pathlib import Path
@@ -41,6 +42,25 @@ from data_loader import create_dataloader, get_dataset_info  # type: ignore
 from model import HybridMoEModel, ModelConfig, estimate_memory_gb
 
 logger = logging.getLogger(__name__)
+
+
+# ─── SIGINT handler (Ctrl+C → safe checkpoint) ───────────────────────────────
+
+_interrupt_requested: bool = False
+
+def _sigint_handler(signum, frame) -> None:
+    """First Ctrl+C: request graceful exit after current step.
+       Second Ctrl+C: force-exit immediately (default Python behaviour restored).
+    """
+    global _interrupt_requested
+    if _interrupt_requested:
+        # User is impatient — restore default and let it propagate
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        raise KeyboardInterrupt
+    _interrupt_requested = True
+    # Print directly; logger may not be initialised yet at import time
+    print("\nSIGINT received — will save checkpoint after current step "
+          "(press Ctrl+C again to force-quit).", flush=True)
 
 
 # ─── Config helpers ───────────────────────────────────────────────────────────
@@ -132,6 +152,7 @@ def save_checkpoint(
     model: HybridMoEModel,
     optimizer: torch.optim.Optimizer,
     step: int,
+    tokens_trained: int,
     best_val_loss: float,
     train_cfg: Dict,
     output_dir: Path,
@@ -139,12 +160,13 @@ def save_checkpoint(
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     state = {
-        "step":          step,
-        "best_val_loss": best_val_loss,
-        "model":         model.state_dict(),
-        "optimizer":     optimizer.state_dict(),
-        "model_config":  model.config.__dict__,
-        "train_cfg":     train_cfg,
+        "step":           step,
+        "tokens_trained": tokens_trained,   # cumulative tokens seen so far
+        "best_val_loss":  best_val_loss,
+        "model":          model.state_dict(),
+        "optimizer":      optimizer.state_dict(),
+        "model_config":   model.config.__dict__,
+        "train_cfg":      train_cfg,
     }
     ckpt_path = output_dir / f"step_{step:08d}.pt"
     torch.save(state, ckpt_path)
@@ -169,17 +191,20 @@ def load_checkpoint(
     model: HybridMoEModel,
     optimizer: Optional[torch.optim.Optimizer],
     device: torch.device,
-) -> Tuple[int, float]:
-    """Load checkpoint; returns (step, best_val_loss)."""
+) -> Tuple[int, int, float]:
+    """Load checkpoint; returns (step, tokens_trained, best_val_loss)."""
     logger.info(f"Loading checkpoint: {path}")
     state = torch.load(path, map_location=device, weights_only=False)
     model.load_state_dict(state["model"])
     if optimizer is not None and "optimizer" in state:
         optimizer.load_state_dict(state["optimizer"])
-    step          = state.get("step", 0)
-    best_val_loss = state.get("best_val_loss", float("inf"))
-    logger.info(f"  Resumed from step {step}  |  best_val_loss={best_val_loss:.4f}")
-    return step, best_val_loss
+    step           = state.get("step", 0)
+    tokens_trained = state.get("tokens_trained", 0)  # 0 for old checkpoints
+    best_val_loss  = state.get("best_val_loss", float("inf"))
+    logger.info(f"  Resumed from step {step}  |  "
+                f"tokens_trained={tokens_trained/1e9:.3f}B  |  "
+                f"best_val_loss={best_val_loss:.4f}")
+    return step, tokens_trained, best_val_loss
 
 
 # ─── Evaluation ───────────────────────────────────────────────────────────────
@@ -192,9 +217,13 @@ def evaluate(
     dtype: torch.dtype,
     n_batches: int = 50,
 ) -> float:
-    """Compute mean validation loss over n_batches."""
+    """Compute mean validation CE loss over n_batches.
+
+    Returns ce_loss only (aux/load-balance loss is a training artifact and
+    should not influence the val metric used for early-stopping / best-model).
+    """
     model.eval()
-    total_loss = 0.0
+    total_ce = 0.0
     count = 0
     for batch in val_loader:
         if count >= n_batches:
@@ -202,12 +231,12 @@ def evaluate(
         input_ids = batch["input_ids"].to(device, non_blocking=True)
         labels    = batch["labels"].to(device, non_blocking=True)
         with torch.autocast(device_type="cuda", dtype=dtype):
-            _, loss = model(input_ids, targets=labels, use_checkpoint=False)
-        if loss is not None:
-            total_loss += loss.item()
+            _, _, loss_dict = model(input_ids, targets=labels, use_checkpoint=False)
+        if loss_dict is not None:
+            total_ce += loss_dict["ce_loss"]
             count += 1
     model.train()
-    return total_loss / max(1, count)
+    return total_ce / max(1, count)
 
 
 # ─── Setup logging ────────────────────────────────────────────────────────────
@@ -229,6 +258,9 @@ def setup_logging(output_dir: Path, level: int = logging.INFO) -> None:
 # ─── Main training loop ───────────────────────────────────────────────────────
 
 def main():
+    # Register graceful-exit handler immediately so it covers the whole run
+    signal.signal(signal.SIGINT, _sigint_handler)
+
     parser = build_arg_parser()
     args = parser.parse_args()
 
@@ -292,6 +324,25 @@ def main():
         split="val",
     )
 
+    # ── Optional data sanity check ────────────────────────────────────────────
+    # Verifies that input_ids/labels are correctly shifted (labels = tokens[1:])
+    if train_cfg.get("debug_data_check", False) or args.debug_data_check:
+        sample = next(iter(train_loader))
+        ids_s  = sample["input_ids"]
+        lbl_s  = sample["labels"]
+        logger.info("[debug] Data check:")
+        logger.info(f"  input_ids shape : {list(ids_s.shape)}  dtype={ids_s.dtype}")
+        logger.info(f"  labels shape    : {list(lbl_s.shape)}  dtype={lbl_s.dtype}")
+        logger.info(f"  input_ids[0,:8] : {ids_s[0, :8].tolist()}")
+        logger.info(f"  labels[0,:8]    : {lbl_s[0, :8].tolist()}")
+        # input_ids[t+1] should equal labels[t] for valid positions
+        valid_mask = lbl_s[0] != -100
+        if valid_mask.sum() > 1:
+            shift_ok = (ids_s[0, 1:][valid_mask[1:]] == lbl_s[0, :-1][valid_mask[1:]]).all()
+            logger.info(f"  label shift OK  : {bool(shift_ok)}")
+        else:
+            logger.warning("  label shift check skipped (too many -100 labels)")
+
     # ── Model ─────────────────────────────────────────────────────────────────
     logger.info("Building model…")
     model = HybridMoEModel(cfg).to(device)
@@ -322,12 +373,13 @@ def main():
 
     # ── Resume ────────────────────────────────────────────────────────────────
     start_step    = 0
+    start_tokens  = 0
     best_val_loss = float("inf")
     resume_path   = train_cfg.get("resume", None)
     if args.resume:
         resume_path = args.resume
     if resume_path and Path(resume_path).exists():
-        start_step, best_val_loss = load_checkpoint(
+        start_step, start_tokens, best_val_loss = load_checkpoint(
             resume_path, model, optimizer, device  # type: ignore[arg-type]
         )
 
@@ -348,6 +400,7 @@ def main():
 
     # ── Training state ────────────────────────────────────────────────────────
     max_steps   = train_cfg.get("max_steps", 200_000)
+    max_tokens  = train_cfg.get("max_tokens", None)   # optional token-budget limit
     warmup      = train_cfg.get("warmup_steps", 2_000)
     peak_lr     = train_cfg.get("lr", 3e-4)
     min_lr      = train_cfg.get("min_lr", 3e-5)
@@ -356,46 +409,78 @@ def main():
     eval_every  = train_cfg.get("eval_every", 500)
     save_every  = train_cfg.get("save_every", 1000)
 
+    tokens_trained = start_tokens
+
+    # When a token budget is set, derive the equivalent max_steps so the
+    # cosine LR schedule is calibrated to the full planned training run.
+    # effective_batch_tokens is already computed above.
+    if max_tokens is not None:
+        tokens_remaining = max(0, max_tokens - tokens_trained)
+        steps_from_tokens = math.ceil(tokens_remaining / effective_batch_tokens)
+        # Use whichever limit is tighter; also use max_tokens-derived steps
+        # to calibrate the LR schedule horizon.
+        effective_max_steps = min(max_steps, start_step + steps_from_tokens)
+        logger.info(
+            f"max_tokens={max_tokens/1e9:.2f}B  |  already seen={tokens_trained/1e9:.3f}B  |  "
+            f"steps remaining≈{steps_from_tokens:,}  |  effective_max_steps={effective_max_steps:,}"
+        )
+    else:
+        effective_max_steps = max_steps
+        logger.info(f"max_tokens not set — training for {max_steps:,} steps")
+
     scaler = torch.amp.GradScaler(device="cuda", enabled=(dtype == torch.float16))
 
     model.train()
     train_iter = iter(train_loader)
     optimizer.zero_grad(set_to_none=True)
 
-    step               = start_step
-    micro_step         = 0
-    accum_loss         = 0.0
-    accum_tokens       = 0
-    t_last             = time.perf_counter()
-    tokens_since_log   = 0
-    grad_norm_ema      = 0.0   # exponential moving average for monitoring
+    step             = start_step
+    # Per-log-window accumulators (reset every log_every steps)
+    log_total_loss   = 0.0   # sum of per-step average total losses
+    log_ce_loss      = 0.0   # sum of per-step average CE losses
+    log_aux_loss     = 0.0   # sum of per-step average aux losses
+    log_tokens       = 0     # valid tokens seen in this window
+    t_last           = time.perf_counter()
+    grad_norm_ema    = 0.0   # EMA of grad norm for monitoring
 
-    logger.info(f"Starting training from step {step} → {max_steps}")
+    logger.info(f"Starting training from step {step} → {effective_max_steps}"
+                + (f"  ({max_tokens/1e9:.2f}B token budget)" if max_tokens else ""))
     logger.info(f"gradient_checkpointing={use_grad_ckpt}  |  compile={use_compile}")
 
-    while step < max_steps:
+    while step < effective_max_steps and (max_tokens is None or tokens_trained < max_tokens):
         # ── Update LR ─────────────────────────────────────────────────────────
-        lr = get_lr(step, warmup, max_steps, peak_lr, min_lr)
+        lr = get_lr(step, warmup, effective_max_steps, peak_lr, min_lr)
         for pg in optimizer.param_groups:
             pg["lr"] = lr
 
         # ── Micro-batch accumulation loop ─────────────────────────────────────
-        for micro in range(grad_accum):
-            batch = next(train_iter)
+        # Each micro-batch produces a mean-over-tokens CE loss.  We divide by
+        # grad_accum so the gradient is the average over the effective batch,
+        # and we accumulate the same normalised value for logging so that the
+        # reported loss is a true per-token average, not inflated by grad_accum.
+        step_total = 0.0
+        step_ce    = 0.0
+        step_aux   = 0.0
+        step_tokens = 0
+
+        for _ in range(grad_accum):
+            batch     = next(train_iter)
             input_ids = batch["input_ids"].to(device, non_blocking=True)
             labels    = batch["labels"].to(device, non_blocking=True)
 
             with torch.autocast(device_type="cuda", dtype=dtype):
-                _, loss = model(input_ids, targets=labels, use_checkpoint=use_grad_ckpt)
+                _, total_loss, loss_dict = model(
+                    input_ids, targets=labels, use_checkpoint=use_grad_ckpt
+                )
 
-            # Scale loss by grad_accum so gradients average correctly
-            loss_scaled = loss / grad_accum
-            scaler.scale(loss_scaled).backward()
+            # Divide before backward so gradients are averaged, not summed
+            scaler.scale(total_loss / grad_accum).backward()
 
-            accum_loss += loss.item()
-            tokens_in_batch = (labels != -100).sum().item()
-            accum_tokens       += tokens_in_batch
-            tokens_since_log   += tokens_in_batch
+            # Accumulate normalised (per-micro-batch) values for logging
+            step_total  += total_loss.item()     / grad_accum
+            step_ce     += loss_dict["ce_loss"]  / grad_accum  # type: ignore[index]
+            step_aux    += loss_dict["aux_loss"] / grad_accum  # type: ignore[index]
+            step_tokens += int((labels != -100).sum().item())
 
         # ── Optimizer step ────────────────────────────────────────────────────
         scaler.unscale_(optimizer)
@@ -404,38 +489,57 @@ def main():
         scaler.update()
         optimizer.zero_grad(set_to_none=True)
 
-        step += 1
-        grad_norm_ema = 0.9 * grad_norm_ema + 0.1 * grad_norm.item()
+        step           += 1
+        tokens_trained += step_tokens
+        grad_norm_ema   = 0.9 * grad_norm_ema + 0.1 * grad_norm.item()
+
+        # Accumulate into per-window totals
+        log_total_loss += step_total
+        log_ce_loss    += step_ce
+        log_aux_loss   += step_aux
+        log_tokens     += step_tokens
 
         # ── Logging ───────────────────────────────────────────────────────────
         if step % log_every == 0:
-            t_now  = time.perf_counter()
-            elapsed = t_now - t_last
-            tok_per_sec = tokens_since_log / max(elapsed, 1e-6)
-            avg_loss    = accum_loss / log_every
+            t_now    = time.perf_counter()
+            elapsed  = t_now - t_last
+            tok_s    = log_tokens / max(elapsed, 1e-6)
 
+            # Divide accumulated step-averages by number of steps in window
+            avg_total = log_total_loss / log_every
+            avg_ce    = log_ce_loss    / log_every
+            avg_aux   = log_aux_loss   / log_every
+            mem_gb    = torch.cuda.memory_allocated() / 1e9
+
+            tokens_str = (
+                f"  tokens: {tokens_trained/1e9:.3f}B/{max_tokens/1e9:.2f}B"
+                if max_tokens else
+                f"  tokens: {tokens_trained/1e9:.3f}B"
+            )
             logger.info(
-                f"step {step:>7d}/{max_steps}  |  "
-                f"loss: {avg_loss:.4f}  |  "
-                f"lr: {lr:.2e}  |  "
-                f"grad_norm: {grad_norm_ema:.3f}  |  "
-                f"tok/s: {tok_per_sec:,.0f}  |  "
-                f"mem: {torch.cuda.memory_allocated()/1e9:.1f}GB"
+                f"step {step:>7d}/{effective_max_steps}  |  "
+                f"loss: {avg_total:.4f}  ce: {avg_ce:.4f}  aux: {avg_aux:.4f}  |  "
+                f"lr: {lr:.2e}  gnorm: {grad_norm_ema:.3f}  |  "
+                f"tok/s: {tok_s:,.0f}  mem: {mem_gb:.1f}GB{tokens_str}"
             )
 
             if wandb_run is not None:
                 wandb_run.log({
-                    "train/loss": avg_loss,
-                    "train/lr":   lr,
-                    "train/grad_norm": grad_norm_ema,
-                    "perf/tok_per_sec": tok_per_sec,
-                    "perf/mem_gb": torch.cuda.memory_allocated() / 1e9,
-                    "step": step,
+                    "train/loss":        avg_total,
+                    "train/ce_loss":     avg_ce,
+                    "train/aux_loss":    avg_aux,
+                    "train/lr":          lr,
+                    "train/grad_norm":   grad_norm_ema,
+                    "perf/tok_per_sec":  tok_s,
+                    "perf/mem_gb":       mem_gb,
+                    "tokens_trained_B":  tokens_trained / 1e9,
+                    "step":              step,
                 })
 
-            accum_loss       = 0.0
-            tokens_since_log = 0
-            t_last           = t_now
+            # Reset window accumulators
+            log_total_loss = log_ce_loss = log_aux_loss = 0.0
+            log_tokens = 0
+            t_last = t_now
 
         # ── Evaluation ────────────────────────────────────────────────────────
         if step % eval_every == 0:
@@ -446,20 +550,33 @@ def main():
                 best_val_loss = val_loss
 
             logger.info(
-                f"[EVAL]  step {step}  |  val_loss: {val_loss:.4f}  "
+                f"[EVAL]  step {step}  |  val_ce: {val_loss:.4f}  "
                 f"|  best: {best_val_loss:.4f}  {'★' if is_best else ''}"
             )
             if wandb_run is not None:
-                wandb_run.log({"val/loss": val_loss, "val/best_loss": best_val_loss, "step": step})
+                wandb_run.log({"val/ce_loss": val_loss, "val/best_ce_loss": best_val_loss,
+                               "step": step})
 
-            # Always save on eval; also mark best
             raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
-            save_checkpoint(raw_model, optimizer, step, best_val_loss, train_cfg, ckpt_dir, is_best)  # type: ignore[arg-type]
+            save_checkpoint(raw_model, optimizer, step, tokens_trained,  # type: ignore[arg-type]
+                            best_val_loss, train_cfg, ckpt_dir, is_best)
 
         # ── Periodic save ─────────────────────────────────────────────────────
         elif step % save_every == 0:
             raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
-            save_checkpoint(raw_model, optimizer, step, best_val_loss, train_cfg, ckpt_dir, False)  # type: ignore[arg-type]
+            save_checkpoint(raw_model, optimizer, step, tokens_trained,  # type: ignore[arg-type]
+                            best_val_loss, train_cfg, ckpt_dir, False)
+
+        # ── SIGINT: save checkpoint then exit cleanly ─────────────────────────
+        if _interrupt_requested:
+            logger.info("SIGINT: saving checkpoint and exiting…")
+            raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+            save_checkpoint(raw_model, optimizer, step, tokens_trained,  # type: ignore[arg-type]
+                            best_val_loss, train_cfg, ckpt_dir, False)
+            logger.info("Checkpoint saved. Exiting.")
+            if wandb_run is not None:
+                wandb_run.finish()
+            sys.exit(0)
 
     logger.info("Training complete.")
     if wandb_run is not None:
@@ -493,6 +610,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     train.add_argument("--batch_size",      type=int,   default=None)
     train.add_argument("--grad_accum",      type=int,   default=None)
     train.add_argument("--max_steps",       type=int,   default=None)
+    train.add_argument("--max_tokens",      type=int,   default=None,
+                       help="Stop training after this many tokens (e.g. 4_000_000_000 for 4B)")
     train.add_argument("--warmup_steps",    type=int,   default=None)
     train.add_argument("--lr",              type=float, default=None)
     train.add_argument("--min_lr",          type=float, default=None)
@@ -503,6 +622,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     train.add_argument("--output_dir",      type=str,   default=None)
     train.add_argument("--en_ratio",        type=float, default=None)
     train.add_argument("--pt_ratio",        type=float, default=None)
+    train.add_argument("--log_every",       type=int,   default=None)
+    train.add_argument("--eval_every",      type=int,   default=None)
+    train.add_argument("--save_every",      type=int,   default=None)
+    train.add_argument("--eval_batches",    type=int,   default=None)
     train.add_argument("--resume",          type=str,   default=None,
                        help="Path to checkpoint to resume from")
 
@@ -514,6 +637,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     feat.add_argument("--wandb_project",       type=str, default=None)
     feat.add_argument("--wandb_run_name",      type=str, default=None)
     feat.add_argument("--dtype",               type=str, default=None, choices=["bfloat16", "float16"])
+    feat.add_argument("--debug_data_check",    action="store_true",
+                      help="Log input/label shapes and first tokens at startup "
+                           "to verify correct causal-LM label shifting")
 
     return p
 

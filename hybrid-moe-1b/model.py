@@ -607,7 +607,7 @@ class HybridMoEModel(nn.Module):
         targets:   Optional[torch.Tensor] = None,  # [B, L]
         kv_caches: Optional[List] = None,          # list of KV caches (inference)
         use_checkpoint: bool = False,              # gradient checkpointing
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Dict[str, float]]]:
         """
         Args:
             input_ids:  Token indices [B, L]
@@ -617,7 +617,8 @@ class HybridMoEModel(nn.Module):
 
         Returns:
             logits:     [B, L, vocab_size]
-            loss:       scalar CE + MoE aux loss, or None if targets not given
+            total_loss: ce_loss + aux_loss scalar (for backward), or None
+            loss_dict:  {"ce_loss": float, "aux_loss": float}, or None
         """
         B, L = input_ids.shape
         x = self.embed_tokens(input_ids)  # [B, L, d_model]
@@ -659,16 +660,20 @@ class HybridMoEModel(nn.Module):
         x = self.norm(x)
         logits = self.lm_head(x)  # [B, L, vocab_size]
 
-        loss: Optional[torch.Tensor] = None
         if targets is not None:
             ce_loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)),
                 targets.view(-1),
                 ignore_index=-100,
             )
-            loss = ce_loss + total_aux_loss
+            total_loss = ce_loss + total_aux_loss
+            loss_dict: Optional[Dict[str, float]] = {
+                "ce_loss":  ce_loss.item(),
+                "aux_loss": total_aux_loss.item(),
+            }
+            return logits, total_loss, loss_dict
 
-        return logits, loss
+        return logits, None, None
 
     @torch.no_grad()
     def generate(
@@ -689,7 +694,7 @@ class HybridMoEModel(nn.Module):
         kv_caches: List[Optional[Tuple[torch.Tensor, torch.Tensor]]] = [None] * n_attn
 
         # Prefill: process prompt in one pass (no KV cache for simplicity)
-        logits, _ = self.forward(ids, kv_caches=None)
+        logits, _, _ = self.forward(ids, kv_caches=None)
         next_token_logits = logits[:, -1, :]
 
         generated = []
@@ -717,7 +722,7 @@ class HybridMoEModel(nn.Module):
             ids = torch.cat([ids, next_token], dim=1)
 
             # Single-token forward for the next step
-            logits_new, _ = self.forward(next_token, kv_caches=None)
+            logits_new, _, _ = self.forward(next_token, kv_caches=None)
             next_token_logits = logits_new[:, -1, :]
 
         return torch.cat([prompt_ids, torch.cat(generated, dim=1)], dim=1)

@@ -75,6 +75,7 @@ training:
   # Chinchilla-optimal: ~20× tokens per parameter → 820M × 20 = 16.4B tokens
   # At 65,536 tokens/step: ~250,000 steps for 16B tokens
   max_steps:     250000
+  max_tokens:    null          # optional token-budget cap (e.g. 16_000_000_000 for 16B)
   warmup_steps:  2000
 
   # ── Learning rate ──────────────────────────────────────────────────────────
