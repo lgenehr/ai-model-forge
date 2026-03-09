@@ -1,0 +1,108 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# Hybrid Transformer-Mamba-MoE  —  Configuration
+#
+# Parameter count summary (default config):
+#   Embedding:        103M  (vocab=50304, d=2048, tied with LM head)
+#   14 Mamba layers:  371M  (26.5M each)
+#    4 Attn layers:    42M  (10.5M each, GQA n_heads=16 / n_kv_heads=4)
+#    4 MoE layers:    302M  (75.5M each, 6 experts × 12.6M SwiGLU)
+#   ─────────────────────────
+#   Total:           ~818M  parameters
+#   Active/step:     ~570M  (only top-2 of 6 experts active per MoE call)
+#
+# Memory estimate (standard fp32 AdamW, bf16 activations, grad checkpointing):
+#   Params (fp32):   3.3 GB
+#   Gradients:       3.3 GB
+#   Optimizer m+v:   6.6 GB
+#   Activations:    ~1.5 GB  (with grad checkpointing)
+#   ─────────────────────────
+#   Total:          ~14.7 GB  ← fits in RTX 4070 Ti Super (17.2 GB)
+#
+# To push toward 1B: increase moe_n_experts to 8 (→ ~920M, needs ~15.8 GB)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+model:
+  # ── Embedding ──────────────────────────────────────────────────────────────
+  vocab_size:    50304       # GPT-2 BPE, rounded to 64× for tensor core alignment
+  max_seq_len:   2048
+
+  # ── Hidden dimension ───────────────────────────────────────────────────────
+  d_model:       2048
+
+  # ── Layer layout ───────────────────────────────────────────────────────────
+  n_layers:      18
+  # 0-indexed layer indices that use Attention + MoE (all others = Mamba)
+  attention_layers: [3, 7, 11, 17]
+
+  # ── Mamba SSM ──────────────────────────────────────────────────────────────
+  mamba_expand:  2           # d_inner = 2 × d_model = 4096
+  mamba_d_state: 16          # SSM state dimension N
+  mamba_d_conv:  4           # causal convolution kernel width
+  mamba_dt_rank: "auto"      # "auto" → ceil(d_model / 16) = 128
+
+  # ── Grouped-Query Attention ────────────────────────────────────────────────
+  n_heads:       16           # total Q heads  →  head_dim = 2048/16 = 128
+  n_kv_heads:    4            # GQA: 4 KV heads shared across 16 Q heads (4× KV compression)
+  rope_base:     10000.0
+
+  # ── Mixture of Experts ─────────────────────────────────────────────────────
+  moe_n_experts:    6         # number of experts (increase to 8 for ~1B at the cost of ~1.1 GB more)
+  moe_top_k:        2         # tokens route to top-2 experts
+  moe_intermediate: 2048      # SwiGLU hidden dim per expert (= d_model)
+  moe_aux_loss_coeff: 0.01    # Switch Transformer load-balancing loss weight
+
+  # ── Regularisation ─────────────────────────────────────────────────────────
+  norm_eps:      1.0e-5
+  dropout:       0.0          # 0 recommended for large-scale pre-training
+  tie_embeddings: true        # share embedding ↔ lm_head weights (saves 103M params)
+
+
+training:
+  # ── Data ───────────────────────────────────────────────────────────────────
+  data_dir:      "../bitnet-mamba-hybrid/data/tokenized"
+  en_ratio:      0.30         # 30% English
+  pt_ratio:      0.70         # 70% Portuguese
+  num_workers:   4
+
+  # ── Batching ───────────────────────────────────────────────────────────────
+  batch_size:    2            # per-GPU micro-batch size
+  grad_accum:    16           # effective batch = 2 × 2048 × 16 = 65,536 tokens/step
+
+  # ── Training duration ──────────────────────────────────────────────────────
+  # Chinchilla-optimal: ~20× tokens per parameter → 820M × 20 = 16.4B tokens
+  # At 65,536 tokens/step: ~250,000 steps for 16B tokens
+  max_steps:     250000
+  warmup_steps:  2000
+
+  # ── Learning rate ──────────────────────────────────────────────────────────
+  lr:            3.0e-4       # peak LR (cosine schedule)
+  min_lr:        3.0e-5       # final LR (10% of peak)
+  beta1:         0.9
+  beta2:         0.95
+  adam_eps:      1.0e-8
+  weight_decay:  0.1
+  grad_clip:     1.0
+
+  # ── Performance ────────────────────────────────────────────────────────────
+  dtype:                 "bfloat16"   # bf16 preferred (Ampere+); fall back to float16
+  # torch.compile with mamba-ssm CUDA kernel requires the kernel to be
+  # registered as a custom op, which is not yet supported by mamba-ssm.
+  # Set to true only when using the PyTorch fallback scan (no mamba-ssm).
+  # With mamba-ssm installed, training is already >6000 tok/s without compile.
+  compile:               false
+  gradient_checkpointing: true        # ~10× activation memory reduction
+  seed:                  42
+
+  # ── Checkpointing ──────────────────────────────────────────────────────────
+  output_dir:    "./model_1b"
+  save_every:    1000          # save checkpoint every N steps
+  eval_every:    500           # evaluate on val set every N steps
+  eval_batches:  50            # number of val batches per evaluation
+
+  # ── Logging ────────────────────────────────────────────────────────────────
+  log_every:     10
+  wandb:         false
+  wandb_project: "hybrid-moe-1b"
+  wandb_run_name: null
+
+  # resume: null               # set to path to resume (e.g. "./model_1b/checkpoints/latest.pt")
