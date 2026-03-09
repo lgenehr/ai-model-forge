@@ -46,9 +46,12 @@ model:
   rope_base:     10000.0
 
   # ── Mixture of Experts ─────────────────────────────────────────────────────
-  moe_n_experts:    6         # number of experts (increase to 8 for ~1B at the cost of ~1.1 GB more)
+  # WSL2 memory budget: Windows display uses ~1.5-2 GB VRAM.
+  # Target ≤13 GB training VRAM to avoid allocator thrashing (GPU throttle).
+  # intermediate=1024 → 11.5 GB AdamW + ~1.2 GB activations = ~12.7 GB  ✓
+  moe_n_experts:    8
   moe_top_k:        2         # tokens route to top-2 experts
-  moe_intermediate: 2048      # SwiGLU hidden dim per expert (= d_model)
+  moe_intermediate: 1024      # SwiGLU hidden dim — tuned for WSL2 VRAM budget
   moe_aux_loss_coeff: 0.01    # Switch Transformer load-balancing loss weight
 
   # ── Regularisation ─────────────────────────────────────────────────────────
@@ -65,8 +68,8 @@ training:
   num_workers:   4
 
   # ── Batching ───────────────────────────────────────────────────────────────
-  batch_size:    2            # per-GPU micro-batch size
-  grad_accum:    16           # effective batch = 2 × 2048 × 16 = 65,536 tokens/step
+  batch_size:    1            # per-GPU micro-batch (1 = safer on WSL2 due to display VRAM sharing)
+  grad_accum:    32           # effective batch = 1 × 2048 × 32 = 65,536 tokens/step (same as B=2 × 16)
 
   # ── Training duration ──────────────────────────────────────────────────────
   # Chinchilla-optimal: ~20× tokens per parameter → 820M × 20 = 16.4B tokens

@@ -72,9 +72,20 @@ class ModelConfig:
     rope_base: float = 10000.0
 
     # Mixture of Experts
-    moe_n_experts: int = 6
+    # WSL2 note: Windows display driver occupies ~1.5-2 GB of VRAM even when
+    # training. To avoid memory thrashing (GPU throttling to ~77W), we target
+    # ≤13 GB total training VRAM on a 17.2 GB card.
+    #
+    # MoE memory is the largest tunable knob:
+    #   8 experts × intermediate=1024 → 201M MoE params → 11.5 GB AdamW states
+    #   + ~1.2 GB activations (grad ckpt) = ~12.7 GB → safe on WSL2
+    #
+    # Quality note: Mamba layers already project d_model → 2×d_inner (4096)
+    # internally, so MoE only adds specialist *refinement* — intermediate=1024
+    # (0.5× d_model) is adequate in a Mamba-heavy hybrid architecture.
+    moe_n_experts: int = 8
     moe_top_k: int = 2
-    moe_intermediate: int = 2048     # expert hidden dimension (SwiGLU)
+    moe_intermediate: int = 1024     # SwiGLU hidden dim — sized for WSL2 VRAM budget
     moe_aux_loss_coeff: float = 0.01 # load-balancing coefficient
 
     # Misc
