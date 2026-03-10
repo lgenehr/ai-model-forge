@@ -143,6 +143,65 @@ python train.py --no_compile --no_grad_checkpoint
 
 ---
 
+## Inference
+
+The `inference.py` script loads a checkpoint and runs autoregressive generation.
+
+### Basic usage
+
+```bash
+# Interactive mode (uses model_1b/checkpoints/best.pt by default)
+python inference.py
+
+# Single prompt
+python inference.py --prompt "Era uma vez"
+
+# Specific checkpoint
+python inference.py --checkpoint model_1b/checkpoints/step_00001500.pt --prompt "Olá"
+```
+
+### Sampling options
+
+```bash
+# Greedy decoding (deterministic)
+python inference.py --prompt "Hello" --temperature 0
+
+# More creative / longer output
+python inference.py --prompt "Conta uma história" \
+    --max_new_tokens 400 --temperature 0.9 --top_p 0.95
+
+# Disable repetition penalty
+python inference.py --prompt "Era uma vez" --repetition_penalty 1.0
+
+# Print everything at once instead of streaming
+python inference.py --prompt "Olá" --no_stream
+```
+
+### All options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--checkpoint` | `model_1b/checkpoints/best.pt` | Path to `.pt` checkpoint |
+| `--output_dir` | `model_1b` | Base dir to find checkpoints automatically |
+| `--prompt` | *(interactive)* | Input text; omit to enter interactive loop |
+| `--max_new_tokens` | `200` | Maximum tokens to generate |
+| `--temperature` | `0.8` | Sampling temperature (`0` = greedy) |
+| `--top_p` | `0.9` | Nucleus sampling threshold |
+| `--repetition_penalty` | `1.1` | Penalize repeated tokens (`1.0` = off) |
+| `--dtype` | `bfloat16` | Inference dtype (`bfloat16` / `float16` / `float32`) |
+| `--device` | *(auto)* | Override device (`cuda` / `cpu`) |
+| `--no_stream` | off | Disable token streaming |
+
+### How it works
+
+- **Checkpoint auto-discovery**: looks for `best.pt` → `latest.pt` in `output_dir/checkpoints/`.
+- **Config from checkpoint**: `ModelConfig` is reconstructed from the saved `model_config` dict — no need to repeat architecture flags.
+- **Streaming**: tokens are printed as they are generated; final line reports `tok/s`.
+- **EOS handling**: generation stops automatically on the GPT-2 end-of-text token (`<|endoftext|>`).
+- **Inference dtype**: model is cast to `bfloat16` by default, matching training precision and halving VRAM vs `float32`.
+
+---
+
 ## Performance Notes
 
 | Setting | Expected tok/s |
