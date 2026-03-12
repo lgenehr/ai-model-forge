@@ -98,6 +98,9 @@ class ModelConfig:
             self.mamba_dt_rank = math.ceil(self.d_model / 16)
         assert self.d_model % self.n_heads == 0
         assert self.n_heads % self.n_kv_heads == 0
+        assert self.head_dim % 2 == 0, "RoPE requires an even head_dim"
+        assert self.moe_top_k <= self.moe_n_experts
+        assert all(0 <= idx < self.n_layers for idx in self.attention_layers)
         self._attention_set = set(self.attention_layers)
 
     @property
@@ -447,7 +450,7 @@ class MoELayer(nn.Module):
             aux_loss: scalar load-balancing loss
         """
         B, T, D = x.shape
-        x_flat = x.view(B * T, D)          # [N, D]  where N = B*T
+        x_flat = x.reshape(B * T, D)       # [N, D]  where N = B*T
 
         # ── Router ───────────────────────────────────────────────────────────
         gate_logits = self.gate(x_flat)    # [N, E]
@@ -480,7 +483,7 @@ class MoELayer(nn.Module):
         selected = expert_outs.gather(1, idx_expanded)              # [N, K, D]
         out = (selected * top_scores.unsqueeze(-1)).sum(dim=1)      # [N, D]
 
-        return out.view(B, T, D), aux_loss
+        return out.reshape(B, T, D), aux_loss
 
 
 class AttentionMoEBlock(nn.Module):
@@ -662,8 +665,8 @@ class HybridMoEModel(nn.Module):
 
         if targets is not None:
             ce_loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                targets.view(-1),
+                logits.reshape(-1, logits.size(-1)),
+                targets.reshape(-1),
                 ignore_index=-100,
             )
             total_loss = ce_loss + total_aux_loss

@@ -133,14 +133,16 @@ def build_optimizer(model: HybridMoEModel, train_cfg: Dict) -> torch.optim.Optim
         {"params": no_decay_params, "weight_decay": 0.0},
     ]
 
-    opt = torch.optim.AdamW(
-        param_groups,
-        lr=train_cfg["lr"],
-        betas=(train_cfg.get("beta1", 0.9), train_cfg.get("beta2", 0.95)),
-        eps=train_cfg.get("adam_eps", 1e-8),
-        fused=True,  # PyTorch 2.x fused CUDA kernel (faster, less overhead)
-    )
-    logger.info(f"Optimizer: AdamW fused  |  "
+    adamw_kwargs = {
+        "lr": train_cfg["lr"],
+        "betas": (train_cfg.get("beta1", 0.9), train_cfg.get("beta2", 0.95)),
+        "eps": train_cfg.get("adam_eps", 1e-8),
+    }
+    if torch.cuda.is_available():
+        adamw_kwargs["fused"] = True
+
+    opt = torch.optim.AdamW(param_groups, **adamw_kwargs)
+    logger.info(f"Optimizer: AdamW{' fused' if torch.cuda.is_available() else ''}  |  "
                 f"decay params: {sum(p.numel() for p in decay_params):,}  |  "
                 f"no-decay params: {sum(p.numel() for p in no_decay_params):,}")
     return opt
@@ -159,6 +161,7 @@ def save_checkpoint(
     is_best: bool = False,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
+    keep_last = max(1, int(train_cfg.get("keep_last_checkpoints", 3)))
     state = {
         "step":           step,
         "tokens_trained": tokens_trained,   # cumulative tokens seen so far
@@ -183,7 +186,30 @@ def save_checkpoint(
             link_best.unlink()
         link_best.symlink_to(ckpt_path.name)
 
+    prune_old_checkpoints(output_dir, keep_last)
     logger.info(f"Checkpoint saved → {ckpt_path}  (best={is_best})")
+
+
+def prune_old_checkpoints(output_dir: Path, keep_last: int) -> None:
+    """Keep the most recent numbered checkpoints and preserve the best one."""
+    checkpoints = sorted(output_dir.glob("step_*.pt"))
+    best_target = None
+    best_link = output_dir / "best.pt"
+    if best_link.is_symlink():
+        best_target = (output_dir / os.readlink(best_link)).resolve()
+
+    prunable = [
+        path for path in checkpoints
+        if best_target is None or path.resolve() != best_target
+    ]
+    stale = prunable[:-keep_last]
+    if not stale:
+        return
+
+    for path in stale:
+        path.unlink(missing_ok=True)
+
+    logger.info("Pruned %d old checkpoint(s); keeping last %d.", len(stale), keep_last)
 
 
 def load_checkpoint(
@@ -191,6 +217,8 @@ def load_checkpoint(
     model: HybridMoEModel,
     optimizer: Optional[torch.optim.Optimizer],
     device: torch.device,
+    train_cfg: Dict,
+    model_cfg: ModelConfig,
 ) -> Tuple[int, int, float]:
     """Load checkpoint; returns (step, tokens_trained, best_val_loss)."""
     logger.info(f"Loading checkpoint: {path}")
@@ -199,12 +227,38 @@ def load_checkpoint(
     if optimizer is not None and "optimizer" in state:
         optimizer.load_state_dict(state["optimizer"])
     step           = state.get("step", 0)
-    tokens_trained = state.get("tokens_trained", 0)  # 0 for old checkpoints
+    tokens_trained = state.get("tokens_trained")
+    if tokens_trained is None:
+        tokens_trained = infer_tokens_trained(state, step, train_cfg, model_cfg)
     best_val_loss  = state.get("best_val_loss", float("inf"))
     logger.info(f"  Resumed from step {step}  |  "
                 f"tokens_trained={tokens_trained/1e9:.3f}B  |  "
                 f"best_val_loss={best_val_loss:.4f}")
     return step, tokens_trained, best_val_loss
+
+
+def infer_tokens_trained(state: Dict, step: int, train_cfg: Dict, model_cfg: ModelConfig) -> int:
+    """
+    Best-effort fallback for legacy checkpoints that did not persist token counts.
+    """
+    saved_train_cfg = state.get("train_cfg", {})
+    saved_model_cfg = state.get("model_config", {})
+
+    batch_size = int(saved_train_cfg.get("batch_size", train_cfg.get("batch_size", 1)))
+    grad_accum = int(saved_train_cfg.get("grad_accum", train_cfg.get("grad_accum", 1)))
+    seq_len = int(saved_model_cfg.get("max_seq_len", model_cfg.max_seq_len))
+
+    inferred = step * batch_size * grad_accum * seq_len
+    logger.warning(
+        "Checkpoint does not contain tokens_trained; inferred %s tokens from "
+        "step=%s, batch_size=%s, grad_accum=%s, max_seq_len=%s.",
+        f"{inferred:,}",
+        step,
+        batch_size,
+        grad_accum,
+        seq_len,
+    )
+    return inferred
 
 
 # ─── Evaluation ───────────────────────────────────────────────────────────────
@@ -230,7 +284,7 @@ def evaluate(
             break
         input_ids = batch["input_ids"].to(device, non_blocking=True)
         labels    = batch["labels"].to(device, non_blocking=True)
-        with torch.autocast(device_type="cuda", dtype=dtype):
+        with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
             _, _, loss_dict = model(input_ids, targets=labels, use_checkpoint=False)
         if loss_dict is not None:
             total_ce += loss_dict["ce_loss"]
@@ -355,6 +409,12 @@ def main():
 
     use_grad_ckpt = train_cfg.get("gradient_checkpointing", True)
     use_compile   = train_cfg.get("compile", True)
+    if args.no_grad_checkpoint:
+        use_grad_ckpt = False
+    if args.no_compile:
+        use_compile = False
+    train_cfg["gradient_checkpointing"] = use_grad_ckpt
+    train_cfg["compile"] = use_compile
 
     if use_compile:
         from model import HAS_MAMBA_SSM
@@ -380,7 +440,7 @@ def main():
         resume_path = args.resume
     if resume_path and Path(resume_path).exists():
         start_step, start_tokens, best_val_loss = load_checkpoint(
-            resume_path, model, optimizer, device  # type: ignore[arg-type]
+            resume_path, model, optimizer, device, train_cfg, cfg  # type: ignore[arg-type]
         )
 
     # ── W&B ───────────────────────────────────────────────────────────────────
@@ -464,11 +524,15 @@ def main():
         step_tokens = 0
 
         for _ in range(grad_accum):
-            batch     = next(train_iter)
+            try:
+                batch = next(train_iter)
+            except StopIteration:
+                train_iter = iter(train_loader)
+                batch = next(train_iter)
             input_ids = batch["input_ids"].to(device, non_blocking=True)
             labels    = batch["labels"].to(device, non_blocking=True)
 
-            with torch.autocast(device_type="cuda", dtype=dtype):
+            with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
                 _, total_loss, loss_dict = model(
                     input_ids, targets=labels, use_checkpoint=use_grad_ckpt
                 )
@@ -509,7 +573,7 @@ def main():
             avg_total = log_total_loss / log_every
             avg_ce    = log_ce_loss    / log_every
             avg_aux   = log_aux_loss   / log_every
-            mem_gb    = torch.cuda.memory_allocated() / 1e9
+            mem_gb    = (torch.cuda.memory_allocated() / 1e9) if device.type == "cuda" else 0.0
 
             tokens_str = (
                 f"  tokens: {tokens_trained/1e9:.3f}B/{max_tokens/1e9:.2f}B"
@@ -625,6 +689,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     train.add_argument("--log_every",       type=int,   default=None)
     train.add_argument("--eval_every",      type=int,   default=None)
     train.add_argument("--save_every",      type=int,   default=None)
+    train.add_argument("--keep_last_checkpoints", type=int, default=None)
     train.add_argument("--eval_batches",    type=int,   default=None)
     train.add_argument("--resume",          type=str,   default=None,
                        help="Path to checkpoint to resume from")
