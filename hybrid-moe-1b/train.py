@@ -28,20 +28,93 @@ import os
 import signal
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import yaml
+from torch.utils.data import DataLoader, SequentialSampler
 
 # Add parent dir so we can import the existing data_loader
 sys.path.insert(0, str(Path(__file__).parent.parent / "bitnet-mamba-hybrid"))
-from data_loader import create_dataloader, get_dataset_info  # type: ignore
+from data_loader import PreTokenizedDataset, create_dataloader, get_dataset_info  # type: ignore
 
 from model import HybridMoEModel, ModelConfig, estimate_memory_gb
 
 logger = logging.getLogger(__name__)
+
+
+def _to_python_value(value: Any) -> Any:
+    """Convert tensors/scalars to JSON-safe Python values."""
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 1:
+            return value.item()
+        return value.detach().cpu().tolist()
+    if isinstance(value, Path):
+        return str(value)
+    return value
+
+
+def build_checkpoint_metadata(
+    *,
+    step: int,
+    tokens_trained: int,
+    best_val_loss: float,
+    train_metrics: Optional[Dict[str, Any]],
+    eval_metrics: Optional[Dict[str, Any]],
+    train_cfg: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Build a structured metadata payload persisted with each checkpoint."""
+    metadata = {
+        "step": step,
+        "tokens_trained": tokens_trained,
+        "train_loss": None,
+        "train_ce_loss": None,
+        "train_aux_loss": None,
+        "grad_norm": None,
+        "lr": None,
+        "val_loss": None,
+        "val_ce_loss": None,
+        "val_aux_loss": None,
+        "best_val_loss": best_val_loss,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "run_name": train_cfg.get("wandb_run_name"),
+    }
+
+    if train_metrics:
+        metadata.update({
+            "train_loss": _to_python_value(train_metrics.get("train_loss")),
+            "train_ce_loss": _to_python_value(train_metrics.get("train_ce_loss")),
+            "train_aux_loss": _to_python_value(train_metrics.get("train_aux_loss")),
+            "grad_norm": _to_python_value(train_metrics.get("grad_norm")),
+            "lr": _to_python_value(train_metrics.get("lr")),
+        })
+
+    if eval_metrics:
+        metadata.update({
+            "val_loss": _to_python_value(eval_metrics.get("val_loss")),
+            "val_ce_loss": _to_python_value(eval_metrics.get("val_ce_loss")),
+            "val_aux_loss": _to_python_value(eval_metrics.get("val_aux_loss")),
+        })
+        metadata["eval_batches"] = _to_python_value(eval_metrics.get("batches_evaluated"))
+        metadata["eval_tokens"] = _to_python_value(eval_metrics.get("tokens_evaluated"))
+        metadata["eval_seed"] = _to_python_value(eval_metrics.get("eval_seed"))
+
+    return metadata
+
+
+def _write_json(path: Path, payload: Dict[str, Any]) -> None:
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+        f.write("\n")
+
+
+def _update_sidecar_symlink(link_path: Path, target_name: str) -> None:
+    if link_path.is_symlink() or link_path.exists():
+        link_path.unlink()
+    link_path.symlink_to(target_name)
 
 
 # ─── SIGINT handler (Ctrl+C → safe checkpoint) ───────────────────────────────
@@ -158,6 +231,7 @@ def save_checkpoint(
     best_val_loss: float,
     train_cfg: Dict,
     output_dir: Path,
+    checkpoint_meta: Optional[Dict[str, Any]] = None,
     is_best: bool = False,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -170,21 +244,25 @@ def save_checkpoint(
         "optimizer":      optimizer.state_dict(),
         "model_config":   model.config.__dict__,
         "train_cfg":      train_cfg,
+        "checkpoint_meta": checkpoint_meta or {},
     }
     ckpt_path = output_dir / f"step_{step:08d}.pt"
     torch.save(state, ckpt_path)
+    meta_path = ckpt_path.with_suffix(".json")
+    if checkpoint_meta is not None:
+        _write_json(meta_path, checkpoint_meta)
 
     # Symlink latest / best
     link_latest = output_dir / "latest.pt"
-    if link_latest.is_symlink() or link_latest.exists():
-        link_latest.unlink()
-    link_latest.symlink_to(ckpt_path.name)
+    _update_sidecar_symlink(link_latest, ckpt_path.name)
+    if checkpoint_meta is not None:
+        _update_sidecar_symlink(output_dir / "latest.json", meta_path.name)
 
     if is_best:
         link_best = output_dir / "best.pt"
-        if link_best.is_symlink() or link_best.exists():
-            link_best.unlink()
-        link_best.symlink_to(ckpt_path.name)
+        _update_sidecar_symlink(link_best, ckpt_path.name)
+        if checkpoint_meta is not None:
+            _update_sidecar_symlink(output_dir / "best.json", meta_path.name)
 
     prune_old_checkpoints(output_dir, keep_last)
     logger.info(f"Checkpoint saved → {ckpt_path}  (best={is_best})")
@@ -208,6 +286,7 @@ def prune_old_checkpoints(output_dir: Path, keep_last: int) -> None:
 
     for path in stale:
         path.unlink(missing_ok=True)
+        path.with_suffix(".json").unlink(missing_ok=True)
 
     logger.info("Pruned %d old checkpoint(s); keeping last %d.", len(stale), keep_last)
 
@@ -219,8 +298,8 @@ def load_checkpoint(
     device: torch.device,
     train_cfg: Dict,
     model_cfg: ModelConfig,
-) -> Tuple[int, int, float]:
-    """Load checkpoint; returns (step, tokens_trained, best_val_loss)."""
+) -> Tuple[int, int, float, Dict[str, Any]]:
+    """Load checkpoint; returns step, tokens, best loss, and checkpoint metadata."""
     logger.info(f"Loading checkpoint: {path}")
     state = torch.load(path, map_location=device, weights_only=False)
     model.load_state_dict(state["model"])
@@ -231,10 +310,26 @@ def load_checkpoint(
     if tokens_trained is None:
         tokens_trained = infer_tokens_trained(state, step, train_cfg, model_cfg)
     best_val_loss  = state.get("best_val_loss", float("inf"))
+    checkpoint_meta = state.get("checkpoint_meta") or load_checkpoint_metadata(path)
     logger.info(f"  Resumed from step {step}  |  "
                 f"tokens_trained={tokens_trained/1e9:.3f}B  |  "
                 f"best_val_loss={best_val_loss:.4f}")
-    return step, tokens_trained, best_val_loss
+    if checkpoint_meta:
+        logger.info(
+            "  Resume metadata: train_ce=%s  |  val_ce=%s  |  run=%s",
+            checkpoint_meta.get("train_ce_loss"),
+            checkpoint_meta.get("val_ce_loss"),
+            checkpoint_meta.get("run_name"),
+        )
+    return step, tokens_trained, best_val_loss, checkpoint_meta
+
+
+def load_checkpoint_metadata(path: str) -> Dict[str, Any]:
+    sidecar_path = Path(path).with_suffix(".json")
+    if not sidecar_path.exists():
+        return {}
+    with sidecar_path.open("r", encoding="utf-8") as f:
+        return json.load(f)
 
 
 def infer_tokens_trained(state: Dict, step: int, train_cfg: Dict, model_cfg: ModelConfig) -> int:
@@ -263,34 +358,66 @@ def infer_tokens_trained(state: Dict, step: int, train_cfg: Dict, model_cfg: Mod
 
 # ─── Evaluation ───────────────────────────────────────────────────────────────
 
-@torch.no_grad()
 def evaluate(
     model: HybridMoEModel,
-    val_loader,
+    val_batches: List[Dict[str, torch.Tensor]],
     device: torch.device,
     dtype: torch.dtype,
-    n_batches: int = 50,
-) -> float:
-    """Compute mean validation CE loss over n_batches.
+    eval_seed: int,
+) -> Dict[str, float]:
+    """Compute deterministic validation metrics over a fixed batch subset.
 
-    Returns ce_loss only (aux/load-balance loss is a training artifact and
-    should not influence the val metric used for early-stopping / best-model).
+    CE is aggregated by valid-token count so padding/truncation differences do
+    not distort the metric. Aux loss is tracked only for audit.
     """
+    if not val_batches:
+        raise ValueError("Validation batch subset is empty.")
+
+    was_training = model.training
     model.eval()
+    assert not model.training, "Validation must run with model.eval()."
+
     total_ce = 0.0
-    count = 0
-    for batch in val_loader:
-        if count >= n_batches:
-            break
-        input_ids = batch["input_ids"].to(device, non_blocking=True)
-        labels    = batch["labels"].to(device, non_blocking=True)
-        with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
-            _, _, loss_dict = model(input_ids, targets=labels, use_checkpoint=False)
-        if loss_dict is not None:
-            total_ce += loss_dict["ce_loss"]
-            count += 1
-    model.train()
-    return total_ce / max(1, count)
+    total_aux = 0.0
+    total_loss = 0.0
+    total_tokens = 0
+
+    with torch.inference_mode():
+        for batch in val_batches:
+            input_ids = batch["input_ids"].to(device, non_blocking=True)
+            labels = batch["labels"].to(device, non_blocking=True)
+            valid_tokens = int((labels != -100).sum().item())
+            if valid_tokens == 0:
+                continue
+
+            with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
+                _, _, loss_dict = model(input_ids, targets=labels, use_checkpoint=False)
+
+            if loss_dict is None:
+                continue
+
+            ce_loss = float(loss_dict["ce_loss"])
+            aux_loss = float(loss_dict["aux_loss"])
+            total_ce += ce_loss * valid_tokens
+            total_aux += aux_loss
+            total_loss += (ce_loss + aux_loss) * valid_tokens
+            total_tokens += valid_tokens
+
+    if was_training:
+        model.train()
+
+    if total_tokens == 0:
+        raise RuntimeError("Validation produced zero non-padding tokens.")
+
+    batches_evaluated = len(val_batches)
+    return {
+        "val_loss": total_loss / total_tokens,
+        "val_ce_loss": total_ce / total_tokens,
+        "val_aux_loss": total_aux / batches_evaluated,
+        "batches_evaluated": float(batches_evaluated),
+        "tokens_evaluated": float(total_tokens),
+        "eval_seed": float(eval_seed),
+    }
 
 
 # ─── Setup logging ────────────────────────────────────────────────────────────
@@ -307,6 +434,73 @@ def setup_logging(output_dir: Path, level: int = logging.INFO) -> None:
         datefmt="%Y-%m-%d %H:%M:%S",
         handlers=handlers,
     )
+
+
+def build_fixed_validation_batches(
+    *,
+    data_dir: str,
+    batch_size: int,
+    max_seq_len: int,
+    en_ratio: float,
+    pt_ratio: float,
+    seed: int,
+    n_batches: int,
+) -> List[Dict[str, torch.Tensor]]:
+    """Materialize a deterministic validation subset once and reuse it."""
+    val_dataset = PreTokenizedDataset(
+        data_dir=data_dir,
+        max_seq_len=max_seq_len,
+        en_ratio=en_ratio,
+        pt_ratio=pt_ratio,
+        seed=seed,
+        split="val",
+    )
+    val_dataset.set_epoch(0)
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=False,
+        drop_last=True,
+    )
+    assert isinstance(val_loader.sampler, SequentialSampler), (
+        "Validation DataLoader must use sequential sampling."
+    )
+
+    available_batches = len(val_loader)
+    if available_batches == 0:
+        raise RuntimeError("Validation split is too small to form a single batch.")
+    target_batches = min(n_batches, available_batches)
+
+    fixed_batches: List[Dict[str, torch.Tensor]] = []
+    for idx, batch in enumerate(val_loader):
+        if idx >= target_batches:
+            break
+        fixed_batches.append({
+            "input_ids": batch["input_ids"].clone(),
+            "labels": batch["labels"].clone(),
+        })
+
+    assert fixed_batches, "Failed to materialize deterministic validation batches."
+    first_hash = int(fixed_batches[0]["input_ids"][0, :16].sum().item())
+    total_tokens = sum(int((batch["labels"] != -100).sum().item()) for batch in fixed_batches)
+    logger.info(
+        "Validation subset fixed: %d batches  |  %d tokens  |  seed=%d  |  first_batch_hash=%d",
+        len(fixed_batches),
+        total_tokens,
+        seed,
+        first_hash,
+    )
+    if target_batches < n_batches:
+        logger.warning(
+            "Requested %d eval batches but validation split provides only %d; clamping.",
+            n_batches,
+            target_batches,
+        )
+
+    return fixed_batches
 
 
 # ─── Main training loop ───────────────────────────────────────────────────────
@@ -352,6 +546,8 @@ def main():
     seq_len     = cfg.max_seq_len
     grad_accum  = train_cfg.get("grad_accum", 16)
     num_workers = train_cfg.get("num_workers", 4)
+    eval_batches_requested = train_cfg.get("eval_batches", 50)
+    eval_seed = train_cfg.get("eval_seed", train_cfg.get("seed", 42) + 999)
 
     effective_batch_tokens = batch_size * seq_len * grad_accum
     logger.info(f"Batch: {batch_size}  |  grad_accum: {grad_accum}  |  "
@@ -367,15 +563,14 @@ def main():
         seed=train_cfg.get("seed", 42),
         split="train",
     )
-    val_loader = create_dataloader(
+    val_batches = build_fixed_validation_batches(
         data_dir=data_dir,
         batch_size=batch_size,
         max_seq_len=seq_len,
         en_ratio=train_cfg.get("en_ratio", 0.3),
         pt_ratio=train_cfg.get("pt_ratio", 0.7),
-        num_workers=min(num_workers, 2),
-        seed=train_cfg.get("seed", 42) + 999,
-        split="val",
+        seed=eval_seed,
+        n_batches=eval_batches_requested,
     )
 
     # ── Optional data sanity check ────────────────────────────────────────────
@@ -384,11 +579,14 @@ def main():
         sample = next(iter(train_loader))
         ids_s  = sample["input_ids"]
         lbl_s  = sample["labels"]
+        val_sample = val_batches[0]
         logger.info("[debug] Data check:")
         logger.info(f"  input_ids shape : {list(ids_s.shape)}  dtype={ids_s.dtype}")
         logger.info(f"  labels shape    : {list(lbl_s.shape)}  dtype={lbl_s.dtype}")
         logger.info(f"  input_ids[0,:8] : {ids_s[0, :8].tolist()}")
         logger.info(f"  labels[0,:8]    : {lbl_s[0, :8].tolist()}")
+        logger.info(f"  val input shape : {list(val_sample['input_ids'].shape)}")
+        logger.info(f"  val labels shape: {list(val_sample['labels'].shape)}")
         # input_ids[t+1] should equal labels[t] for valid positions
         valid_mask = lbl_s[0] != -100
         if valid_mask.sum() > 1:
@@ -396,6 +594,8 @@ def main():
             logger.info(f"  label shift OK  : {bool(shift_ok)}")
         else:
             logger.warning("  label shift check skipped (too many -100 labels)")
+        assert val_sample["input_ids"].shape == ids_s.shape, "Train/val input shape mismatch."
+        assert val_sample["labels"].shape == lbl_s.shape, "Train/val label shape mismatch."
 
     # ── Model ─────────────────────────────────────────────────────────────────
     logger.info("Building model…")
@@ -435,13 +635,25 @@ def main():
     start_step    = 0
     start_tokens  = 0
     best_val_loss = float("inf")
+    last_eval_metrics: Optional[Dict[str, Any]] = None
     resume_path   = train_cfg.get("resume", None)
     if args.resume:
         resume_path = args.resume
     if resume_path and Path(resume_path).exists():
-        start_step, start_tokens, best_val_loss = load_checkpoint(
+        start_step, start_tokens, best_val_loss, resume_meta = load_checkpoint(
             resume_path, model, optimizer, device, train_cfg, cfg  # type: ignore[arg-type]
         )
+        if resume_meta:
+            last_eval_metrics = {
+                "val_loss": resume_meta.get("val_loss"),
+                "val_ce_loss": resume_meta.get("val_ce_loss"),
+                "val_aux_loss": resume_meta.get("val_aux_loss"),
+                "batches_evaluated": resume_meta.get("eval_batches"),
+                "tokens_evaluated": resume_meta.get("eval_tokens"),
+                "eval_seed": resume_meta.get("eval_seed", eval_seed),
+            }
+            if not train_cfg.get("wandb_run_name") and resume_meta.get("run_name"):
+                train_cfg["wandb_run_name"] = resume_meta["run_name"]
 
     # ── W&B ───────────────────────────────────────────────────────────────────
     wandb_run = None
@@ -502,6 +714,13 @@ def main():
     log_tokens       = 0     # valid tokens seen in this window
     t_last           = time.perf_counter()
     grad_norm_ema    = 0.0   # EMA of grad norm for monitoring
+    last_train_metrics: Dict[str, Any] = {
+        "train_loss": None,
+        "train_ce_loss": None,
+        "train_aux_loss": None,
+        "grad_norm": None,
+        "lr": None,
+    }
 
     logger.info(f"Starting training from step {step} → {effective_max_steps}"
                 + (f"  ({max_tokens/1e9:.2f}B token budget)" if max_tokens else ""))
@@ -556,6 +775,13 @@ def main():
         step           += 1
         tokens_trained += step_tokens
         grad_norm_ema   = 0.9 * grad_norm_ema + 0.1 * grad_norm.item()
+        last_train_metrics = {
+            "train_loss": step_total,
+            "train_ce_loss": step_ce,
+            "train_aux_loss": step_aux,
+            "grad_norm": grad_norm_ema,
+            "lr": lr,
+        }
 
         # Accumulate into per-window totals
         log_total_loss += step_total
@@ -574,6 +800,13 @@ def main():
             avg_ce    = log_ce_loss    / log_every
             avg_aux   = log_aux_loss   / log_every
             mem_gb    = (torch.cuda.memory_allocated() / 1e9) if device.type == "cuda" else 0.0
+            last_train_metrics = {
+                "train_loss": avg_total,
+                "train_ce_loss": avg_ce,
+                "train_aux_loss": avg_aux,
+                "grad_norm": grad_norm_ema,
+                "lr": lr,
+            }
 
             tokens_str = (
                 f"  tokens: {tokens_trained/1e9:.3f}B/{max_tokens/1e9:.2f}B"
@@ -607,36 +840,70 @@ def main():
 
         # ── Evaluation ────────────────────────────────────────────────────────
         if step % eval_every == 0:
-            val_loss = evaluate(model, val_loader, device, dtype,  # type: ignore[arg-type]
-                                n_batches=train_cfg.get("eval_batches", 50))
-            is_best  = val_loss < best_val_loss
+            eval_metrics = evaluate(model, val_batches, device, dtype, eval_seed)
+            val_ce_loss = float(eval_metrics["val_ce_loss"])
+            is_best  = val_ce_loss < best_val_loss
             if is_best:
-                best_val_loss = val_loss
+                best_val_loss = val_ce_loss
+            eval_metrics["best_val_loss"] = best_val_loss
+            last_eval_metrics = eval_metrics
 
             logger.info(
-                f"[EVAL]  step {step}  |  val_ce: {val_loss:.4f}  "
+                f"[EVAL]  step {step}  |  val_ce: {eval_metrics['val_ce_loss']:.4f}  "
+                f"|  val_aux: {eval_metrics['val_aux_loss']:.4f}  "
+                f"|  eval_tokens: {int(eval_metrics['tokens_evaluated'])}  "
                 f"|  best: {best_val_loss:.4f}  {'★' if is_best else ''}"
             )
             if wandb_run is not None:
-                wandb_run.log({"val/ce_loss": val_loss, "val/best_ce_loss": best_val_loss,
-                               "step": step})
+                wandb_run.log({
+                    "val/loss": eval_metrics["val_loss"],
+                    "val/ce_loss": eval_metrics["val_ce_loss"],
+                    "val/aux_loss": eval_metrics["val_aux_loss"],
+                    "val/best_ce_loss": best_val_loss,
+                    "val/tokens": eval_metrics["tokens_evaluated"],
+                    "step": step,
+                })
 
             raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+            checkpoint_meta = build_checkpoint_metadata(
+                step=step,
+                tokens_trained=tokens_trained,
+                best_val_loss=best_val_loss,
+                train_metrics=last_train_metrics,
+                eval_metrics=last_eval_metrics,
+                train_cfg=train_cfg,
+            )
             save_checkpoint(raw_model, optimizer, step, tokens_trained,  # type: ignore[arg-type]
-                            best_val_loss, train_cfg, ckpt_dir, is_best)
+                            best_val_loss, train_cfg, ckpt_dir, checkpoint_meta, is_best)
 
         # ── Periodic save ─────────────────────────────────────────────────────
         elif step % save_every == 0:
             raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+            checkpoint_meta = build_checkpoint_metadata(
+                step=step,
+                tokens_trained=tokens_trained,
+                best_val_loss=best_val_loss,
+                train_metrics=last_train_metrics,
+                eval_metrics=last_eval_metrics,
+                train_cfg=train_cfg,
+            )
             save_checkpoint(raw_model, optimizer, step, tokens_trained,  # type: ignore[arg-type]
-                            best_val_loss, train_cfg, ckpt_dir, False)
+                            best_val_loss, train_cfg, ckpt_dir, checkpoint_meta, False)
 
         # ── SIGINT: save checkpoint then exit cleanly ─────────────────────────
         if _interrupt_requested:
             logger.info("SIGINT: saving checkpoint and exiting…")
             raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+            checkpoint_meta = build_checkpoint_metadata(
+                step=step,
+                tokens_trained=tokens_trained,
+                best_val_loss=best_val_loss,
+                train_metrics=last_train_metrics,
+                eval_metrics=last_eval_metrics,
+                train_cfg=train_cfg,
+            )
             save_checkpoint(raw_model, optimizer, step, tokens_trained,  # type: ignore[arg-type]
-                            best_val_loss, train_cfg, ckpt_dir, False)
+                            best_val_loss, train_cfg, ckpt_dir, checkpoint_meta, False)
             logger.info("Checkpoint saved. Exiting.")
             if wandb_run is not None:
                 wandb_run.finish()
@@ -691,6 +958,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     train.add_argument("--save_every",      type=int,   default=None)
     train.add_argument("--keep_last_checkpoints", type=int, default=None)
     train.add_argument("--eval_batches",    type=int,   default=None)
+    train.add_argument("--eval_seed",       type=int,   default=None)
     train.add_argument("--resume",          type=str,   default=None,
                        help="Path to checkpoint to resume from")
 
