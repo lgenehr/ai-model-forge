@@ -29,7 +29,7 @@ python train_hybrid-mamba-bitnet.py \
     --en_ratio 0.5 \
     --pt_ratio 0.5 \
     --output_dir "model" \
-    --data_dir "data/tokenized" \
+    --data_dir "/home/lgene/meu_modelo_temp/ai-model-forge/datasets/tokenized" \
     --wandb \
     --wandb_api_key "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" \
     --wandb_project "bitnet-mamba-hybrid" \

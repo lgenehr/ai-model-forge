@@ -34,7 +34,7 @@ except ImportError as exc:
 
 DetectorFactory.seed = 0
 
-DEFAULT_DATASET_ROOT = Path("../bitnet-mamba-hybrid/data/tokenized")
+DEFAULT_DATASET_ROOT = Path("/home/lgene/meu_modelo_temp/ai-model-forge/datasets/tokenized")
 LANGS = ("en", "pt")
 SAMPLE_COUNT = 200
 SAMPLE_LENGTH = 64

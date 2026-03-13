@@ -62,7 +62,7 @@ model:
 
 training:
   # ── Data ───────────────────────────────────────────────────────────────────
-  data_dir:      "../bitnet-mamba-hybrid/data/tokenized"
+  data_dir:      "/home/lgene/meu_modelo_temp/ai-model-forge/datasets/tokenized"
   en_ratio:      0.30         # 30% English
   pt_ratio:      0.70         # 70% Portuguese
   num_workers:   4

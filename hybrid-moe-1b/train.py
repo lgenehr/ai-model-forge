@@ -44,6 +44,7 @@ from data_loader import PreTokenizedDataset, create_dataloader, get_dataset_info
 from model import HybridMoEModel, ModelConfig, estimate_memory_gb
 
 logger = logging.getLogger(__name__)
+DEFAULT_DATASET_ROOT = "/home/lgene/meu_modelo_temp/ai-model-forge/datasets/tokenized"
 
 
 def _to_python_value(value: Any) -> Any:
@@ -554,8 +555,7 @@ def main():
     torch.manual_seed(train_cfg.get("seed", 42))
 
     # ── Data ──────────────────────────────────────────────────────────────────
-    data_dir = train_cfg.get("data_dir",
-        str(Path(__file__).parent.parent / "bitnet-mamba-hybrid" / "data" / "tokenized"))
+    data_dir = train_cfg.get("data_dir", DEFAULT_DATASET_ROOT)
 
     info = get_dataset_info(data_dir)
     logger.info(f"Dataset  EN: {info['en_tokens']:,} tokens  "

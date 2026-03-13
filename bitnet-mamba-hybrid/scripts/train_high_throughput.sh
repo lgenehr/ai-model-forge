@@ -37,7 +37,7 @@ python train_hybrid-mamba-bitnet.py \
     --en_ratio 0.5 \
     --pt_ratio 0.5 \
     --output_dir "model" \
-    --data_dir "data/tokenized" \
+    --data_dir "/home/lgene/meu_modelo_temp/ai-model-forge/datasets/tokenized" \
     --wandb \
     --wandb_project "bitnet-mamba-hybrid" \
     --wandb_run_name "d1024-high-throughput-$(date +%Y%m%d-%H%M%S)"

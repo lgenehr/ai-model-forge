@@ -12,7 +12,7 @@ Usage:
     from data_loader import create_dataloader, PreTokenizedDataset
 
     dataloader = create_dataloader(
-        data_dir="./data/tokenized",
+        data_dir="/home/lgene/meu_modelo_temp/ai-model-forge/datasets/tokenized",
         batch_size=6,
         max_seq_len=2048,
         en_ratio=0.5,
@@ -38,6 +38,8 @@ import torch
 from torch.utils.data import Dataset, DataLoader, Sampler
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_DATASET_ROOT = "/home/lgene/meu_modelo_temp/ai-model-forge/datasets/tokenized"
 
 
 class MemoryMappedTokens:
@@ -523,7 +525,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Test data loader")
-    parser.add_argument("--data_dir", type=str, default="./data/tokenized")
+    parser.add_argument("--data_dir", type=str, default=DEFAULT_DATASET_ROOT)
     parser.add_argument("--batch_size", type=int, default=6)
     parser.add_argument("--max_seq_len", type=int, default=2048)
     parser.add_argument("--num_workers", type=int, default=4)

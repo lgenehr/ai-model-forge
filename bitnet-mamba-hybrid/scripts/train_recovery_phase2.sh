@@ -95,7 +95,7 @@ python train_hybrid-mamba-bitnet.py \
     --max_tokens 4000000000 \
     \
     `# === DATA CONFIGURATION (UNCHANGED) ===` \
-    --data_dir "data/tokenized" \
+    --data_dir "/home/lgene/meu_modelo_temp/ai-model-forge/datasets/tokenized" \
     --en_ratio 0.5 \
     --pt_ratio 0.5 \
     --num_workers 4 \

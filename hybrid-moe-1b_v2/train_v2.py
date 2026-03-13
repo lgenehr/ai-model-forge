@@ -42,6 +42,16 @@ from torch.utils.data import DataLoader, SequentialSampler
 _v1_dir = Path(__file__).parent.parent / "hybrid-moe-1b"
 sys.path.insert(0, str(Path(__file__).parent.parent / "bitnet-mamba-hybrid"))
 from data_loader import PreTokenizedDataset, create_dataloader, get_dataset_info
+from data_pipeline_v2 import (
+    build_fixed_validation_batches_v2,
+    create_dataloader_v2,
+    format_stage_mix,
+    get_missing_source_paths,
+    get_dataset_info_v2,
+    load_data_config,
+    parse_stage_configs,
+    resolve_stage,
+)
 
 from model_v2 import (
     HybridMoEModelV2,
@@ -51,6 +61,7 @@ from model_v2 import (
 )
 
 logger = logging.getLogger(__name__)
+DEFAULT_DATASET_ROOT = "/home/lgene/meu_modelo_temp/ai-model-forge/datasets/tokenized"
 
 
 # ─── Utilities ────────────────────────────────────────────────────────────────
@@ -97,6 +108,7 @@ def build_checkpoint_metadata(
             "train_aux_loss": _to_python_value(train_metrics.get("train_aux_loss")),
             "grad_norm": _to_python_value(train_metrics.get("grad_norm")),
             "lr": _to_python_value(train_metrics.get("lr")),
+            "data_stage": _to_python_value(train_metrics.get("data_stage")),
         })
     if eval_metrics:
         metadata.update({
@@ -168,6 +180,7 @@ def build_config_from_args(args: argparse.Namespace) -> Tuple[ModelConfigV2, Dic
     # V2: balanced bilingual ratio (50% EN / 50% PT)
     train_raw.setdefault("en_ratio", 0.5)
     train_raw.setdefault("pt_ratio", 0.5)
+    train_raw.setdefault("data_config_v2", str(Path(__file__).with_name("data_config_v2.yaml")))
 
     cfg = ModelConfigV2(**{k: v for k, v in model_raw.items() if k in model_keys})
     return cfg, train_raw
@@ -435,6 +448,17 @@ def setup_logging(output_dir: Path, level: int = logging.INFO) -> None:
     )
 
 
+def _format_sampled_source_mix(source_counts: Dict[int, int], source_name_map: Dict[int, str]) -> str:
+    total = sum(source_counts.values())
+    if total <= 0:
+        return "n/a"
+    items = []
+    for source_id, count in sorted(source_counts.items(), key=lambda item: item[0]):
+        name = source_name_map.get(source_id, f"source_{source_id}")
+        items.append(f"{name}={100.0 * count / total:.1f}%")
+    return ", ".join(items)
+
+
 def build_fixed_validation_batches(
     *,
     data_dir: str,
@@ -658,12 +682,50 @@ def main():
     torch.manual_seed(train_cfg.get("seed", 42))
 
     # ── Data ─────────────────────────────────────────────────────────────────
-    data_dir = train_cfg.get("data_dir",
-        str(Path(__file__).parent.parent / "bitnet-mamba-hybrid" / "data" / "tokenized"))
+    data_dir = train_cfg.get("data_dir", DEFAULT_DATASET_ROOT)
+    data_config_path = args.data_config_v2 or train_cfg.get("data_config_v2")
+    use_v2_data_pipeline = False
+    data_cfg: Optional[Dict[str, Any]] = None
+    train_stages = []
+    current_stage = None
+    current_stage_name = "legacy"
+    source_name_map: Dict[int, str] = {}
+    val_source_name_map: Dict[int, str] = {}
+    validation_stage_name = "legacy"
 
-    info = get_dataset_info(data_dir)
-    logger.info(f"Dataset  EN: {info['en_tokens']:,} tokens  "
-                f"|  PT: {info['pt_tokens']:,} tokens")
+    if data_config_path and Path(data_config_path).exists():
+        data_cfg = load_data_config(data_config_path)
+        missing_sources = get_missing_source_paths(data_cfg)
+        if missing_sources:
+            if args.data_config_v2:
+                raise FileNotFoundError(
+                    "V2 data config was explicitly requested, but these sources are missing: "
+                    + ", ".join(missing_sources)
+                )
+            logger.warning(
+                "V2 data config found but artifacts are missing. Falling back to legacy loader. Missing: %s",
+                ", ".join(missing_sources),
+            )
+            data_cfg = None
+        else:
+            train_stages = parse_stage_configs(data_cfg)
+            current_stage = resolve_stage(train_stages, step=0)
+            current_stage_name = current_stage.name
+            use_v2_data_pipeline = True
+
+            info = get_dataset_info_v2(data_cfg)
+            logger.info("V2 data pipeline: %s", data_config_path)
+            for stage_info in info["stages"]:
+                stage_sources = ", ".join(
+                    f"{source['name']}={source['tokens']:,}tok"
+                    for source in stage_info["sources"]
+                )
+                logger.info("  stage=%s  |  %s", stage_info["name"], stage_sources)
+            logger.info("Initial V2 stage: %s  |  mix=%s", current_stage.name, format_stage_mix(current_stage))
+    if not use_v2_data_pipeline:
+        info = get_dataset_info(data_dir)
+        logger.info(f"Dataset  EN: {info['en_tokens']:,} tokens  "
+                    f"|  PT: {info['pt_tokens']:,} tokens")
 
     batch_size = train_cfg.get("batch_size", 2)
     seq_len = cfg.max_seq_len
@@ -676,25 +738,51 @@ def main():
     logger.info(f"Batch: {batch_size}  |  grad_accum: {grad_accum}  |  "
                 f"effective: {effective_batch_tokens:,} tokens/step")
 
-    train_loader = create_dataloader(
-        data_dir=data_dir,
-        batch_size=batch_size,
-        max_seq_len=seq_len,
-        en_ratio=train_cfg.get("en_ratio", 0.3),
-        pt_ratio=train_cfg.get("pt_ratio", 0.7),
-        num_workers=num_workers,
-        seed=train_cfg.get("seed", 42),
-        split="train",
-    )
-    val_batches = build_fixed_validation_batches(
-        data_dir=data_dir,
-        batch_size=batch_size,
-        max_seq_len=seq_len,
-        en_ratio=train_cfg.get("en_ratio", 0.3),
-        pt_ratio=train_cfg.get("pt_ratio", 0.7),
-        seed=eval_seed,
-        n_batches=eval_batches_requested,
-    )
+    if use_v2_data_pipeline:
+        prefetch_factor = int(data_cfg.get("prefetch_factor", 2))
+        pin_memory = bool(data_cfg.get("pin_memory", True))
+        val_fraction = float(data_cfg.get("validation_fraction", 0.005))
+        train_loader, source_name_map = create_dataloader_v2(
+            stage=current_stage,
+            batch_size=batch_size,
+            max_seq_len=seq_len,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            prefetch_factor=prefetch_factor,
+            seed=train_cfg.get("seed", 42),
+            epoch_tokens=train_cfg.get("epoch_tokens"),
+            split="train",
+            val_fraction=val_fraction,
+            drop_last=True,
+        )
+        val_batches, val_source_name_map, validation_stage_name = build_fixed_validation_batches_v2(
+            data_cfg=data_cfg,
+            batch_size=batch_size,
+            max_seq_len=seq_len,
+            seed=eval_seed,
+            n_batches=eval_batches_requested,
+        )
+        logger.info("Validation stage: %s", validation_stage_name)
+    else:
+        train_loader = create_dataloader(
+            data_dir=data_dir,
+            batch_size=batch_size,
+            max_seq_len=seq_len,
+            en_ratio=train_cfg.get("en_ratio", 0.3),
+            pt_ratio=train_cfg.get("pt_ratio", 0.7),
+            num_workers=num_workers,
+            seed=train_cfg.get("seed", 42),
+            split="train",
+        )
+        val_batches = build_fixed_validation_batches(
+            data_dir=data_dir,
+            batch_size=batch_size,
+            max_seq_len=seq_len,
+            en_ratio=train_cfg.get("en_ratio", 0.3),
+            pt_ratio=train_cfg.get("pt_ratio", 0.7),
+            seed=eval_seed,
+            n_batches=eval_batches_requested,
+        )
 
     # ── Model ────────────────────────────────────────────────────────────────
     logger.info("Building V2 model...")
@@ -808,14 +896,38 @@ def main():
     log_ce_loss = 0.0
     log_aux_loss = 0.0
     log_tokens = 0
+    log_source_counts: Dict[int, int] = {}
     t_last = time.perf_counter()
     grad_norm_ema = 0.0
     last_train_metrics: Dict[str, Any] = {}
 
     logger.info(f"Starting training from step {step} -> {effective_max_steps}")
     logger.info(f"gradient_checkpointing={use_grad_ckpt}  |  compile={use_compile}")
+    if use_v2_data_pipeline and current_stage is not None:
+        logger.info("Active V2 stage: %s  |  mix=%s", current_stage.name, format_stage_mix(current_stage))
 
     while step < effective_max_steps and (max_tokens is None or tokens_trained < max_tokens):
+        if use_v2_data_pipeline and data_cfg is not None:
+            stage_for_step = resolve_stage(train_stages, step)
+            if current_stage is None or stage_for_step.name != current_stage.name:
+                current_stage = stage_for_step
+                current_stage_name = current_stage.name
+                train_loader, source_name_map = create_dataloader_v2(
+                    stage=current_stage,
+                    batch_size=batch_size,
+                    max_seq_len=seq_len,
+                    num_workers=num_workers,
+                    pin_memory=bool(data_cfg.get("pin_memory", True)),
+                    prefetch_factor=int(data_cfg.get("prefetch_factor", 2)),
+                    seed=train_cfg.get("seed", 42) + step,
+                    epoch_tokens=train_cfg.get("epoch_tokens"),
+                    split="train",
+                    val_fraction=float(data_cfg.get("validation_fraction", 0.005)),
+                    drop_last=True,
+                )
+                train_iter = iter(train_loader)
+                logger.info("Switched V2 stage -> %s  |  mix=%s", current_stage.name, format_stage_mix(current_stage))
+
         lr = get_lr(step)
         for pg in optimizer.param_groups:
             pg["lr"] = lr
@@ -835,6 +947,10 @@ def main():
                     batch = next(train_iter)
                 input_ids = batch["input_ids"].to(device, non_blocking=True)
                 labels = batch["labels"].to(device, non_blocking=True)
+                if "source_id" in batch:
+                    source_ids = batch["source_id"].view(-1).tolist()
+                    for source_id in source_ids:
+                        log_source_counts[int(source_id)] = log_source_counts.get(int(source_id), 0) + 1
 
                 with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
                     _, total_loss, loss_dict = model(
@@ -889,6 +1005,7 @@ def main():
             "train_aux_loss": step_aux,
             "grad_norm": grad_norm_ema,
             "lr": lr,
+            "data_stage": current_stage_name,
         }
 
         log_total_loss += step_total
@@ -913,6 +1030,7 @@ def main():
                 "train_aux_loss": avg_aux,
                 "grad_norm": grad_norm_ema,
                 "lr": lr,
+                "data_stage": current_stage_name,
             }
 
             tokens_str = (
@@ -926,9 +1044,15 @@ def main():
                 f"lr: {lr:.2e}  gnorm: {grad_norm_ema:.3f}  |  "
                 f"tok/s: {tok_s:,.0f}  mem: {mem_gb:.1f}GB{tokens_str}"
             )
+            if log_source_counts:
+                logger.info(
+                    "  data_stage=%s  |  sampled_mix=%s",
+                    current_stage_name,
+                    _format_sampled_source_mix(log_source_counts, source_name_map),
+                )
 
             if wandb_run is not None:
-                wandb_run.log({
+                wandb_payload = {
                     "train/loss": avg_total,
                     "train/ce_loss": avg_ce,
                     "train/aux_loss": avg_aux,
@@ -938,10 +1062,19 @@ def main():
                     "perf/mem_gb": mem_gb,
                     "tokens_trained_B": tokens_trained / 1e9,
                     "step": step,
-                })
+                }
+                if use_v2_data_pipeline:
+                    wandb_payload["data/stage"] = current_stage_name
+                    total_source_samples = sum(log_source_counts.values())
+                    if total_source_samples > 0:
+                        for source_id, count in log_source_counts.items():
+                            source_key = source_name_map.get(source_id, f"source_{source_id}")
+                            wandb_payload[f"data_mix/{source_key}"] = count / total_source_samples
+                wandb_run.log(wandb_payload)
 
             log_total_loss = log_ce_loss = log_aux_loss = 0.0
             log_tokens = 0
+            log_source_counts = {}
             t_last = t_now
 
         # ── Evaluation ───────────────────────────────────────────────────
@@ -959,6 +1092,8 @@ def main():
                 f"|  val_aux: {eval_metrics['val_aux_loss']:.4f}  "
                 f"|  best: {best_val_loss:.4f}  {'*' if is_best else ''}"
             )
+            if val_source_name_map:
+                logger.info("  validation_stage=%s  |  source_mix=%s", validation_stage_name, ", ".join(val_source_name_map.values()))
             if wandb_run is not None:
                 wandb_run.log({
                     "val/loss": eval_metrics["val_loss"],
@@ -1051,6 +1186,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     train.add_argument("--grad_clip", type=float, default=None)
     train.add_argument("--seed", type=int, default=None)
     train.add_argument("--data_dir", type=str, default=None)
+    train.add_argument("--data_config_v2", type=str, default=None)
     train.add_argument("--output_dir", type=str, default=None)
     train.add_argument("--en_ratio", type=float, default=None)
     train.add_argument("--pt_ratio", type=float, default=None)

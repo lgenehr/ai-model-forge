@@ -1,0 +1,142 @@
+version: 2
+
+# V2-specific dataset policy derived from Tucano 2:
+# - Train only on local materialized/tokenized artifacts in the hot path.
+# - Prefer GigaVerbo-v2 educational web data plus GigaVerbo-v2 Synth.
+# - Preserve a smaller slice of the pre-existing PT corpus for breadth.
+# - Keep English educational data as a minority source for bilingual robustness.
+strategy:
+  mode: local_materialized
+  rationale: >
+    Throughput and fault tolerance are higher when training consumes local memmaps.
+    Hugging Face access should be limited to offline acquisition or warm-cache steps.
+
+validation_fraction: 0.005
+prefetch_factor: 2
+pin_memory: true
+
+recipe:
+  paper: "Tucano 2 Cool: Better Open Source LLMs for Portuguese"
+  chosen_mix: "GigaVerbo-v2 educational subset + GigaVerbo-v2 Synth, with staged weighting"
+  why: >
+    The paper's ablation showed Edu+Synth as the best aggregate pretraining mix.
+    For this repo, the staged recipe keeps Portuguese dominant, raises educational
+    quality over time, and avoids replacing the existing local PT corpus outright.
+
+paths:
+  existing_en_fineweb_edu: "/home/lgene/meu_modelo_temp/ai-model-forge/datasets/tokenized/en"
+  existing_pt_corpus: "/home/lgene/meu_modelo_temp/ai-model-forge/datasets/tokenized/pt"
+  gigaverbo_v2_edu: "/home/lgene/meu_modelo_temp/ai-model-forge/datasets/gigaverbo_v2/tokenized/gigaverbo_v2_edu"
+  gigaverbo_v2_synth: "/home/lgene/meu_modelo_temp/ai-model-forge/datasets/gigaverbo_v2/tokenized/gigaverbo_v2_synth"
+
+stages:
+  - name: warmup_edu
+    start_step: 0
+    end_step: 2000
+    notes: >
+      Mirrors the paper's quality-first warmup while remaining compatible with the
+      existing bilingual setup. Synth is kept out during initial stabilization.
+    sources:
+      - name: gigaverbo_v2_edu
+        path: "/home/lgene/meu_modelo_temp/ai-model-forge/datasets/gigaverbo_v2/tokenized/gigaverbo_v2_edu"
+        language: pt
+        weight: 0.50
+        repeat: 1.5
+        text_domain: educational_web
+      - name: pt_legacy
+        path: "/home/lgene/meu_modelo_temp/ai-model-forge/datasets/tokenized/pt"
+        language: pt
+        weight: 0.20
+        repeat: 1.0
+        text_domain: broad_pt
+      - name: en_fineweb_edu
+        path: "/home/lgene/meu_modelo_temp/ai-model-forge/datasets/tokenized/en"
+        language: en
+        weight: 0.30
+        repeat: 1.0
+        text_domain: educational_web
+
+  - name: stable_edu_synth
+    start_step: 2000
+    end_step: 50000
+    notes: >
+      Main pretraining phase. Introduces Portuguese synthetic data and keeps
+      English educational data as minority support.
+    sources:
+      - name: gigaverbo_v2_edu
+        path: "/home/lgene/meu_modelo_temp/ai-model-forge/datasets/gigaverbo_v2/tokenized/gigaverbo_v2_edu"
+        language: pt
+        weight: 0.34
+        repeat: 2.0
+        text_domain: educational_web
+      - name: gigaverbo_v2_synth
+        path: "/home/lgene/meu_modelo_temp/ai-model-forge/datasets/gigaverbo_v2/tokenized/gigaverbo_v2_synth"
+        language: pt
+        weight: 0.20
+        repeat: 1.5
+        text_domain: synthetic_reasoning
+      - name: pt_legacy
+        path: "/home/lgene/meu_modelo_temp/ai-model-forge/datasets/tokenized/pt"
+        language: pt
+        weight: 0.21
+        repeat: 1.0
+        text_domain: broad_pt
+      - name: en_fineweb_edu
+        path: "/home/lgene/meu_modelo_temp/ai-model-forge/datasets/tokenized/en"
+        language: en
+        weight: 0.25
+        repeat: 1.0
+        text_domain: educational_web
+
+  - name: late_pt_synth
+    start_step: 50000
+    end_step: null
+    notes: >
+      Late-stage specialization. Portuguese rises further, synth is emphasized,
+      and English is reduced instead of removed entirely.
+    sources:
+      - name: gigaverbo_v2_edu
+        path: "/home/lgene/meu_modelo_temp/ai-model-forge/datasets/gigaverbo_v2/tokenized/gigaverbo_v2_edu"
+        language: pt
+        weight: 0.25
+        repeat: 2.0
+        text_domain: educational_web
+      - name: gigaverbo_v2_synth
+        path: "/home/lgene/meu_modelo_temp/ai-model-forge/datasets/gigaverbo_v2/tokenized/gigaverbo_v2_synth"
+        language: pt
+        weight: 0.30
+        repeat: 2.5
+        text_domain: synthetic_reasoning
+      - name: pt_legacy
+        path: "/home/lgene/meu_modelo_temp/ai-model-forge/datasets/tokenized/pt"
+        language: pt
+        weight: 0.25
+        repeat: 1.0
+        text_domain: broad_pt
+      - name: en_fineweb_edu
+        path: "/home/lgene/meu_modelo_temp/ai-model-forge/datasets/tokenized/en"
+        language: en
+        weight: 0.20
+        repeat: 1.0
+        text_domain: educational_web
+
+validation:
+  name: pt_en_holdout
+  notes: >
+    Validation avoids synth-only skew and keeps a stable PT-majority bilingual mix.
+  sources:
+    - name: gigaverbo_v2_edu
+      path: "/home/lgene/meu_modelo_temp/ai-model-forge/datasets/gigaverbo_v2/tokenized/gigaverbo_v2_edu"
+      language: pt
+      weight: 0.45
+      repeat: 1.0
+    - name: pt_legacy
+      path: "/home/lgene/meu_modelo_temp/ai-model-forge/datasets/tokenized/pt"
+      language: pt
+      weight: 0.35
+      repeat: 1.0
+    - name: en_fineweb_edu
+      path: "/home/lgene/meu_modelo_temp/ai-model-forge/datasets/tokenized/en"
+      language: en
+      weight: 0.20
+      repeat: 1.0

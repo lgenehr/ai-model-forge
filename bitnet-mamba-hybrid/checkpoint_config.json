@@ -30,7 +30,7 @@
     "checkpoint_interval": 1000,
     "en_ratio": 0.3,
     "pt_ratio": 0.7,
-    "data_dir": "data/tokenized",
+    "data_dir": "/home/lgene/meu_modelo_temp/ai-model-forge/datasets/tokenized",
     "output_dir": "model_204m",
     "checkpoint_dir": "model_204m/checkpoints",
     "log_file": "model_204m/training.log",

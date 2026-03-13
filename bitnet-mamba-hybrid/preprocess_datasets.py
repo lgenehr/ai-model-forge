@@ -25,13 +25,13 @@ Features:
 
 Usage:
     # Normal preprocessing
-    python preprocess_datasets.py --output_dir ./data/tokenized
+    python preprocess_datasets.py --output_dir /home/lgene/meu_modelo_temp/ai-model-forge/datasets/tokenized
 
     # Merge chunks from interrupted download
-    python preprocess_datasets.py --output_dir ./data/tokenized --merge_chunks
+    python preprocess_datasets.py --output_dir /home/lgene/meu_modelo_temp/ai-model-forge/datasets/tokenized --merge_chunks
 
     # Force reprocessing even if tokens.bin exists
-    python preprocess_datasets.py --output_dir ./data/tokenized --force
+    python preprocess_datasets.py --output_dir /home/lgene/meu_modelo_temp/ai-model-forge/datasets/tokenized --force
 
     # Combine multiple Portuguese sources for diversity
     python preprocess_datasets.py --pt_combined_sources 3
@@ -58,6 +58,8 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger(__name__)
+
+DEFAULT_DATASET_ROOT = "/home/lgene/meu_modelo_temp/ai-model-forge/datasets/tokenized"
 
 # Global flag for graceful shutdown
 _shutdown_requested = False
@@ -137,7 +139,7 @@ def save_chunk_progress(output_path: Path, num_chunks: int):
 @dataclass
 class PreprocessConfig:
     """Configuration for dataset preprocessing"""
-    output_dir: str = "./data/tokenized"
+    output_dir: str = DEFAULT_DATASET_ROOT
     max_seq_len: int = 2048
     vocab_size: int = 50304
 
@@ -173,7 +175,7 @@ def check_dataset_already_processed(output_path: Path) -> Tuple[bool, Optional[i
     Check if a dataset has already been processed by validating tokens.bin.
 
     Args:
-        output_path: Path to the dataset directory (e.g., ./data/tokenized/en)
+        output_path: Path to the dataset directory (e.g., /home/lgene/meu_modelo_temp/ai-model-forge/datasets/tokenized/en)
 
     Returns:
         Tuple of (is_processed, token_count)
@@ -1073,7 +1075,7 @@ def main():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="./data/tokenized",
+        default=DEFAULT_DATASET_ROOT,
         help="Output directory for tokenized data"
     )
     parser.add_argument(

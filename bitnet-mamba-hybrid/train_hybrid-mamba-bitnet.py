@@ -88,6 +88,8 @@ logging.getLogger("datasets").setLevel(logging.WARNING)
 logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
 logging.getLogger("filelock").setLevel(logging.WARNING)
 
+DEFAULT_DATASET_ROOT = "/home/lgene/meu_modelo_temp/ai-model-forge/datasets/tokenized"
+
 # Weights & Biases for experiment tracking
 WANDB_AVAILABLE = False
 try:
@@ -300,7 +302,7 @@ class TrainingConfig:
     pt_ratio: float = 0.5
 
     # Paths
-    data_dir: str = "./data/tokenized"  # Pre-tokenized data directory
+    data_dir: str = DEFAULT_DATASET_ROOT  # Pre-tokenized data directory
     output_dir: str = "./ai-model-forge/bitnet-mamba-hybrid"
     checkpoint_dir: str = "./ai-model-forge/bitnet-mamba-hybrid/checkpoints"
     log_file: str = "./ai-model-forge/bitnet-mamba-hybrid/training.log"
@@ -2097,7 +2099,7 @@ def parse_args() -> argparse.Namespace:
                         help="LR multiplier for BitLinear params (STE needs higher LR to overcome gradient noise)")
 
     # Data arguments
-    parser.add_argument("--data_dir", type=str, default="./data/tokenized",
+    parser.add_argument("--data_dir", type=str, default=DEFAULT_DATASET_ROOT,
                         help="Directory containing pre-tokenized data (run preprocess_datasets.py first)")
     parser.add_argument("--en_ratio", type=float, default=0.5, help="English data ratio")
     parser.add_argument("--pt_ratio", type=float, default=0.5, help="Portuguese data ratio")

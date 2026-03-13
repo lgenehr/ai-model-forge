@@ -116,9 +116,9 @@ echo "============================================================"
 echo ""
 
 # Verify data exists
-if [ ! -d "data/tokenized/en" ] && [ ! -d "data/tokenized/pt" ]; then
+if [ ! -d "/home/lgene/meu_modelo_temp/ai-model-forge/datasets/tokenized/en" ] && [ ! -d "/home/lgene/meu_modelo_temp/ai-model-forge/datasets/tokenized/pt" ]; then
     echo "ERROR: Preprocessed data not found!"
-    echo "Please run: python preprocess_datasets.py --output_dir data/tokenized"
+    echo "Please run: python preprocess_datasets.py --output_dir /home/lgene/meu_modelo_temp/ai-model-forge/datasets/tokenized"
     exit 1
 fi
 
@@ -178,7 +178,7 @@ python train_hybrid-mamba-bitnet.py \
     --max_tokens 4000000000 \
     \
     `# === DATA CONFIGURATION ===` \
-    --data_dir "data/tokenized" \
+    --data_dir "/home/lgene/meu_modelo_temp/ai-model-forge/datasets/tokenized" \
     --en_ratio 0.5 \
     --pt_ratio 0.5 \
     --num_workers 4 \
