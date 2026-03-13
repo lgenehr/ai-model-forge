@@ -117,6 +117,25 @@ def _update_sidecar_symlink(link_path: Path, target_name: str) -> None:
     link_path.symlink_to(target_name)
 
 
+def log_cuda_debug_context(device: torch.device) -> None:
+    """Log best-effort CUDA diagnostics after an accelerator failure."""
+    if device.type != "cuda":
+        return
+    try:
+        mem_alloc = torch.cuda.memory_allocated(device) / 1e9
+        mem_reserved = torch.cuda.memory_reserved(device) / 1e9
+        max_mem = torch.cuda.max_memory_allocated(device) / 1e9
+        logger.error(
+            "CUDA debug  |  alloc=%.2fGB  reserved=%.2fGB  peak=%.2fGB  device=%s",
+            mem_alloc,
+            mem_reserved,
+            max_mem,
+            device,
+        )
+    except Exception as debug_exc:
+        logger.error("Failed to collect CUDA debug info: %s", debug_exc)
+
+
 # ─── SIGINT handler (Ctrl+C → safe checkpoint) ───────────────────────────────
 
 _interrupt_requested: bool = False
@@ -727,144 +746,221 @@ def main():
     logger.info(f"gradient_checkpointing={use_grad_ckpt}  |  compile={use_compile}")
 
     while step < effective_max_steps and (max_tokens is None or tokens_trained < max_tokens):
-        # ── Update LR ─────────────────────────────────────────────────────────
-        lr = get_lr(step, warmup, effective_max_steps, peak_lr, min_lr)
-        for pg in optimizer.param_groups:
-            pg["lr"] = lr
-
-        # ── Micro-batch accumulation loop ─────────────────────────────────────
-        # Each micro-batch produces a mean-over-tokens CE loss.  We divide by
-        # grad_accum so the gradient is the average over the effective batch,
-        # and we accumulate the same normalised value for logging so that the
-        # reported loss is a true per-token average, not inflated by grad_accum.
         step_total = 0.0
-        step_ce    = 0.0
-        step_aux   = 0.0
+        step_ce = 0.0
+        step_aux = 0.0
         step_tokens = 0
+        lr = 0.0
+        try:
+            # ── Update LR ─────────────────────────────────────────────────────
+            lr = get_lr(step, warmup, effective_max_steps, peak_lr, min_lr)
+            for pg in optimizer.param_groups:
+                pg["lr"] = lr
 
-        for _ in range(grad_accum):
-            try:
-                batch = next(train_iter)
-            except StopIteration:
-                train_iter = iter(train_loader)
-                batch = next(train_iter)
-            input_ids = batch["input_ids"].to(device, non_blocking=True)
-            labels    = batch["labels"].to(device, non_blocking=True)
+            # ── Micro-batch accumulation loop ─────────────────────────────────
+            # Each micro-batch produces a mean-over-tokens CE loss. We divide by
+            # grad_accum so the gradient is the average over the effective batch.
+            for _ in range(grad_accum):
+                try:
+                    batch = next(train_iter)
+                except StopIteration:
+                    train_iter = iter(train_loader)
+                    batch = next(train_iter)
+                input_ids = batch["input_ids"].to(device, non_blocking=True)
+                labels = batch["labels"].to(device, non_blocking=True)
 
-            with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
-                _, total_loss, loss_dict = model(
-                    input_ids, targets=labels, use_checkpoint=use_grad_ckpt
-                )
+                with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
+                    _, total_loss, loss_dict = model(
+                        input_ids, targets=labels, use_checkpoint=use_grad_ckpt
+                    )
 
-            # Divide before backward so gradients are averaged, not summed
-            scaler.scale(total_loss / grad_accum).backward()
+                scaler.scale(total_loss / grad_accum).backward()
 
-            # Accumulate normalised (per-micro-batch) values for logging
-            step_total  += total_loss.item()     / grad_accum
-            step_ce     += loss_dict["ce_loss"]  / grad_accum  # type: ignore[index]
-            step_aux    += loss_dict["aux_loss"] / grad_accum  # type: ignore[index]
-            step_tokens += int((labels != -100).sum().item())
+                step_total += total_loss.item() / grad_accum
+                step_ce += loss_dict["ce_loss"] / grad_accum  # type: ignore[index]
+                step_aux += loss_dict["aux_loss"] / grad_accum  # type: ignore[index]
+                step_tokens += int((labels != -100).sum().item())
 
-        # ── Optimizer step ────────────────────────────────────────────────────
-        scaler.unscale_(optimizer)
-        grad_norm = nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-        scaler.step(optimizer)
-        scaler.update()
-        optimizer.zero_grad(set_to_none=True)
+            # ── Optimizer step ────────────────────────────────────────────────
+            scaler.unscale_(optimizer)
+            grad_norm = nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
 
-        step           += 1
-        tokens_trained += step_tokens
-        grad_norm_ema   = 0.9 * grad_norm_ema + 0.1 * grad_norm.item()
-        last_train_metrics = {
-            "train_loss": step_total,
-            "train_ce_loss": step_ce,
-            "train_aux_loss": step_aux,
-            "grad_norm": grad_norm_ema,
-            "lr": lr,
-        }
-
-        # Accumulate into per-window totals
-        log_total_loss += step_total
-        log_ce_loss    += step_ce
-        log_aux_loss   += step_aux
-        log_tokens     += step_tokens
-
-        # ── Logging ───────────────────────────────────────────────────────────
-        if step % log_every == 0:
-            t_now    = time.perf_counter()
-            elapsed  = t_now - t_last
-            tok_s    = log_tokens / max(elapsed, 1e-6)
-
-            # Divide accumulated step-averages by number of steps in window
-            avg_total = log_total_loss / log_every
-            avg_ce    = log_ce_loss    / log_every
-            avg_aux   = log_aux_loss   / log_every
-            mem_gb    = (torch.cuda.memory_allocated() / 1e9) if device.type == "cuda" else 0.0
+            step += 1
+            tokens_trained += step_tokens
+            grad_norm_ema = 0.9 * grad_norm_ema + 0.1 * grad_norm.item()
             last_train_metrics = {
-                "train_loss": avg_total,
-                "train_ce_loss": avg_ce,
-                "train_aux_loss": avg_aux,
+                "train_loss": step_total,
+                "train_ce_loss": step_ce,
+                "train_aux_loss": step_aux,
                 "grad_norm": grad_norm_ema,
                 "lr": lr,
             }
 
-            tokens_str = (
-                f"  tokens: {tokens_trained/1e9:.3f}B/{max_tokens/1e9:.2f}B"
-                if max_tokens else
-                f"  tokens: {tokens_trained/1e9:.3f}B"
+            # Accumulate into per-window totals
+            log_total_loss += step_total
+            log_ce_loss += step_ce
+            log_aux_loss += step_aux
+            log_tokens += step_tokens
+
+            # ── Logging ───────────────────────────────────────────────────────
+            if step % log_every == 0:
+                t_now = time.perf_counter()
+                elapsed = t_now - t_last
+                tok_s = log_tokens / max(elapsed, 1e-6)
+
+                avg_total = log_total_loss / log_every
+                avg_ce = log_ce_loss / log_every
+                avg_aux = log_aux_loss / log_every
+                mem_gb = (torch.cuda.memory_allocated() / 1e9) if device.type == "cuda" else 0.0
+                last_train_metrics = {
+                    "train_loss": avg_total,
+                    "train_ce_loss": avg_ce,
+                    "train_aux_loss": avg_aux,
+                    "grad_norm": grad_norm_ema,
+                    "lr": lr,
+                }
+
+                tokens_str = (
+                    f"  tokens: {tokens_trained/1e9:.3f}B/{max_tokens/1e9:.2f}B"
+                    if max_tokens else
+                    f"  tokens: {tokens_trained/1e9:.3f}B"
+                )
+                logger.info(
+                    f"step {step:>7d}/{effective_max_steps}  |  "
+                    f"loss: {avg_total:.4f}  ce: {avg_ce:.4f}  aux: {avg_aux:.4f}  |  "
+                    f"lr: {lr:.2e}  gnorm: {grad_norm_ema:.3f}  |  "
+                    f"tok/s: {tok_s:,.0f}  mem: {mem_gb:.1f}GB{tokens_str}"
+                )
+
+                if wandb_run is not None:
+                    wandb_run.log({
+                        "train/loss": avg_total,
+                        "train/ce_loss": avg_ce,
+                        "train/aux_loss": avg_aux,
+                        "train/lr": lr,
+                        "train/grad_norm": grad_norm_ema,
+                        "perf/tok_per_sec": tok_s,
+                        "perf/mem_gb": mem_gb,
+                        "tokens_trained_B": tokens_trained / 1e9,
+                        "step": step,
+                    })
+
+                log_total_loss = log_ce_loss = log_aux_loss = 0.0
+                log_tokens = 0
+                t_last = t_now
+
+            # ── Evaluation ────────────────────────────────────────────────────
+            if step % eval_every == 0:
+                eval_metrics = evaluate(model, val_batches, device, dtype, eval_seed)
+                val_ce_loss = float(eval_metrics["val_ce_loss"])
+                is_best = val_ce_loss < best_val_loss
+                if is_best:
+                    best_val_loss = val_ce_loss
+                eval_metrics["best_val_loss"] = best_val_loss
+                last_eval_metrics = eval_metrics
+
+                logger.info(
+                    f"[EVAL]  step {step}  |  val_ce: {eval_metrics['val_ce_loss']:.4f}  "
+                    f"|  val_aux: {eval_metrics['val_aux_loss']:.4f}  "
+                    f"|  eval_tokens: {int(eval_metrics['tokens_evaluated'])}  "
+                    f"|  best: {best_val_loss:.4f}  {'★' if is_best else ''}"
+                )
+                if wandb_run is not None:
+                    wandb_run.log({
+                        "val/loss": eval_metrics["val_loss"],
+                        "val/ce_loss": eval_metrics["val_ce_loss"],
+                        "val/aux_loss": eval_metrics["val_aux_loss"],
+                        "val/best_ce_loss": best_val_loss,
+                        "val/tokens": eval_metrics["tokens_evaluated"],
+                        "step": step,
+                    })
+
+                raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+                checkpoint_meta = build_checkpoint_metadata(
+                    step=step,
+                    tokens_trained=tokens_trained,
+                    best_val_loss=best_val_loss,
+                    train_metrics=last_train_metrics,
+                    eval_metrics=last_eval_metrics,
+                    train_cfg=train_cfg,
+                )
+                save_checkpoint(
+                    raw_model,
+                    optimizer,
+                    step,
+                    tokens_trained,
+                    best_val_loss,
+                    train_cfg,
+                    ckpt_dir,
+                    checkpoint_meta,
+                    is_best,
+                )
+
+            elif step % save_every == 0:
+                raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+                checkpoint_meta = build_checkpoint_metadata(
+                    step=step,
+                    tokens_trained=tokens_trained,
+                    best_val_loss=best_val_loss,
+                    train_metrics=last_train_metrics,
+                    eval_metrics=last_eval_metrics,
+                    train_cfg=train_cfg,
+                )
+                save_checkpoint(
+                    raw_model,
+                    optimizer,
+                    step,
+                    tokens_trained,
+                    best_val_loss,
+                    train_cfg,
+                    ckpt_dir,
+                    checkpoint_meta,
+                    False,
+                )
+
+            if _interrupt_requested:
+                logger.info("SIGINT: saving checkpoint and exiting…")
+                raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+                checkpoint_meta = build_checkpoint_metadata(
+                    step=step,
+                    tokens_trained=tokens_trained,
+                    best_val_loss=best_val_loss,
+                    train_metrics=last_train_metrics,
+                    eval_metrics=last_eval_metrics,
+                    train_cfg=train_cfg,
+                )
+                save_checkpoint(
+                    raw_model,
+                    optimizer,
+                    step,
+                    tokens_trained,
+                    best_val_loss,
+                    train_cfg,
+                    ckpt_dir,
+                    checkpoint_meta,
+                    False,
+                )
+                logger.info("Checkpoint saved. Exiting.")
+                if wandb_run is not None:
+                    wandb_run.finish()
+                sys.exit(0)
+        except Exception as exc:
+            logger.exception(
+                "Training step failed  |  step=%s  tokens=%.3fB  lr=%.2e  partial_tokens=%s",
+                step,
+                tokens_trained / 1e9,
+                lr,
+                step_tokens,
             )
-            logger.info(
-                f"step {step:>7d}/{effective_max_steps}  |  "
-                f"loss: {avg_total:.4f}  ce: {avg_ce:.4f}  aux: {avg_aux:.4f}  |  "
-                f"lr: {lr:.2e}  gnorm: {grad_norm_ema:.3f}  |  "
-                f"tok/s: {tok_s:,.0f}  mem: {mem_gb:.1f}GB{tokens_str}"
-            )
+            if "CUDA" in str(exc) or isinstance(exc, torch.AcceleratorError):
+                log_cuda_debug_context(device)
+                logger.error(
+                    "CUDA failure detected. Re-run with CUDA_LAUNCH_BLOCKING=1 to pinpoint the failing kernel."
+                )
 
-            if wandb_run is not None:
-                wandb_run.log({
-                    "train/loss":        avg_total,
-                    "train/ce_loss":     avg_ce,
-                    "train/aux_loss":    avg_aux,
-                    "train/lr":          lr,
-                    "train/grad_norm":   grad_norm_ema,
-                    "perf/tok_per_sec":  tok_s,
-                    "perf/mem_gb":       mem_gb,
-                    "tokens_trained_B":  tokens_trained / 1e9,
-                    "step":              step,
-                })
-
-            # Reset window accumulators
-            log_total_loss = log_ce_loss = log_aux_loss = 0.0
-            log_tokens = 0
-            t_last = t_now
-
-        # ── Evaluation ────────────────────────────────────────────────────────
-        if step % eval_every == 0:
-            eval_metrics = evaluate(model, val_batches, device, dtype, eval_seed)
-            val_ce_loss = float(eval_metrics["val_ce_loss"])
-            is_best  = val_ce_loss < best_val_loss
-            if is_best:
-                best_val_loss = val_ce_loss
-            eval_metrics["best_val_loss"] = best_val_loss
-            last_eval_metrics = eval_metrics
-
-            logger.info(
-                f"[EVAL]  step {step}  |  val_ce: {eval_metrics['val_ce_loss']:.4f}  "
-                f"|  val_aux: {eval_metrics['val_aux_loss']:.4f}  "
-                f"|  eval_tokens: {int(eval_metrics['tokens_evaluated'])}  "
-                f"|  best: {best_val_loss:.4f}  {'★' if is_best else ''}"
-            )
-            if wandb_run is not None:
-                wandb_run.log({
-                    "val/loss": eval_metrics["val_loss"],
-                    "val/ce_loss": eval_metrics["val_ce_loss"],
-                    "val/aux_loss": eval_metrics["val_aux_loss"],
-                    "val/best_ce_loss": best_val_loss,
-                    "val/tokens": eval_metrics["tokens_evaluated"],
-                    "step": step,
-                })
-
-            raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
             checkpoint_meta = build_checkpoint_metadata(
                 step=step,
                 tokens_trained=tokens_trained,
@@ -873,41 +969,39 @@ def main():
                 eval_metrics=last_eval_metrics,
                 train_cfg=train_cfg,
             )
-            save_checkpoint(raw_model, optimizer, step, tokens_trained,  # type: ignore[arg-type]
-                            best_val_loss, train_cfg, ckpt_dir, checkpoint_meta, is_best)
+            checkpoint_meta["crash"] = {
+                "error_type": type(exc).__name__,
+                "message": str(exc),
+                "partial_step_tokens": step_tokens,
+                "partial_train_loss": step_total if step_total else None,
+                "partial_train_ce_loss": step_ce if step_ce else None,
+                "partial_train_aux_loss": step_aux if step_aux else None,
+            }
+            crash_step = step if step_tokens == 0 else step + 1
+            crash_path = ckpt_dir / f"crash_step_{crash_step:08d}.json"
+            _write_json(crash_path, checkpoint_meta)
 
-        # ── Periodic save ─────────────────────────────────────────────────────
-        elif step % save_every == 0:
-            raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
-            checkpoint_meta = build_checkpoint_metadata(
-                step=step,
-                tokens_trained=tokens_trained,
-                best_val_loss=best_val_loss,
-                train_metrics=last_train_metrics,
-                eval_metrics=last_eval_metrics,
-                train_cfg=train_cfg,
-            )
-            save_checkpoint(raw_model, optimizer, step, tokens_trained,  # type: ignore[arg-type]
-                            best_val_loss, train_cfg, ckpt_dir, checkpoint_meta, False)
+            try:
+                raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+                save_checkpoint(
+                    raw_model,
+                    optimizer,
+                    crash_step,
+                    tokens_trained,
+                    best_val_loss,
+                    train_cfg,
+                    ckpt_dir,
+                    checkpoint_meta,
+                    False,
+                )
+                logger.error("Emergency checkpoint saved after failure.")
+            except Exception as save_exc:
+                logger.exception("Emergency checkpoint save failed: %s", save_exc)
+                logger.error("Crash metadata still written to %s", crash_path)
 
-        # ── SIGINT: save checkpoint then exit cleanly ─────────────────────────
-        if _interrupt_requested:
-            logger.info("SIGINT: saving checkpoint and exiting…")
-            raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
-            checkpoint_meta = build_checkpoint_metadata(
-                step=step,
-                tokens_trained=tokens_trained,
-                best_val_loss=best_val_loss,
-                train_metrics=last_train_metrics,
-                eval_metrics=last_eval_metrics,
-                train_cfg=train_cfg,
-            )
-            save_checkpoint(raw_model, optimizer, step, tokens_trained,  # type: ignore[arg-type]
-                            best_val_loss, train_cfg, ckpt_dir, checkpoint_meta, False)
-            logger.info("Checkpoint saved. Exiting.")
             if wandb_run is not None:
-                wandb_run.finish()
-            sys.exit(0)
+                wandb_run.finish(exit_code=1)
+            raise
 
     logger.info("Training complete.")
     if wandb_run is not None:
