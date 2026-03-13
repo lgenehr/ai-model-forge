@@ -1,0 +1,1009 @@
+{
+  "generated_at": "2026-03-10T20:33:08.152948Z",
+  "dataset_root": "../bitnet-mamba-hybrid/data/tokenized",
+  "reports": [
+    {
+      "language": "en",
+      "status": "PASS WITH MINOR WARNINGS",
+      "paths": {
+        "tokens": "../bitnet-mamba-hybrid/data/tokenized/en/tokens.bin",
+        "metadata": "../bitnet-mamba-hybrid/data/tokenized/en/metadata.json"
+      },
+      "structure": {
+        "exists": true,
+        "file_size_bytes": 19907978666,
+        "file_size_human": "18.54 GB",
+        "dtype": "uint16",
+        "estimated_tokens_from_size": 9953989333,
+        "metadata_total_tokens": 9953989333,
+        "token_count_matches_size": true,
+        "max_seq_len": 2048,
+        "audit_mode": "quick",
+        "audited_tokens": 500000000,
+        "audited_fraction_pct": 5.023111671843701
+      },
+      "range_validation": {
+        "min_token_id": 0,
+        "max_token_id": 50256,
+        "mean_token_value": 4883.89582376,
+        "std_token_value": 9082.45324204326,
+        "negative_tokens": 0,
+        "above_model_vocab_tokens": 0,
+        "above_tokenizer_vocab_tokens": 0,
+        "invalid_token_pct": 0.0,
+        "tokenizer_oob_pct": 0.0,
+        "model_vocab_size": 50304,
+        "tokenizer_vocab_size": 50257,
+        "tokenizer_max_token_id": 50256
+      },
+      "distribution": {
+        "top_50_tokens": [
+          {
+            "token_id": 262,
+            "count": 19890613
+          },
+          {
+            "token_id": 11,
+            "count": 19700733
+          },
+          {
+            "token_id": 13,
+            "count": 19107439
+          },
+          {
+            "token_id": 286,
+            "count": 12357692
+          },
+          {
+            "token_id": 290,
+            "count": 10875834
+          },
+          {
+            "token_id": 198,
+            "count": 9864995
+          },
+          {
+            "token_id": 284,
+            "count": 9680656
+          },
+          {
+            "token_id": 257,
+            "count": 7211781
+          },
+          {
+            "token_id": 287,
+            "count": 6904845
+          },
+          {
+            "token_id": 12,
+            "count": 5119162
+          },
+          {
+            "token_id": 318,
+            "count": 4764459
+          },
+          {
+            "token_id": 326,
+            "count": 3684658
+          },
+          {
+            "token_id": 329,
+            "count": 3189877
+          },
+          {
+            "token_id": 447,
+            "count": 3114608
+          },
+          {
+            "token_id": 389,
+            "count": 2545847
+          },
+          {
+            "token_id": 357,
+            "count": 2416690
+          },
+          {
+            "token_id": 355,
+            "count": 2404632
+          },
+          {
+            "token_id": 351,
+            "count": 2398191
+          },
+          {
+            "token_id": 319,
+            "count": 2231425
+          },
+          {
+            "token_id": 307,
+            "count": 2076013
+          },
+          {
+            "token_id": 247,
+            "count": 2035654
+          },
+          {
+            "token_id": 393,
+            "count": 1981993
+          },
+          {
+            "token_id": 340,
+            "count": 1945710
+          },
+          {
+            "token_id": 416,
+            "count": 1838177
+          },
+          {
+            "token_id": 25,
+            "count": 1799469
+          },
+          {
+            "token_id": 82,
+            "count": 1797011
+          },
+          {
+            "token_id": 383,
+            "count": 1783416
+          },
+          {
+            "token_id": 422,
+            "count": 1674334
+          },
+          {
+            "token_id": 373,
+            "count": 1615928
+          },
+          {
+            "token_id": 345,
+            "count": 1498270
+          },
+          {
+            "token_id": 460,
+            "count": 1468280
+          },
+          {
+            "token_id": 423,
+            "count": 1420295
+          },
+          {
+            "token_id": 8,
+            "count": 1341580
+          },
+          {
+            "token_id": 281,
+            "count": 1331675
+          },
+          {
+            "token_id": 379,
+            "count": 1327321
+          },
+          {
+            "token_id": 428,
+            "count": 1306994
+          },
+          {
+            "token_id": 407,
+            "count": 1258751
+          },
+          {
+            "token_id": 511,
+            "count": 1097977
+          },
+          {
+            "token_id": 543,
+            "count": 1018437
+          },
+          {
+            "token_id": 464,
+            "count": 1009639
+          },
+          {
+            "token_id": 484,
+            "count": 1002865
+          },
+          {
+            "token_id": 534,
+            "count": 965268
+          },
+          {
+            "token_id": 564,
+            "count": 946620
+          },
+          {
+            "token_id": 481,
+            "count": 934994
+          },
+          {
+            "token_id": 250,
+            "count": 930670
+          },
+          {
+            "token_id": 517,
+            "count": 921966
+          },
+          {
+            "token_id": 251,
+            "count": 921928
+          },
+          {
+            "token_id": 468,
+            "count": 886964
+          },
+          {
+            "token_id": 547,
+            "count": 799132
+          },
+          {
+            "token_id": 475,
+            "count": 778677
+          }
+        ],
+        "rare_tokens": {
+          "unique_rare_tokens": 325,
+          "count_buckets": {
+            "1": 60,
+            "2": 43,
+            "3": 38,
+            "4": 34,
+            "5": 29,
+            "6": 35,
+            "7": 26,
+            "8": 29,
+            "9": 31
+          },
+          "examples": [
+            153,
+            155,
+            175,
+            197,
+            2432,
+            2941,
+            3156,
+            3523,
+            3587,
+            4060,
+            5367,
+            5392,
+            5997,
+            6043,
+            6336,
+            6438,
+            6598,
+            7105,
+            7804,
+            8418,
+            8755,
+            8773,
+            8964,
+            8980,
+            9169,
+            9968,
+            10298,
+            10882,
+            11273,
+            11411,
+            11480,
+            11548,
+            11592,
+            11606,
+            11689,
+            11727,
+            11910,
+            11974,
+            12054,
+            12486,
+            12677,
+            12717,
+            12869,
+            12943,
+            13150,
+            13198,
+            13296,
+            13945,
+            14223,
+            14468
+          ]
+        },
+        "dominant_token_ratio": 0.039781226,
+        "suspicious_dominant_tokens": [
+          {
+            "token_id": 262,
+            "count": 19890613,
+            "ratio": 0.039781226
+          },
+          {
+            "token_id": 11,
+            "count": 19700733,
+            "ratio": 0.039401466
+          },
+          {
+            "token_id": 13,
+            "count": 19107439,
+            "ratio": 0.038214878
+          },
+          {
+            "token_id": 286,
+            "count": 12357692,
+            "ratio": 0.024715384
+          },
+          {
+            "token_id": 290,
+            "count": 10875834,
+            "ratio": 0.021751668
+          },
+          {
+            "token_id": 198,
+            "count": 9864995,
+            "ratio": 0.01972999
+          },
+          {
+            "token_id": 284,
+            "count": 9680656,
+            "ratio": 0.019361312
+          },
+          {
+            "token_id": 257,
+            "count": 7211781,
+            "ratio": 0.014423562
+          },
+          {
+            "token_id": 287,
+            "count": 6904845,
+            "ratio": 0.01380969
+          },
+          {
+            "token_id": 12,
+            "count": 5119162,
+            "ratio": 0.010238324
+          }
+        ],
+        "long_identical_runs": [
+          {
+            "token_id": 5595,
+            "run_length": 162,
+            "chunk_offset": 342601,
+            "token_text": " •",
+            "context_preview": " use the shovel to dig out the drive wheels and put some sand or litter under them for traction. If neither of these works, you are stuck.\\nIf you have to stop, stay in your vehicle. You will quickly become disoriented in snow and cold. Try"
+          }
+        ],
+        "severe_long_run_count": 0
+      },
+      "decode_analysis": {
+        "sample_count": 200,
+        "problematic_examples": [],
+        "informational_examples": [
+          {
+            "start": 86677849,
+            "decoded_preview": " but that beautiful smell or texture may tempt your pooch to lick or nibble. Daily Treat has a roundup of the 11 most poisonous plants for dogs, and the Humane Society has a large list of pooch-poisoning plants as well.\n- Rawhide dog chews might seem crazy to consider dangerous,",
+            "decoded_with_context_preview": "�t wise.\n- Plants may add an attractive quality to your home, but that beautiful smell or texture may tempt your pooch to lick or nibble. Daily Treat has a roundup of the 11 most poisonous plants for dogs, and the Humane Society has a large list of pooch-poisoning plants as well.\n- Rawhide dog chews",
+            "lang": "en",
+            "roundtrip_ok": true,
+            "flags": [
+              "invalid_utf8_edge"
+            ]
+          },
+          {
+            "start": 147899709,
+            "decoded_preview": "�s survival. The strong will to live in a life and death situation will make you physically and mentally stronger to cope up with the frightening circumstances. As a survivalist, you need to learn the skill of living and fighting under stress. You must have a backup plan with you when the first gets",
+            "decoded_with_context_preview": ". Mind preparedness:\nThe mind and its readiness are critical for one’s survival. The strong will to live in a life and death situation will make you physically and mentally stronger to cope up with the frightening circumstances. As a survivalist, you need to learn the skill of living and fighting un",
+            "lang": "en",
+            "roundtrip_ok": true,
+            "flags": [
+              "replacement_char_edge"
+            ]
+          },
+          {
+            "start": 167415220,
+            "decoded_preview": "�Boccaccio’ produces a list of all of these with a selection of images from each one. Six are also fully digitised on our Digitised Manuscripts website. Here are just some of these fascinating manuscripts.\nConcerning Famous Women\nMost impressive of all are two grand volumes of B",
+            "decoded_with_context_preview": " of Illuminated Manuscripts using the field ‘Author’: ‘Boccaccio’ produces a list of all of these with a selection of images from each one. Six are also fully digitised on our Digitised Manuscripts website. Here are just some of these fascinating manuscripts.\nConcerning Famous Women\nMost impressive ",
+            "lang": "en",
+            "roundtrip_ok": true,
+            "flags": [
+              "replacement_char_edge"
+            ]
+          },
+          {
+            "start": 170421667,
+            "decoded_preview": " food advertising.\nTo learn more about food and beverage marketing take a listen to our safefood Nutrition Podcast that explores marketing of unhealthy food to children, its link to childhood obesity, public and parental awareness of marketing, and how to approach tackling the issue.<|endoftext|>Inv",
+            "decoded_with_context_preview": " shelters are a key platform for advertising and future research should explore the impact of outdoor food advertising.\nTo learn more about food and beverage marketing take a listen to our safefood Nutrition Podcast that explores marketing of unhealthy food to children, its link to childhood obesity",
+            "lang": "en",
+            "roundtrip_ok": false,
+            "flags": [
+              "invalid_utf8_edge"
+            ]
+          },
+          {
+            "start": 254375381,
+            "decoded_preview": " to May\nsummer: June to September<|endoftext|>03 December 2011, Quezon City. Environment watchdog EcoWaste Coalition lauds the continuous efforts of local government units to address the plastic pollution in our country. Recently, more cities in the country enacted ordinances to regulate the use of ",
+            "decoded_with_context_preview": ": 12 inches each year\nSolar Insolation: 2 seasons\nwinter: October to May\nsummer: June to September<|endoftext|>03 December 2011, Quezon City. Environment watchdog EcoWaste Coalition lauds the continuous efforts of local government units to address the plastic pollution in our country. Recently, more",
+            "lang": "en",
+            "roundtrip_ok": false,
+            "flags": [
+              "invalid_utf8_edge"
+            ]
+          },
+          {
+            "start": 306930649,
+            "decoded_preview": " not always profitable.\nRoyal Dutch Shell PLC, which has had a tough time coaxing crude oil from dense rock formations, said Thursday its shale holdings in the U.S. are worth $2.2 billion less than it had previously determined. The write-down helped push the Anglo-Dutch oil giant�",
+            "decoded_with_context_preview": " shale boom in North America, where deposits of oil and gas are proving abundant but not always profitable.\nRoyal Dutch Shell PLC, which has had a tough time coaxing crude oil from dense rock formations, said Thursday its shale holdings in the U.S. are worth $2.2 billion less than it had previously ",
+            "lang": "en",
+            "roundtrip_ok": true,
+            "flags": [
+              "replacement_char_edge"
+            ]
+          },
+          {
+            "start": 436266132,
+            "decoded_preview": "arising from the prerogative of the Crown (usually delegated to the government or the judiciary) and based in common law rather than statutory law\n‘the monarch retained the formal prerogative power to appoint the Prime Minister’;\nIn law, a prerogative is an exclusive right bestowed by a",
+            "decoded_with_context_preview": "�it's not a female prerogative to feel insecure’;\narising from the prerogative of the Crown (usually delegated to the government or the judiciary) and based in common law rather than statutory law\n‘the monarch retained the formal prerogative power to appoint the Prime Minister’;\nIn law, a prerogativ",
+            "lang": "en",
+            "roundtrip_ok": true,
+            "flags": [
+              "invalid_utf8_edge"
+            ]
+          }
+        ]
+      },
+      "language_validation": {
+        "detected_languages": {
+          "en": 200
+        },
+        "contamination_pct": 0.0
+      },
+      "tokenizer_consistency": {
+        "mismatch_rate_pct": 5.5
+      },
+      "special_tokens": {
+        "bos": {
+          "token_id": 50256,
+          "count": 482607
+        },
+        "eos": {
+          "token_id": 50256,
+          "count": 482607
+        },
+        "pad": {
+          "token_id": null,
+          "count": null
+        },
+        "unk": {
+          "token_id": null,
+          "count": null
+        }
+      },
+      "quality_metrics": {
+        "entropy_bits": 11.032244766690551,
+        "token_diversity": 9.9952e-05,
+        "repetition_ratio": 0.00021572000043144001,
+        "unique_tokens": 49976,
+        "truncated_sequence_remainder": 1280
+      },
+      "recommendations": [
+        "Tokenizer mismatches are mostly boundary-related in sampled windows; treat as informational unless confirmed on larger-context checks."
+      ]
+    },
+    {
+      "language": "pt",
+      "status": "PASS WITH MINOR WARNINGS",
+      "paths": {
+        "tokens": "../bitnet-mamba-hybrid/data/tokenized/pt/tokens.bin",
+        "metadata": "../bitnet-mamba-hybrid/data/tokenized/pt/metadata.json"
+      },
+      "structure": {
+        "exists": true,
+        "file_size_bytes": 64613850586,
+        "file_size_human": "60.18 GB",
+        "dtype": "uint16",
+        "estimated_tokens_from_size": 32306925293,
+        "metadata_total_tokens": 32306925293,
+        "token_count_matches_size": true,
+        "max_seq_len": 2048,
+        "audit_mode": "quick",
+        "audited_tokens": 500000000,
+        "audited_fraction_pct": 1.5476557904083057
+      },
+      "range_validation": {
+        "min_token_id": 0,
+        "max_token_id": 50256,
+        "mean_token_value": 6062.698338326,
+        "std_token_value": 10298.737161645833,
+        "negative_tokens": 0,
+        "above_model_vocab_tokens": 0,
+        "above_tokenizer_vocab_tokens": 0,
+        "invalid_token_pct": 0.0,
+        "tokenizer_oob_pct": 0.0,
+        "model_vocab_size": 50304,
+        "tokenizer_vocab_size": 50257,
+        "tokenizer_max_token_id": 50256
+      },
+      "distribution": {
+        "top_50_tokens": [
+          {
+            "token_id": 11,
+            "count": 14132237
+          },
+          {
+            "token_id": 390,
+            "count": 10647598
+          },
+          {
+            "token_id": 78,
+            "count": 10277412
+          },
+          {
+            "token_id": 13,
+            "count": 9673764
+          },
+          {
+            "token_id": 257,
+            "count": 8603013
+          },
+          {
+            "token_id": 28749,
+            "count": 8157951
+          },
+          {
+            "token_id": 64,
+            "count": 7667299
+          },
+          {
+            "token_id": 418,
+            "count": 7134110
+          },
+          {
+            "token_id": 304,
+            "count": 7039641
+          },
+          {
+            "token_id": 198,
+            "count": 6960605
+          },
+          {
+            "token_id": 267,
+            "count": 6151795
+          },
+          {
+            "token_id": 16175,
+            "count": 5944166
+          },
+          {
+            "token_id": 292,
+            "count": 5844477
+          },
+          {
+            "token_id": 8358,
+            "count": 5318873
+          },
+          {
+            "token_id": 6557,
+            "count": 4262785
+          },
+          {
+            "token_id": 68,
+            "count": 3952540
+          },
+          {
+            "token_id": 466,
+            "count": 3604828
+          },
+          {
+            "token_id": 401,
+            "count": 3490105
+          },
+          {
+            "token_id": 283,
+            "count": 3326251
+          },
+          {
+            "token_id": 84,
+            "count": 3112369
+          },
+          {
+            "token_id": 12379,
+            "count": 2924765
+          },
+          {
+            "token_id": 274,
+            "count": 2914685
+          },
+          {
+            "token_id": 795,
+            "count": 2909271
+          },
+          {
+            "token_id": 384,
+            "count": 2891470
+          },
+          {
+            "token_id": 544,
+            "count": 2731285
+          },
+          {
+            "token_id": 299,
+            "count": 2713168
+          },
+          {
+            "token_id": 8836,
+            "count": 2629059
+          },
+          {
+            "token_id": 285,
+            "count": 2550315
+          },
+          {
+            "token_id": 72,
+            "count": 2538050
+          },
+          {
+            "token_id": 31215,
+            "count": 2515628
+          },
+          {
+            "token_id": 279,
+            "count": 2511106
+          },
+          {
+            "token_id": 2634,
+            "count": 2411464
+          },
+          {
+            "token_id": 12,
+            "count": 2351168
+          },
+          {
+            "token_id": 4533,
+            "count": 2102497
+          },
+          {
+            "token_id": 38251,
+            "count": 2035320
+          },
+          {
+            "token_id": 288,
+            "count": 2034270
+          },
+          {
+            "token_id": 23781,
+            "count": 2022283
+          },
+          {
+            "token_id": 76,
+            "count": 2022127
+          },
+          {
+            "token_id": 645,
+            "count": 2010772
+          },
+          {
+            "token_id": 10205,
+            "count": 2003102
+          },
+          {
+            "token_id": 2611,
+            "count": 2001315
+          },
+          {
+            "token_id": 25792,
+            "count": 2000910
+          },
+          {
+            "token_id": 312,
+            "count": 1937011
+          },
+          {
+            "token_id": 271,
+            "count": 1808767
+          },
+          {
+            "token_id": 277,
+            "count": 1781455
+          },
+          {
+            "token_id": 321,
+            "count": 1772691
+          },
+          {
+            "token_id": 671,
+            "count": 1769220
+          },
+          {
+            "token_id": 1556,
+            "count": 1759788
+          },
+          {
+            "token_id": 15152,
+            "count": 1748937
+          },
+          {
+            "token_id": 334,
+            "count": 1744849
+          }
+        ],
+        "rare_tokens": {
+          "unique_rare_tokens": 7873,
+          "count_buckets": {
+            "1": 973,
+            "2": 1020,
+            "3": 1024,
+            "4": 1006,
+            "5": 891,
+            "6": 845,
+            "7": 767,
+            "8": 741,
+            "9": 606
+          },
+          "examples": [
+            197,
+            1147,
+            1508,
+            1543,
+            1857,
+            1914,
+            1977,
+            2115,
+            2131,
+            2212,
+            2333,
+            2335,
+            2532,
+            2549,
+            2698,
+            2918,
+            2924,
+            2955,
+            3018,
+            3040,
+            3135,
+            3156,
+            3229,
+            3282,
+            3302,
+            3322,
+            3343,
+            3358,
+            3380,
+            3408,
+            3422,
+            3462,
+            3472,
+            3479,
+            3569,
+            3587,
+            3603,
+            3746,
+            3821,
+            3907,
+            4026,
+            4204,
+            4209,
+            4212,
+            4416,
+            4431,
+            4644,
+            4651,
+            4742,
+            4824
+          ]
+        },
+        "dominant_token_ratio": 0.028264474,
+        "suspicious_dominant_tokens": [
+          {
+            "token_id": 11,
+            "count": 14132237,
+            "ratio": 0.028264474
+          },
+          {
+            "token_id": 390,
+            "count": 10647598,
+            "ratio": 0.021295196
+          },
+          {
+            "token_id": 78,
+            "count": 10277412,
+            "ratio": 0.020554824
+          },
+          {
+            "token_id": 13,
+            "count": 9673764,
+            "ratio": 0.019347528
+          },
+          {
+            "token_id": 257,
+            "count": 8603013,
+            "ratio": 0.017206026
+          },
+          {
+            "token_id": 28749,
+            "count": 8157951,
+            "ratio": 0.016315902
+          },
+          {
+            "token_id": 64,
+            "count": 7667299,
+            "ratio": 0.015334598
+          },
+          {
+            "token_id": 418,
+            "count": 7134110,
+            "ratio": 0.01426822
+          },
+          {
+            "token_id": 304,
+            "count": 7039641,
+            "ratio": 0.014079282
+          },
+          {
+            "token_id": 198,
+            "count": 6960605,
+            "ratio": 0.01392121
+          },
+          {
+            "token_id": 267,
+            "count": 6151795,
+            "ratio": 0.01230359
+          },
+          {
+            "token_id": 16175,
+            "count": 5944166,
+            "ratio": 0.011888332
+          },
+          {
+            "token_id": 292,
+            "count": 5844477,
+            "ratio": 0.011688954
+          },
+          {
+            "token_id": 8358,
+            "count": 5318873,
+            "ratio": 0.010637746
+          }
+        ],
+        "long_identical_runs": [
+          {
+            "token_id": 28747,
+            "run_length": 170,
+            "chunk_offset": 941515,
+            "token_text": "kk",
+            "context_preview": "erente de como ela se espalha através dos comunicadores ou experts. Não precisamos ver ou sermos incentivados por estas pessoas para sermos atingidos pelas ideias. Seremos contagiados apenas por estarmos dentro deste contexto. No Brasil pod"
+          },
+          {
+            "token_id": 28747,
+            "run_length": 165,
+            "chunk_offset": 941690,
+            "token_text": "kk",
+            "context_preview": " sensação de medo floresce. Estes lugares incentivam outros tipos de crimes e vandalismo, uma vez que a sensação de impunidade também é sentida pelos criminosos.\\nO poder do contexto é tão forte em algumas situações que ele pode até alterar"
+          },
+          {
+            "token_id": 28747,
+            "run_length": 294,
+            "chunk_offset": 1789757,
+            "token_text": "kk",
+            "context_preview": " regra carmelita austera. Despite strong opposition, she succeeded (1562) in opening the Convent of Saint Joseph in Avila, the first of the reformed Carmelite houses. Apesar de uma forte oposição, ela conseguiu (1562) na abertura do Convent"
+          }
+        ],
+        "severe_long_run_count": 0
+      },
+      "decode_analysis": {
+        "sample_count": 200,
+        "problematic_examples": [],
+        "informational_examples": [
+          {
+            "start": 160689101,
+            "decoded_preview": "itação da destinação final do lixo de Belo Horizonte promovida pela prefeitura petista da capital mineira, que brindou a empresa Vital Engenharia Ambiental, do Grupo Queiroz Galvão, com um contr",
+            "decoded_with_context_preview": "a.\nVideversus acrescenta sobre a fraudulenta licitação da destinação final do lixo de Belo Horizonte promovida pela prefeitura petista da capital mineira, que brindou a empresa Vital Engenharia Ambiental, do Grupo Queiroz Galvão, com um contrato de 25 anos, no valor inicial de 820 milh�",
+            "lang": "pt",
+            "roundtrip_ok": true,
+            "flags": [
+              "invalid_utf8_edge"
+            ]
+          },
+          {
+            "start": 302047037,
+            "decoded_preview": " restabelecer a honra: “A necessidade de justificar-se aos próprios olhos e aos de terceiros levava o cangaceiro a assoalhar seu desejo de vingança, a sua miss",
+            "decoded_with_context_preview": "�, uma espécie de moral da vingança para restabelecer a honra: “A necessidade de justificar-se aos próprios olhos e aos de terceiros levava o cangaceiro a assoalhar seu desejo de vingança, a sua missão pretensamente ética, a verdadeira obrig",
+            "lang": "pt",
+            "roundtrip_ok": true,
+            "flags": [
+              "invalid_utf8_edge"
+            ]
+          },
+          {
+            "start": 392308831,
+            "decoded_preview": "�rea para sua empresa? Qual a real importância dessa função para um e-commerce? Acompanhe.\nSEO para e-commerce\nO profissional de SEO é responsável por analisar 3 principais esferas de um site:\n",
+            "decoded_with_context_preview": " de SEO faz? Por que contratar especialistas nessa área para sua empresa? Qual a real importância dessa função para um e-commerce? Acompanhe.\nSEO para e-commerce\nO profissional de SEO é responsável por analisar 3 principais esferas de um site:\n- Conteúdo;\n- Estrutura;\n- C",
+            "lang": "pt",
+            "roundtrip_ok": true,
+            "flags": [
+              "replacement_char_edge"
+            ]
+          },
+          {
+            "start": 407905636,
+            "decoded_preview": "opo de atuação definido pelos órgãos da própria companhia, e o resultado depende das informações por ela disponibilizadas, não tendo o escritório mandato para ir alé",
+            "decoded_with_context_preview": "�em investigações desta natureza, há escopo de atuação definido pelos órgãos da própria companhia, e o resultado depende das informações por ela disponibilizadas, não tendo o escritório mandato para ir além dos limites contratuais estabelecidos, nem tamp",
+            "lang": "pt",
+            "roundtrip_ok": true,
+            "flags": [
+              "invalid_utf8_edge"
+            ]
+          }
+        ]
+      },
+      "language_validation": {
+        "detected_languages": {
+          "pt": 196,
+          "es": 2,
+          "it": 1,
+          "en": 1
+        },
+        "contamination_pct": 2.0
+      },
+      "tokenizer_consistency": {
+        "mismatch_rate_pct": 5.5
+      },
+      "special_tokens": {
+        "bos": {
+          "token_id": 50256,
+          "count": 431827
+        },
+        "eos": {
+          "token_id": 50256,
+          "count": 431827
+        },
+        "pad": {
+          "token_id": null,
+          "count": null
+        },
+        "unk": {
+          "token_id": null,
+          "count": null
+        }
+      },
+      "quality_metrics": {
+        "entropy_bits": 9.62648545811663,
+        "token_diversity": 9.8684e-05,
+        "repetition_ratio": 0.000660474001320948,
+        "unique_tokens": 49342,
+        "truncated_sequence_remainder": 1280
+      },
+      "recommendations": [
+        "Tokenizer mismatches are mostly boundary-related in sampled windows; treat as informational unless confirmed on larger-context checks."
+      ]
+    }
+  ],
+  "final_report": {
+    "overall_status": "PASS WITH MINOR WARNINGS",
+    "dataset_statuses": {
+      "en": "PASS WITH MINOR WARNINGS",
+      "pt": "PASS WITH MINOR WARNINGS"
+    },
+    "dataset_summary": {
+      "en": {
+        "status": "PASS WITH MINOR WARNINGS",
+        "file_size_human": "18.54 GB",
+        "estimated_tokens": 9953989333,
+        "audit_mode": "quick",
+        "audited_tokens": 500000000,
+        "audited_fraction_pct": 5.023111671843701,
+        "invalid_token_pct": 0.0,
+        "contamination_pct": 0.0,
+        "tokenizer_mismatch_rate_pct": 5.5
+      },
+      "pt": {
+        "status": "PASS WITH MINOR WARNINGS",
+        "file_size_human": "60.18 GB",
+        "estimated_tokens": 32306925293,
+        "audit_mode": "quick",
+        "audited_tokens": 500000000,
+        "audited_fraction_pct": 1.5476557904083057,
+        "invalid_token_pct": 0.0,
+        "contamination_pct": 2.0,
+        "tokenizer_mismatch_rate_pct": 5.5
+      }
+    },
+    "recommendations": [
+      "Tokenizer mismatches are mostly boundary-related in sampled windows; treat as informational unless confirmed on larger-context checks."
+    ]
+  }
+}
